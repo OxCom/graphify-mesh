@@ -32,3 +32,4 @@ docs/kb
 /CLAUDE.md
 .docker-ca.crt
 .docker-pip.conf
+.serena

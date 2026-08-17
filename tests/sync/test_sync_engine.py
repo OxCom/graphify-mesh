@@ -165,6 +165,38 @@ def test_shrink_refusal_detected_last_good_kept(env):
     assert "stale ratio" in report.publish_blocked_reason
 
 
+def test_shrink_accepted_with_allow_shrink_state_advances(env):
+    env.add_repo(
+        "example-org.styleguide",
+        "example-org",
+        "styleguide",
+        "styleguide.example-org.dev.lo",
+        "repo_a.json",
+    )
+    env.write_registry()
+    collection = env.collection_path("example-org", "styleguide")
+    original = _read_json(collection / "graph.json")
+
+    env.set_control(collection, "shrink")
+    settings = env.settings(allow_shrink=True)
+    report = run(settings)
+
+    actions = {a["repo_id"]: a for a in report.project_actions}
+    row = actions["example-org.styleguide"]
+    assert row["status"] == "updated"
+    assert "operator-authorized" in row["reason"]
+    assert "example-org.styleguide" not in report.stale_repos
+    # The shrunken graph is kept on disk, not the last-good snapshot.
+    kept = _read_json(collection / "graph.json")
+    assert kept != original
+    assert len(kept["nodes"]) < len(original["nodes"])
+
+    # State advanced: a second run (no allow_shrink needed) decides skip.
+    second = run(env.settings())
+    second_statuses = {a["repo_id"]: a["status"] for a in second.project_actions}
+    assert second_statuses["example-org.styleguide"] == "unchanged"
+
+
 def test_forbidden_edge_invariant_trips_validation(env):
     env.add_repo(
         "example-org.styleguide",

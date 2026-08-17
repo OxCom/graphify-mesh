@@ -7,6 +7,7 @@ per project code style rules.
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import tempfile
@@ -65,8 +66,25 @@ def decide_action(prior_state: dict | None, current_manifest: SourceDigest, has_
     return ACTION_SKIP
 
 
+def _shrink_floor(old_count: int, tolerance: float) -> int:
+    """Smallest new count accepted for `old_count` at `tolerance`.
+
+    Rounds up, so a tolerance can never be widened by truncation, and a repo with
+    very few nodes still gets exact-match semantics: at old_count=3 and a 10%
+    tolerance the floor is 3, i.e. no shrink is tolerated where a single node is a
+    third of the graph.
+    """
+    if old_count <= 0 or tolerance <= 0.0:
+        return old_count
+    return math.ceil(old_count * (1.0 - tolerance))
+
+
 def _classify_shrink(
-    old_hash: str, new_hash: str, old_counts: tuple[int, int], new_counts: tuple[int, int]
+    old_hash: str,
+    new_hash: str,
+    old_counts: tuple[int, int],
+    new_counts: tuple[int, int],
+    tolerance: float = 0.0,
 ) -> str:
     """C21 shrink-guard defense: never trust CLI exit code alone.
 
@@ -75,12 +93,21 @@ def _classify_shrink(
     structural node/edge counts, not raw file byte size (byte size is
     sensitive to incidental re-serialization/formatting differences and is
     not a reliable growth signal on its own).
+
+    `tolerance` (fraction, 0.0 = strict) absorbs LLM extraction jitter: the
+    `extract` action re-derives entities non-deterministically, so an unchanged
+    repo legitimately varies by a few percent between runs and a strict guard
+    deadlocks the pipeline (see SHRINK_TOLERANCE in sync/config.py). It defaults
+    to strict here so direct callers keep the old contract; production passes
+    `settings.shrink_tolerance`.
     """
     if new_hash == old_hash:
         return STATUS_NOOP
     new_nodes, new_edges = new_counts
     old_nodes, old_edges = old_counts
-    if new_nodes < old_nodes or new_edges < old_edges:
+    if new_nodes < _shrink_floor(old_nodes, tolerance) or new_edges < _shrink_floor(
+        old_edges, tolerance
+    ):
         return STATUS_SHRINK_REFUSED
     return STATUS_UPDATED
 
@@ -99,6 +126,9 @@ def apply_action(
     collection_path: Path,
     action: str,
     current_manifest: SourceDigest,
+    *,
+    allow_shrink: bool = False,
+    shrink_tolerance: float = 0.0,
 ) -> ProjectOutcome:
     graph_path = collection_path / "graph.json"
     dirty = is_worktree_dirty(root)
@@ -182,7 +212,27 @@ def apply_action(
             graph_content_hash=new_hash,
         )
 
-    outcome_status = _classify_shrink(old_hash, new_hash or "", old_counts, new_counts)
+    outcome_status = _classify_shrink(
+        old_hash, new_hash or "", old_counts, new_counts, shrink_tolerance
+    )
+
+    if outcome_status == STATUS_SHRINK_REFUSED and allow_shrink:
+        # Operator-authorized (--allow-shrink): accept the smaller graph and
+        # advance state, otherwise the repo would re-extract and be refused
+        # again on every subsequent run.
+        _cleanup_snapshot(snapshot_path)
+        return ProjectOutcome(
+            repo_id,
+            action,
+            STATUS_UPDATED,
+            reason=(
+                f"shrink accepted (operator-authorized via --allow-shrink): "
+                f"old={old_counts} new={new_counts}"
+            ),
+            dirty_worktree=dirty,
+            new_manifest=current_manifest,
+            graph_content_hash=new_hash,
+        )
 
     if outcome_status == STATUS_SHRINK_REFUSED:
         _restore_snapshot(snapshot_path, graph_path)

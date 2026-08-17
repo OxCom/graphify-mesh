@@ -50,7 +50,20 @@ def _make_two_extract_repos(env):
 
 
 def _fake_apply_action_factory(active, lock, delay=0.05):
-    def fake_apply_action(repo_id, graphify_bin, root, collection_path, action, current_manifest):
+    def fake_apply_action(
+        repo_id,
+        graphify_bin,
+        root,
+        collection_path,
+        action,
+        current_manifest,
+        *,
+        allow_shrink=False,
+        # Accept any further keyword-only guard settings the real apply_action
+        # grows (shrink_tolerance, ...) — this double only measures concurrency,
+        # so it must not pin the full signature.
+        **_guard_settings,
+    ):
         with lock:
             active["count"] += 1
             active["max"] = max(active["max"], active["count"])

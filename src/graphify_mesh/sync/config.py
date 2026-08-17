@@ -96,6 +96,41 @@ OLLAMA_DEFAULT_HEALTH_TIMEOUT = 3.0
 # style rule.
 STALE_PUBLISH_THRESHOLD = 0.30
 
+# Per-repo shrink tolerance. The extract action re-derives entities with an LLM
+# (`graphify extract --backend ollama`), which is not deterministic: repeated runs
+# over unchanged sources differ by a few percent in node/edge counts. An absolute
+# "must not shrink" guard against a jittery extractor is unsatisfiable in steady
+# state — any negative wobble refuses the result, the refusal does not advance
+# per-repo state, so the repo re-extracts and wobbles again on every run, and the
+# repo stays permanently stale (observed 2026-07-21..08-17: publishes blocked for
+# four weeks by refusals of -1.4%, -4.0% and -5.7%).
+#
+# A material loss still has to be caught, so the guard refuses only when counts
+# drop by more than this fraction. Set GRAPHIFY_MESH_SHRINK_TOLERANCE=0 to restore
+# the old absolute behaviour (appropriate if every repo uses AST-only `update`,
+# which IS deterministic).
+SHRINK_TOLERANCE = 0.10
+
+
+def _read_shrink_tolerance() -> float:
+    """Resolve the shrink tolerance from the environment, clamped to [0, 1).
+
+    Fails safe: an unparseable or out-of-range value falls back to the default
+    rather than accidentally disabling the guard (a tolerance of 1.0 would accept
+    a graph collapsing to zero nodes).
+    """
+    raw = os.environ.get("GRAPHIFY_MESH_SHRINK_TOLERANCE")
+    if raw is None or not raw.strip():
+        return SHRINK_TOLERANCE
+    try:
+        value = float(raw)
+    except ValueError:
+        return SHRINK_TOLERANCE
+    if value < 0.0 or value >= 1.0:
+        return SHRINK_TOLERANCE
+    return value
+
+
 # WS3 embedding-stage defaults (C9): the NATIVE Ollama `/api/embed` endpoint,
 # NOT the OpenAI-compat `/v1` surface used by OLLAMA_DEFAULT_BASE_URL above
 # for the WS2 naming/labeling LLM calls — different contract, different base
@@ -356,6 +391,9 @@ class Settings:
     registry_path: Path
     graphify_bin: str = field(default_factory=lambda: os.environ.get("GRAPHIFY_BIN", "graphify"))
     stale_threshold: float = STALE_PUBLISH_THRESHOLD
+    shrink_tolerance: float = field(
+        default_factory=lambda: _read_shrink_tolerance(),
+    )
     dry_run: bool = False
     skip_labeling: bool = False
     skip_embedding: bool = False

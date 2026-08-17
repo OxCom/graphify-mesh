@@ -24,6 +24,7 @@ keep their upstream names: `GRAPHIFY_BIN` and `GRAPHIFY_NO_BACKUP`.
 | `GRAPHIFY_MESH_APPROVED_ROOTS` | sync | resolved scan roots | Colon-separated roots trusted by the discovery path-traversal guard. Uses the same strip-and-drop-empty normalization as `GRAPHIFY_MESH_SCAN_ROOTS`; unset or empty means the resolved scan roots. |
 | `GRAPHIFY_MESH_SCAN_DEPTH` | sync | `4` | Maximum nesting of a project directory below each scan root. Values below `1` or unparsable values degrade to `1`; values above `8` degrade to `8` rather than raising. |
 | `GRAPHIFY_MESH_REGISTRY` | sync + server | `<root>/bin/registry.json` | Path to `registry.json`. |
+| `GRAPHIFY_MESH_SHRINK_TOLERANCE` | sync (per-repo guard) | `0.10` | Fraction a repo's node/edge counts may drop before the per-repo shrink guard refuses the result. `extract` re-derives entities with an LLM and is non-deterministic, so an unchanged repo varies a few percent per run; a strict guard turns that jitter into a permanent refusal loop, because a refusal does not advance per-repo state and the repo re-extracts every run. Counts below `old * (1 - tolerance)` (rounded up) are still refused, so material loss is caught. Graphs small enough that the rounding floor equals the old count get exact-match semantics. Set to `0` for the old absolute behaviour — appropriate only if every repo uses AST-only `update`, which is deterministic. Unparsable or out-of-range values (`<0`, `>=1`) fall back to the default rather than disabling the guard. |
 | `GRAPHIFY_MESH_OLLAMA_BASE_URL` | sync (naming) | `http://localhost:11434/v1` | OpenAI-compatible `/v1` endpoint for the community-labeling LLM. |
 | `GRAPHIFY_MESH_OLLAMA_API_KEY` | sync (naming) | `dummy` | API key sent to the `/v1` endpoint (Ollama ignores it, but the client requires one). |
 | `GRAPHIFY_MESH_OLLAMA_MODEL` | sync (naming) | `qwen2.5-coder:14b` | Model for community labeling. |
@@ -47,7 +48,7 @@ keep their upstream names: `GRAPHIFY_BIN` and `GRAPHIFY_NO_BACKUP`.
 | `--registry PATH` | Override `GRAPHIFY_MESH_REGISTRY`. |
 | `--skip-labeling` / `--no-skip-labeling` | Skip / enforce the non-placeholder community-name check. |
 | `--skip-embedding` | Log-skip the embedding stage. |
-| `--allow-shrink` | Authorize publishing a smaller graph than the previous generation. |
+| `--allow-shrink` | Authorize publishing a smaller graph than the previous generation; also authorizes per-repo (per-project) shrink acceptance — a shrunken per-repo graph is accepted and state advances instead of being refused. |
 | `--extract-concurrency N` | Override `GRAPHIFY_MESH_EXTRACT_CONCURRENCY` (default 2, floor 1). |
 | `-v`, `--verbose` | Debug logging. |
 

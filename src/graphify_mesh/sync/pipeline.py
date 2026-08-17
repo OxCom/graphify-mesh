@@ -349,6 +349,12 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 entry.collection_path,
                 action,
                 current_manifest,
+                # Per-repo shrink acceptance follows the explicit operator
+                # flag only — reconciliation.removed (removed repos) must not
+                # loosen per-repo guards, so effective_allow_shrink does not
+                # apply here.
+                allow_shrink=settings.allow_shrink,
+                shrink_tolerance=settings.shrink_tolerance,
             )
             for (i, entry, root, action, current_manifest) in actionable
         }

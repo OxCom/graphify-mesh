@@ -4,6 +4,20 @@
 
 ### Features and behavior changes
 
+- Changed: the per-repo shrink guard now tolerates a configurable fraction of
+  loss instead of refusing any decrease. `extract` re-derives entities with an
+  LLM and is non-deterministic, so an unchanged repo varies a few percent per
+  run; because a refusal does not advance per-repo state, a strict guard made
+  the repo re-extract and wobble again on every run, leaving it permanently
+  stale and blocking publishes indefinitely. Counts below
+  `old * (1 - GRAPHIFY_MESH_SHRINK_TOLERANCE)` (rounded up, default `0.10`) are
+  still refused, so material loss is caught, and graphs small enough that the
+  floor equals the old count keep exact-match semantics. Set the env var to `0`
+  for the previous absolute behavior.
+- Changed: `--allow-shrink` now also authorizes the per-repo shrink guard —
+  an operator-authorized run accepts a legitimately smaller per-repo graph
+  (status `updated`, state advanced) instead of refusing it on every sync
+  run; without the flag, per-repo shrink refusal is unchanged.
 - Added: filesystem discovery supports multiple ordered scan roots and a
   configurable project-directory nesting depth (default `4`, clamped to
   `1`–`8`). `--scan-root` is repeatable, `--scan-depth` sets the depth,
