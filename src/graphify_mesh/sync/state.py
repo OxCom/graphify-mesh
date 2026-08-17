@@ -34,8 +34,54 @@ class SourceDigest:
         }
 
 
+CONTENT_DIGEST_ENV = "GRAPHIFY_MESH_CONTENT_DIGEST"
+
+
+def _use_content_digests() -> bool:
+    """Whether the manifest digest keys on file CONTENT (default) or mtime.
+
+    mtime is a proxy for "changed" that is wrong in the expensive direction here:
+    a `git checkout`, an editor save-without-edit, or a regenerated lockfile bumps
+    `st_mtime_ns` with byte-identical content, `semantic_hash` changes, and
+    `decide_action` schedules a full non-deterministic `graphify extract` that can
+    take 900-2700 s of shared-GPU time and whose output legitimately differs from
+    the last run. Keying on content means an unchanged tree is genuinely unchanged
+    and the LLM never re-runs.
+
+    Set GRAPHIFY_MESH_CONTENT_DIGEST=0 to restore mtime behaviour (e.g. on a tree
+    so large that hashing dominates, though measured cost here is ~66 MB per four
+    repos, i.e. seconds against a multi-minute extract).
+    """
+    raw = os.environ.get(CONTENT_DIGEST_ENV)
+    if raw is None or not raw.strip():
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _change_marker(path: Path, stat: os.stat_result, content_digests: bool) -> str:
+    """Per-file component of the manifest digest.
+
+    Falls back to mtime when content is unreadable (races, permissions, a file
+    deleted between walk and hash) so one bad file degrades that entry instead of
+    aborting the whole manifest.
+    """
+    if not content_digests:
+        return str(stat.st_mtime_ns)
+    try:
+        digest = file_content_hash(path)
+    except OSError:
+        # Unreadable (permissions, deleted between walk and hash, I/O error) or
+        # a device/FIFO that cannot be slurped. One bad file must degrade its own
+        # entry to the mtime marker, never abort the whole manifest — an aborted
+        # manifest would look like "no files" and cascade into a bootstrap.
+        return str(stat.st_mtime_ns)
+    if digest is None:
+        return str(stat.st_mtime_ns)
+    return digest[:32]
+
+
 def compute_source_manifest(root: Path) -> SourceDigest:
-    """Walk root, hashing (relpath, size, mtime_ns) separately per category.
+    """Walk root, hashing (relpath, size, content-digest) separately per category.
 
     Uses os.walk with in-place `dirnames` pruning so ignored trees
     (node_modules/.git/vendor/...) are never even descended into — the old
@@ -50,6 +96,8 @@ def compute_source_manifest(root: Path) -> SourceDigest:
     count = 0
     if not root.is_dir():
         return SourceDigest(code_hash="empty", semantic_hash="empty", file_count=0)
+
+    content_digests = _use_content_digests()
 
     candidates: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -75,7 +123,7 @@ def compute_source_manifest(root: Path) -> SourceDigest:
         except OSError:
             continue
         rel = str(path.relative_to(root))
-        entry = f"{rel}:{stat.st_size}:{stat.st_mtime_ns}"
+        entry = f"{rel}:{stat.st_size}:{_change_marker(path, stat, content_digests)}"
         count += 1
         if category == "code":
             code_entries.append(entry)

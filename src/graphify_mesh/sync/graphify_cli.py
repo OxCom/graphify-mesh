@@ -71,7 +71,45 @@ def _base_argv(graphify_bin: str) -> list[str]:
     return resolve_bin_argv(graphify_bin)
 
 
-def _run(argv: list[str], cwd: Path | None, env: dict | None, timeout: int = 900) -> CliResult:
+DEFAULT_CLI_TIMEOUT_SECONDS = 900
+
+# Bounds for the env override. The floor keeps a typo from making every call
+# time out instantly; the ceiling stays under the unit's own TimeoutStartSec so a
+# single hung subprocess can never outlive the run that spawned it.
+MIN_CLI_TIMEOUT_SECONDS = 60
+MAX_CLI_TIMEOUT_SECONDS = 7200
+
+
+def _cli_timeout() -> int:
+    """Per-subprocess timeout, overridable via GRAPHIFY_MESH_CLI_TIMEOUT.
+
+    `extract` runs an LLM pass over a whole repo, so its wall time scales with
+    repo size and with how loaded the shared Ollama host is. The 900 s default
+    is comfortable for small repos and too tight for large ones: a repo that
+    needs longer fails with returncode 124 on every run, never advances state,
+    and counts toward the stale-ratio publish gate forever (observed on
+    cryengine.mage, cryengine.styleguide and agentscopex.mcp-context-gateway).
+
+    Clamped to [MIN, MAX] with a fallback to the default on unparsable input, so
+    a bad value degrades to the old behaviour rather than disabling the timeout.
+    """
+    raw = os.environ.get("GRAPHIFY_MESH_CLI_TIMEOUT")
+    if raw is None or not raw.strip():
+        return DEFAULT_CLI_TIMEOUT_SECONDS
+    try:
+        value = int(float(raw))
+    except ValueError:
+        return DEFAULT_CLI_TIMEOUT_SECONDS
+    if value < MIN_CLI_TIMEOUT_SECONDS or value > MAX_CLI_TIMEOUT_SECONDS:
+        return DEFAULT_CLI_TIMEOUT_SECONDS
+    return value
+
+
+def _run(
+    argv: list[str], cwd: Path | None, env: dict | None, timeout: int | None = None
+) -> CliResult:
+    if timeout is None:
+        timeout = _cli_timeout()
     full_env = dict(os.environ)
     full_env["GRAPHIFY_NO_BACKUP"] = "1"
     if env:

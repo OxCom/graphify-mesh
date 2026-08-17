@@ -7,6 +7,7 @@ typical single-host deployment; override them for your environment.
 
 from __future__ import annotations
 
+import math
 import os
 import urllib.parse
 from collections.abc import Callable, Sequence
@@ -147,6 +148,75 @@ EMBED_DEFAULT_BASE_URL = "http://localhost:11434"
 EMBED_DEFAULT_MODEL = "qwen3-embedding:0.6b"
 EMBED_DEFAULT_DIM = 1024
 EMBED_DEFAULT_HEALTH_TIMEOUT = 3.0
+
+# Extract-backend health-probe defaults. The probe guards the per-repo
+# `graphify extract --backend ollama` children (NOT the AST-only `update`
+# path) so a remote-Ollama blip is classified as an infra outage instead of
+# marking half the fleet `failed` and vetoing an otherwise complete publish.
+# The URL deliberately defaults from OLLAMA_BASE_URL — the env var the extract
+# CHILD itself resolves its endpoint from — not from
+# GRAPHIFY_MESH_OLLAMA_BASE_URL, which configures this package's own naming
+# stage and can legitimately point at a different host. With neither env set
+# the URL is empty and the whole feature is inert (every failure stays
+# `failed`, no probe is ever attempted).
+EXTRACT_HEALTH_DEFAULT_TIMEOUT = 5.0
+
+# Values of GRAPHIFY_MESH_EXTRACT_HEALTH that disable the probe entirely.
+EXTRACT_HEALTH_DISABLED_VALUES = frozenset({"off", "0", "false", "no"})
+
+# How long (hours) infra_* repos are exempt from the publish gate before they
+# start counting toward the unrefreshed ratio. 0 means: no exemption, infra
+# statuses count immediately.
+INFRA_GRACE_DEFAULT_HOURS = 24.0
+
+
+def _extract_health_url_from_env() -> str:
+    """Resolve the extract-backend probe URL.
+
+    GRAPHIFY_MESH_EXTRACT_HEALTH_URL overrides whenever it is SET — including
+    set-but-empty, which yields "" and pins the feature inert (an operator's
+    explicit "no probe URL" must never silently fall back to probing
+    OLLAMA_BASE_URL). Only when the override var is entirely unset does the
+    default apply: OLLAMA_BASE_URL (the extract child's own endpoint env —
+    see the block comment above). Empty when neither is set, which makes the
+    probe feature inert.
+    """
+    override = os.environ.get("GRAPHIFY_MESH_EXTRACT_HEALTH_URL")
+    if override is not None:
+        return override.strip()
+    return (os.environ.get("OLLAMA_BASE_URL") or "").strip()
+
+
+def _extract_health_enabled_from_env(name: str) -> bool:
+    """Parse the GRAPHIFY_MESH_EXTRACT_HEALTH disable knob. Unset/empty (and
+    any unrecognized value) means enabled; only the explicit disable values
+    turn the probe off."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return True
+    return raw.strip().lower() not in EXTRACT_HEALTH_DISABLED_VALUES
+
+
+def _read_infra_grace_hours(name: str, default: float) -> float:
+    """Parse the GRAPHIFY_MESH_INFRA_GRACE_HOURS override. Must be a FINITE
+    number >= 0 (0 is allowed and means infra statuses count toward the
+    publish gate immediately; float() accepts "nan"/"inf", which would make
+    the grace-window arithmetic silently nonsensical); anything else raises
+    ValueError naming the env var — same fail-fast-at-startup policy as
+    _health_timeout_from_env."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number of hours, got {raw!r}") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number of hours, got {raw!r}")
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0 hours, got {raw!r}")
+    return value
+
 
 # WS3 C27: keep only the last N *published* generations' embedding shards on
 # disk; GC prunes older ones at publish time (see embedding.persist_generation).
@@ -444,6 +514,42 @@ class Settings:
     ollama_embed_health_check: Callable[[str, float], bool] | None = None
     keep_embedding_generations: int = KEEP_EMBEDDING_GENERATIONS
     keep_structural_generations: int = KEEP_STRUCTURAL_GENERATIONS
+
+    # Extract-backend health probe (infra-outage classification). Disabled OR
+    # an empty URL makes the whole feature inert: no probes, every child
+    # failure stays plain `failed`, exactly the pre-probe behavior. See the
+    # EXTRACT_HEALTH_DEFAULT_TIMEOUT block comment for why the URL defaults
+    # from OLLAMA_BASE_URL rather than GRAPHIFY_MESH_OLLAMA_BASE_URL.
+    extract_health_url: str = field(default_factory=_extract_health_url_from_env)
+    extract_health_api_key: str = field(
+        default_factory=lambda: os.environ.get(
+            "GRAPHIFY_MESH_EXTRACT_HEALTH_API_KEY", os.environ.get("OLLAMA_API_KEY", "")
+        )
+    )
+    extract_health_timeout: float = field(
+        default_factory=lambda: _health_timeout_from_env(
+            "GRAPHIFY_MESH_EXTRACT_HEALTH_TIMEOUT", EXTRACT_HEALTH_DEFAULT_TIMEOUT
+        )
+    )
+    extract_health_enabled: bool = field(
+        default_factory=lambda: _extract_health_enabled_from_env("GRAPHIFY_MESH_EXTRACT_HEALTH")
+    )
+    # Test-only dependency injection, mirrors ollama_health_check above but
+    # for the extract-backend probe. Boolean contract: True means healthy,
+    # False means outage — a bool cannot express the misconfigured state.
+    extract_health_check: Callable[[str, str, float], bool] | None = None
+    # Test-only dependency injection for the full tri-state probe: returns
+    # one of pipeline.PROBE_HEALTHY / PROBE_OUTAGE / PROBE_MISCONFIGURED.
+    # Takes precedence over extract_health_check when both are set.
+    extract_health_probe: Callable[[str, str, float], str] | None = None
+    # Grace window (hours) during which infra_* repos are exempt from the
+    # publish gate; past it they count toward the unrefreshed ratio. 0 means
+    # they count immediately.
+    infra_grace_hours: float = field(
+        default_factory=lambda: _read_infra_grace_hours(
+            "GRAPHIFY_MESH_INFRA_GRACE_HOURS", INFRA_GRACE_DEFAULT_HOURS
+        )
+    )
 
     # Bounded parallelism for per-repo `graphify extract/update` children.
     # Each child's RSS lands in the same MemoryMax cgroup as this process,

@@ -34,6 +34,22 @@ STATUS_BOOTSTRAP_FAILED = "bootstrap_failed"
 STATUS_FAILED = "failed"
 STATUS_SHRINK_REFUSED = "shrink_refused"
 STATUS_NOOP = "noop"
+# Infra-outage classifications (assigned by pipeline._guarded_apply_action,
+# never by apply_action itself): the remote extract backend — not the repo —
+# is the reason no refresh happened, so the publish gate treats these
+# differently from a plain `failed` (see pipeline.py's grace-window handling).
+#
+#   infra_skipped - the pre-launch health probe said the backend is down, so
+#                   the child was never spawned. Whatever graph.json already
+#                   exists is untouched: for an extract that last-good graph
+#                   still flows to the merge, but a first-time bootstrap has
+#                   no graph yet, so the repo is simply omitted from this
+#                   generation until the backend recovers.
+#   infra_failed  - the child failed AND a follow-up probe confirmed the
+#                   backend is down, so the failure is attributed to the
+#                   outage rather than to the repo.
+STATUS_INFRA_FAILED = "infra_failed"
+STATUS_INFRA_SKIPPED = "infra_skipped"
 
 
 @dataclass
@@ -49,6 +65,21 @@ class ProjectOutcome:
     # of re-reading every per-repo graph.json; None means "not computed here,
     # hash at publish time" (skip/broken/failed paths).
     graph_content_hash: str | None = None
+    # Source digest of an attempt that was REFUSED (shrink guard). Recorded so a
+    # refusal advances *attempted* state while leaving *accepted* state (and the
+    # last-good graph.json) untouched. Without this, a refusal left the accepted
+    # digest stale, decide_action saw a difference forever, and the repo
+    # re-extracted and was refused on every run — a permanent retry loop that
+    # also kept it in the stale bucket and blocked publish fleet-wide.
+    refused_manifest: SourceDigest | None = None
+
+
+# How many consecutive refusals of the SAME source digest before the repo stops
+# re-extracting. 1 means: refuse once, then skip identical sources until either
+# the source changes or an operator intervenes. Kept low because a retry costs a
+# full LLM extract on a shared GPU and a non-deterministic extractor is not
+# meaningfully more likely to succeed on attempt N+1 with identical input.
+REFUSAL_RETRY_LIMIT = 1
 
 
 def decide_action(prior_state: dict | None, current_manifest: SourceDigest, has_graph: bool) -> str:
@@ -60,6 +91,15 @@ def decide_action(prior_state: dict | None, current_manifest: SourceDigest, has_
         # cheap AST refresh rather than forcing an LLM extract every run.
         return ACTION_UPDATE
     if current_manifest.semantic_hash != prior_state.get("semantic_hash"):
+        # Break the refusal loop: if this exact source digest has already been
+        # refused REFUSAL_RETRY_LIMIT times, re-running the extractor on
+        # unchanged input just burns GPU for another refusal. Hold the last-good
+        # graph instead and wait for the source to actually change.
+        if (
+            current_manifest.semantic_hash == prior_state.get("refused_semantic_hash")
+            and int(prior_state.get("refusal_streak") or 0) >= REFUSAL_RETRY_LIMIT
+        ):
+            return ACTION_SKIP
         return ACTION_EXTRACT
     if current_manifest.code_hash != prior_state.get("code_hash"):
         return ACTION_UPDATE
@@ -246,6 +286,11 @@ def apply_action(
                 f"(old={old_counts} new={new_counts}); last-good graph.json restored"
             ),
             dirty_worktree=dirty,
+            # Accepted state deliberately stays put (no new_manifest) so the
+            # last-good graph remains authoritative, but the refused digest is
+            # reported so the caller can record it and stop re-extracting the
+            # same unchanged source every run.
+            refused_manifest=current_manifest,
         )
 
     _cleanup_snapshot(snapshot_path)

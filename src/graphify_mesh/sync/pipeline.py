@@ -22,9 +22,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -47,6 +51,7 @@ from graphify_mesh.sync.config import (
     FORBIDDEN_OVERLAY_RELATION_TYPES,
     SEMANTIC_EXTENSIONS,
     Settings,
+    is_valid_http_base_url,
 )
 from graphify_mesh.sync.discovery import assert_registry_containment, discover_filesystem, reconcile
 from graphify_mesh.sync.locking import transaction_lock
@@ -60,9 +65,12 @@ from graphify_mesh.sync.state import (
 )
 from graphify_mesh.sync.sync_project import (
     ACTION_BOOTSTRAP,
+    ACTION_EXTRACT,
     ACTION_SKIP,
     STATUS_BOOTSTRAP_FAILED,
     STATUS_FAILED,
+    STATUS_INFRA_FAILED,
+    STATUS_INFRA_SKIPPED,
     STATUS_SHRINK_REFUSED,
     ProjectOutcome,
     apply_action,
@@ -72,7 +80,261 @@ from graphify_mesh.sync.vectors import RepoVectors
 
 log = logging.getLogger("graphify_mesh.sync")
 
-STALE_STATUSES = frozenset({STATUS_FAILED, STATUS_BOOTSTRAP_FAILED, STATUS_SHRINK_REFUSED})
+STALE_STATUSES = frozenset(
+    {
+        STATUS_FAILED,
+        STATUS_BOOTSTRAP_FAILED,
+        STATUS_SHRINK_REFUSED,
+        STATUS_INFRA_FAILED,
+        STATUS_INFRA_SKIPPED,
+    }
+)
+
+# Infra-outage classifications (see sync_project.py). Reported as stale like
+# `failed`, but exempt from BOTH publish-gate ratios while the repo's outage
+# is younger than settings.infra_grace_hours — an in-grace infra repo is
+# removed from the gate CALCULATION entirely (numerator AND denominator),
+# never left in the denominator where it would dilute the ratios for the
+# repos that actually count. Past the grace they count toward the UNREFRESHED
+# ratio, in both numerator and denominator (the data is merely old, never
+# suspect — an extract's last-good graph still flows to the merge exactly
+# like the failed path; a first-time bootstrap has no graph and is omitted
+# from the generation until the backend recovers).
+INFRA_STATUSES = frozenset({STATUS_INFRA_FAILED, STATUS_INFRA_SKIPPED})
+
+# Which statuses may VETO a publish, as opposed to merely being reported as stale.
+# The three stale statuses do not carry the same accuracy cost:
+#
+#   bootstrap_failed  - no graph for this repo at all. Publishing omits it
+#                       entirely, so the merged graph is genuinely incomplete.
+#   shrink_refused    - a candidate was rejected and the last-good graph was
+#                       restored. Publishing ships data that is suspect in age
+#                       but structurally intact.
+#   failed            - the refresh did not complete (e.g. extract timeout). The
+#                       last-good graph is untouched and exactly as valid as the
+#                       one already published; the only cost is age.
+#
+# `failed` is therefore held to a SEPARATE, higher threshold rather than the same
+# one: a couple of slow repos must not veto a generation that is strictly newer
+# for every other repo (an unpublished generation also freezes the embedding
+# channel, degrading vector search fleet-wide while the gate "protects" nothing),
+# but a large fraction failing is a systemic signal — the LLM host down, the disk
+# full — and must still block.
+PUBLISH_BLOCKING_STATUSES = frozenset({STATUS_BOOTSTRAP_FAILED, STATUS_SHRINK_REFUSED})
+UNREFRESHED_STATUSES = frozenset({STATUS_FAILED})
+
+# Fraction of repos that may fail to refresh before publish is refused. Higher
+# than STALE_PUBLISH_THRESHOLD because unrefreshed data is merely older, not
+# suspect; low enough that a systemic outage still trips it.
+UNREFRESHED_PUBLISH_THRESHOLD = 0.40
+UNREFRESHED_THRESHOLD_ENV = "GRAPHIFY_MESH_UNREFRESHED_THRESHOLD"
+
+
+def _unrefreshed_threshold() -> float:
+    """Resolve UNREFRESHED_PUBLISH_THRESHOLD from the env, clamped to (0, 1]."""
+    raw = os.environ.get(UNREFRESHED_THRESHOLD_ENV)
+    if raw is None or not raw.strip():
+        return UNREFRESHED_PUBLISH_THRESHOLD
+    try:
+        value = float(raw)
+    except ValueError:
+        return UNREFRESHED_PUBLISH_THRESHOLD
+    if value <= 0.0 or value > 1.0:
+        return UNREFRESHED_PUBLISH_THRESHOLD
+    return value
+
+
+# Actions whose child shells out to the remote Ollama extract backend
+# (`graphify extract --backend ollama`). ACTION_UPDATE is local AST-only and
+# must run even during a backend outage.
+OLLAMA_BACKED_ACTIONS = frozenset({ACTION_EXTRACT, ACTION_BOOTSTRAP})
+
+INFRA_SKIPPED_PREFLIGHT_REASON = "extract backend unhealthy (preflight)"
+
+# Tri-state extract-backend probe classification. A boolean probe made ANY
+# failure an outage, so a misconfigured probe (bad key, wrong path, TLS/
+# gateway misconfig — anything the server answers with a 4xx) silently
+# suppressed every extract forever. Misconfiguration fails OPEN instead:
+# children spawn normally and real failures surface as plain `failed`.
+PROBE_HEALTHY = "healthy"
+PROBE_OUTAGE = "outage"
+PROBE_MISCONFIGURED = "misconfigured"
+
+# publish_blocked_reason for the run where EVERY actionable repo ended
+# infra_* — nothing was refreshed, so merging/naming/embedding the same
+# inputs again would only burn GPU to republish identical data.
+NOOP_INFRA_OUTAGE_REASON = "noop: infra outage — no repo refreshed, nothing to integrate"
+
+# Stages short-circuited by the zero-refresh noop above, in pipeline order.
+INFRA_NOOP_SKIPPED_STAGES = (
+    "merge",
+    "naming",
+    "embedding",
+    "overlay",
+    "lexical_index",
+    "validate",
+    "publish",
+)
+
+
+def _infra_guard_applies(settings: Settings, action: str) -> bool:
+    """Whether the extract-backend probe guards this launch. Disabled via
+    GRAPHIFY_MESH_EXTRACT_HEALTH, or an empty probe URL, makes the feature
+    inert: no probes, no infra_* statuses — behavior identical to before the
+    guard existed."""
+    if action not in OLLAMA_BACKED_ACTIONS:
+        return False
+    if not settings.extract_health_enabled:
+        return False
+    return bool(settings.extract_health_url)
+
+
+def default_extract_backend_probe(base_url: str, api_key: str, timeout: float) -> tuple[str, str]:
+    """GET `{base_url}/models` — the same lowest-cost endpoint
+    naming.default_ollama_health_check uses (whose own boolean contract for
+    the naming/embedding stages is deliberately left untouched), classified
+    tri-state for the extract guard:
+
+      healthy       - 2xx.
+      outage        - connect error, DNS failure, timeout, or a 5xx: the
+                      backend itself is unreachable/down.
+      misconfigured - any 4xx (bad key, wrong path, TLS/gateway misconfig),
+                      or a non-http(s) probe URL: the PROBE is wrong, not the
+                      backend, so the guard must fail open.
+
+    Returns `(state, detail)` where detail carries the status code/error for
+    the once-per-run log line. Never raises out of the pipeline."""
+    url = base_url.rstrip("/") + "/models"
+    if not is_valid_http_base_url(url):
+        return PROBE_MISCONFIGURED, f"non-http(s) probe URL {url!r}"
+    req = urllib.request.Request(  # noqa: S310 - scheme validated above
+        url, headers={"Authorization": f"Bearer {api_key}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed internal endpoint
+            status = getattr(resp, "status", resp.getcode())
+    except urllib.error.HTTPError as exc:
+        if 400 <= exc.code < 500:
+            return PROBE_MISCONFIGURED, f"HTTP {exc.code}"
+        return PROBE_OUTAGE, f"HTTP {exc.code}"
+    except Exception as exc:  # noqa: BLE001 - any transport failure => outage, never crash the pipeline
+        return PROBE_OUTAGE, str(exc)
+    if 200 <= status < 300:
+        return PROBE_HEALTHY, ""
+    return PROBE_OUTAGE, f"HTTP {status}"
+
+
+def _probe_extract_backend(settings: Settings) -> tuple[str, str]:
+    """Probe the extract backend once, tri-state. PROBE_HEALTHY when the
+    feature is inert (no probe attempted). DI order: the tri-state
+    `extract_health_probe` wins; the boolean `extract_health_check` (kept for
+    the existing tests' contract) maps True -> healthy, False -> outage."""
+    if not settings.extract_health_enabled or not settings.extract_health_url:
+        return PROBE_HEALTHY, ""
+    probe_args = (
+        settings.extract_health_url,
+        settings.extract_health_api_key,
+        settings.extract_health_timeout,
+    )
+    if settings.extract_health_probe is not None:
+        return settings.extract_health_probe(*probe_args), ""
+    if settings.extract_health_check is not None:
+        return (PROBE_HEALTHY if settings.extract_health_check(*probe_args) else PROBE_OUTAGE), ""
+    return default_extract_backend_probe(*probe_args)
+
+
+class _MisconfigLogOnce:
+    """Thread-safe once-per-run gate for the misconfigured-probe log line.
+    The probe runs inside pool worker threads, once per launch, but a
+    misconfigured probe endpoint is one fact per run, not one per repo — so
+    the run logs it exactly once, at ERROR, naming the URL and status."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._logged = False
+
+    def error(self, url: str, detail: str) -> None:
+        with self._lock:
+            if self._logged:
+                return
+            self._logged = True
+        log.error(
+            "extract-backend probe misconfigured (%s) for %s — failing open: "
+            "children spawn normally and real failures stay `failed`",
+            detail,
+            url,
+        )
+
+
+def _guarded_apply_action(
+    repo_id: str,
+    graphify_bin: str,
+    root: Path,
+    collection_path: Path,
+    action: str,
+    current_manifest,
+    *,
+    settings: Settings,
+    allow_shrink: bool = False,
+    shrink_tolerance: float = 0.0,
+    misconfig_once: _MisconfigLogOnce | None = None,
+) -> ProjectOutcome:
+    """apply_action wrapped in the extract-backend infra guard.
+
+    Probes BEFORE spawning each ollama-backed child (per-launch re-probe:
+    catches both a start-of-run outage and mid-run recovery): an OUTAGE means
+    the child is never spawned and the repo is reported `infra_skipped` with
+    state untouched — an existing last-good graph.json still flows to the
+    merge, same as the failed path (a first-time bootstrap has none and is
+    omitted from the generation). A MISCONFIGURED probe (4xx) fails open: the
+    guard disarms for this launch, the child spawns normally, real failures
+    stay plain `failed`, and the misconfiguration is logged once per run.
+    When a spawned child comes back plain `failed` under an armed guard, one
+    more probe decides attribution: an outage reclassifies the outcome to
+    `infra_failed`; anything else leaves `failed` untouched. bootstrap_failed
+    and shrink_refused are never reclassified — those verdicts are about the
+    repo's own output, not about reachability.
+    """
+    guarded = _infra_guard_applies(settings, action)
+    if guarded:
+        state, detail = _probe_extract_backend(settings)
+        if state == PROBE_MISCONFIGURED:
+            (misconfig_once or _MisconfigLogOnce()).error(settings.extract_health_url, detail)
+            guarded = False
+        elif state == PROBE_OUTAGE:
+            return ProjectOutcome(
+                repo_id, action, STATUS_INFRA_SKIPPED, reason=INFRA_SKIPPED_PREFLIGHT_REASON
+            )
+    outcome = apply_action(
+        repo_id,
+        graphify_bin,
+        root,
+        collection_path,
+        action,
+        current_manifest,
+        allow_shrink=allow_shrink,
+        shrink_tolerance=shrink_tolerance,
+    )
+    if not guarded:
+        return outcome
+    if outcome.status != STATUS_FAILED:
+        return outcome
+    state, _detail = _probe_extract_backend(settings)
+    if state != PROBE_OUTAGE:
+        return outcome
+    outcome.status = STATUS_INFRA_FAILED
+    outcome.reason = f"{outcome.reason}; backend probe failed"
+    return outcome
+
+
+def _within_infra_grace(now: float, infra_since: float, grace_hours: float) -> bool:
+    """Whether an infra_* repo is still exempt from the publish gate. A grace
+    of 0 means no exemption at all — infra statuses count toward the
+    unrefreshed ratio immediately."""
+    if grace_hours <= 0.0:
+        return False
+    return (now - infra_since) <= grace_hours * 3600.0
+
 
 STAGING_PREFIX = "graphify-mesh-sync-staging-"
 # A SIGKILLed/OOM-killed run never reaches the `finally` that removes its
@@ -122,6 +384,16 @@ class RunReport:
     reconciliation: dict
     project_actions: list[dict] = field(default_factory=list)
     stale_repos: list[str] = field(default_factory=list)
+    # Reported separately from stale_repos so an operator can see WHY a publish
+    # was refused: only these statuses veto it.
+    publish_blocking_repos: list[str] = field(default_factory=list)
+    unrefreshed_repos: list[str] = field(default_factory=list)
+    # infra_* repos split by the grace window: in-grace ones are removed from
+    # the gate calculation entirely; past-grace ones also appear in
+    # unrefreshed_repos. Reported so an operator can see which repos an
+    # outage is currently hiding from the gate — and for how much longer.
+    infra_repos_in_grace: list[str] = field(default_factory=list)
+    infra_repos_past_grace: list[str] = field(default_factory=list)
     dirty_repos: list[str] = field(default_factory=list)
     merge_ok: bool = False
     merge_error: str = ""
@@ -264,6 +536,18 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # project we never attempted to touch is not "stale data", just
     # unrefreshed this cycle.
     stale_repos: list[str] = []
+    # Subset of stale_repos whose status may veto publish (see
+    # PUBLISH_BLOCKING_STATUSES): a timeout leaves valid last-good data behind
+    # and must not block a generation that is newer for every other repo.
+    publish_blocking_repos: list[str] = []
+    # Repos that merely failed to refresh (their last-good graph is intact and as
+    # valid as what is already published). Gated separately, at a higher ratio.
+    unrefreshed_repos: list[str] = []
+    # infra_* repos split by grace: in-grace ones leave the gate calculation
+    # entirely (numerator AND denominator); past-grace ones also land in
+    # unrefreshed_repos above.
+    infra_in_grace: list[str] = []
+    infra_past_grace: list[str] = []
     dirty_repos: list[str] = []
     graph_paths_by_repo: dict[str, Path] = {}
     # WS4: source roots per repo_id, for depends_on/API extraction. Broken
@@ -295,6 +579,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # shared is mutated until after every future has been joined.
     actionable: list[tuple[int, RepoEntry, Path, str, SourceDigest]] = []
     outcomes: dict[str, ProjectOutcome] = {}
+    misconfig_once = _MisconfigLogOnce()
     with ThreadPoolExecutor(max_workers=settings.extract_concurrency) as pool:
         # Per-repo source-manifest computation (a full stat-walk of every
         # repo tree) is pure read-only work, independent per repo — submit it
@@ -342,19 +627,26 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
 
         futures = {
             entry.repo_id: pool.submit(
-                apply_action,
+                _guarded_apply_action,
                 entry.repo_id,
                 settings.graphify_bin,
                 root,
                 entry.collection_path,
                 action,
                 current_manifest,
+                # The infra guard probes inside the worker thread, right
+                # before (and, on failure, right after) each child — a
+                # per-launch re-probe, not one snapshot for the whole run.
+                settings=settings,
                 # Per-repo shrink acceptance follows the explicit operator
                 # flag only — reconciliation.removed (removed repos) must not
                 # loosen per-repo guards, so effective_allow_shrink does not
                 # apply here.
                 allow_shrink=settings.allow_shrink,
                 shrink_tolerance=settings.shrink_tolerance,
+                # Shared across workers: a misconfigured probe endpoint is
+                # logged once per run, not once per launch.
+                misconfig_once=misconfig_once,
             )
             for (i, entry, root, action, current_manifest) in actionable
         }
@@ -376,6 +668,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # All shared-structure mutation happens here, single-threaded, strictly
     # after every future in `actionable` has been joined above — no locking
     # needed because nothing below runs concurrently with anything else.
+    now = time.time()
     for _i, entry, _root, action, _current_manifest in actionable:
         outcome = outcomes[entry.repo_id]
         graph_path = entry.collection_path / "graph.json"
@@ -391,19 +684,98 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             dirty_repos.append(entry.repo_id)
         if outcome.status in STALE_STATUSES:
             stale_repos.append(entry.repo_id)
-            if action == ACTION_BOOTSTRAP:
+            if outcome.status in PUBLISH_BLOCKING_STATUSES:
+                publish_blocking_repos.append(entry.repo_id)
+            elif outcome.status in UNREFRESHED_STATUSES:
+                unrefreshed_repos.append(entry.repo_id)
+            elif outcome.status in INFRA_STATUSES:
+                # Grace window: `infra_since` marks the START of the outage
+                # and is set only if absent, so it survives across runs until
+                # a successful refresh replaces the state entry wholesale
+                # (which clears it). Within the grace the repo is removed
+                # from the gate calculation entirely (neither ratio's
+                # numerator nor denominator); past it, it counts toward the
+                # unrefreshed ratio — its last-good graph is old, never
+                # suspect.
+                prior = state.get(entry.repo_id) or {}
+                infra_since = prior.get("infra_since")
+                if infra_since is None:
+                    infra_since = now
+                    state[entry.repo_id] = {**prior, "infra_since": infra_since}
+                if _within_infra_grace(now, float(infra_since), settings.infra_grace_hours):
+                    infra_in_grace.append(entry.repo_id)
+                else:
+                    infra_past_grace.append(entry.repo_id)
+                    unrefreshed_repos.append(entry.repo_id)
+            if outcome.status == STATUS_BOOTSTRAP_FAILED:
+                # Only genuine bootstrap failures — an infra_skipped
+                # bootstrap never even spawned, so reporting it as a failed
+                # auto-add would blame the repo for the backend's outage.
                 bootstrap_failed_repo_ids.add(entry.repo_id)
+            if outcome.refused_manifest is not None:
+                # Advance *attempted* state only. The accepted digest and the
+                # last-good graph.json stay as they were, but recording which
+                # source digest was refused (and how many times) lets
+                # decide_action stop re-extracting an unchanged source forever.
+                prior = state.get(entry.repo_id) or {}
+                refused_hash = outcome.refused_manifest.semantic_hash
+                streak = int(prior.get("refusal_streak") or 0)
+                streak = streak + 1 if prior.get("refused_semantic_hash") == refused_hash else 1
+                state[entry.repo_id] = {
+                    **prior,
+                    "refused_semantic_hash": refused_hash,
+                    "refusal_streak": streak,
+                }
         else:
             if outcome.new_manifest is not None:
+                # A successful outcome clears any refusal memory: the source is
+                # accepted now, so a future refusal starts its own streak.
                 state[entry.repo_id] = outcome.new_manifest.to_dict()
         if graph_path.exists():
             graph_paths_by_repo[entry.repo_id] = graph_path
     bar.finish()
 
     report.stale_repos = sorted(set(stale_repos))
+    report.publish_blocking_repos = sorted(set(publish_blocking_repos))
+    report.unrefreshed_repos = sorted(set(unrefreshed_repos))
+    report.infra_repos_in_grace = sorted(set(infra_in_grace))
+    report.infra_repos_past_grace = sorted(set(infra_past_grace))
     report.dirty_repos = sorted(set(dirty_repos))
     report.auto_add_failed = sorted(bootstrap_failed_repo_ids)
     tracker.mark("extract")
+
+    # Zero-refresh noop: every actionable repo this run ended infra_*, so not
+    # a single graph changed — merging/naming/embedding the same inputs again
+    # would only burn GPU/LLM time to republish identical data. Repos that
+    # were skip/unchanged neither count as refreshed nor prevent the noop.
+    # State is still saved via _finalize below so `infra_since` persists.
+    #
+    # Two constraints keep the noop honest — it exists for the true-blip case
+    # only:
+    #   - a removed repo must still be merged OUT and published, so a run
+    #     with reconciliation.removed falls through to the normal tail;
+    #   - once ANY infra repo is past its grace window the run must end with
+    #     the unrefreshed-threshold publish_blocked_reason instead — a >grace
+    #     total outage must stop looking like routine idling in status.json.
+    infra_outage_noop = (
+        bool(actionable)
+        and not reconciliation.removed
+        and not infra_past_grace
+        and all(
+            outcomes[entry.repo_id].status in INFRA_STATUSES for _i, entry, *_rest in actionable
+        )
+    )
+    if infra_outage_noop:
+        report.skipped_stages = list(INFRA_NOOP_SKIPPED_STAGES)
+        report.publish_blocked_reason = NOOP_INFRA_OUTAGE_REASON
+        log.info(
+            "noop: %s — skipping %s",
+            NOOP_INFRA_OUTAGE_REASON,
+            ", ".join(INFRA_NOOP_SKIPPED_STAGES),
+        )
+        _record_stage_rss(tracker, report)
+        _finalize(settings, staging_root, report, state, published_data=None, generation_id="")
+        return report
 
     sorted_repo_ids = sorted(graph_paths_by_repo.keys())
     sorted_graph_paths = [graph_paths_by_repo[rid] for rid in sorted_repo_ids]
@@ -594,9 +966,26 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     report.validation_ok = validation.ok
     report.validation_errors = validation.errors
 
-    total_considered = len(active_repos)
-    stale_ratio = (len(report.stale_repos) / total_considered) if total_considered else 0.0
-    stale_blocks_publish = stale_ratio > settings.stale_threshold
+    # In-grace infra repos are excluded from the denominator of BOTH ratios,
+    # not just their numerators: left in the denominator they would dilute
+    # the ratios for the repos that actually count (e.g. 7 in-grace infra +
+    # 6 failed + 3 ok would publish at 6/16 = 37.5% < 40% although 13/16
+    # repos went unrefreshed). A denominator of 0 — every considered repo
+    # in-grace infra — means there is nothing left to gate on: no block.
+    total_considered = len(active_repos) - len(report.infra_repos_in_grace)
+    # Gate on the blocking subset, not on every stale repo: `failed` (e.g. an
+    # extract timeout) leaves the previously published data intact for that repo,
+    # so it costs age, not correctness, and must not veto the whole generation.
+    blocking_ratio = (
+        (len(report.publish_blocking_repos) / total_considered) if total_considered else 0.0
+    )
+    unrefreshed_ratio = (
+        (len(report.unrefreshed_repos) / total_considered) if total_considered else 0.0
+    )
+    unrefreshed_limit = _unrefreshed_threshold()
+    suspect_blocks = blocking_ratio > settings.stale_threshold
+    unrefreshed_blocks = unrefreshed_ratio > unrefreshed_limit
+    stale_blocks_publish = suspect_blocks or unrefreshed_blocks
 
     if settings.dry_run:
         report.publish_blocked_reason = "dry-run: no publish performed"
@@ -615,9 +1004,24 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         return report
 
     if stale_blocks_publish:
-        report.publish_blocked_reason = (
-            f"stale ratio {stale_ratio:.2%} exceeds threshold {settings.stale_threshold:.0%}"
-        )
+        # Both gates can trip in the same run; the reason names every gate
+        # that did, not just the first.
+        reasons: list[str] = []
+        if suspect_blocks:
+            reasons.append(
+                f"stale ratio {blocking_ratio:.2%} of suspect repos exceeds threshold "
+                f"{settings.stale_threshold:.0%} "
+                f"({len(report.publish_blocking_repos)}/{total_considered}: "
+                f"{', '.join(report.publish_blocking_repos)})"
+            )
+        if unrefreshed_blocks:
+            reasons.append(
+                f"stale ratio {unrefreshed_ratio:.2%} of unrefreshed repos exceeds threshold "
+                f"{unrefreshed_limit:.0%} "
+                f"({len(report.unrefreshed_repos)}/{total_considered}: "
+                f"{', '.join(report.unrefreshed_repos)})"
+            )
+        report.publish_blocked_reason = "; ".join(reasons)
         tracker.mark("validate_publish")
         _record_stage_rss(tracker, report)
         _finalize(settings, staging_root, report, state, published_data=None, generation_id="")
@@ -741,6 +1145,14 @@ def _finalize(
             "dry_run": False,
             "reconciliation": report.reconciliation,
             "stale_repos": report.stale_repos,
+            # Operator visibility: WHICH repos held a publish back (or would
+            # have), and which infra repos the grace window is currently
+            # hiding from the gate — split so a lingering outage is visible
+            # in status.json before it starts blocking.
+            "publish_blocking_repos": report.publish_blocking_repos,
+            "unrefreshed_repos": report.unrefreshed_repos,
+            "infra_repos_in_grace": report.infra_repos_in_grace,
+            "infra_repos_past_grace": report.infra_repos_past_grace,
             "dirty_repos": report.dirty_repos,
             "merge_ok": report.merge_ok,
             "merge_error": report.merge_error,

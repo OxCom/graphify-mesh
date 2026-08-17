@@ -117,6 +117,12 @@ class Env:
         # the real Ollama host; tests exercising the healthy embed path must
         # inject their own deterministic fake health_check AND embed_batch.
         overrides.setdefault("ollama_embed_health_check", lambda *a, **kw: False)
+        # And for the extract-backend infra probe: an empty URL keeps the
+        # feature inert (no probes, failures stay plain `failed`) even when
+        # the machine running the tests has OLLAMA_BASE_URL exported. Tests
+        # exercising the guard override this with an explicit URL plus a
+        # deterministic extract_health_check fake.
+        overrides.setdefault("extract_health_url", "")
         return Settings.from_env(
             mesh_root=self.mesh_root,
             scan_roots=self.scan_roots,

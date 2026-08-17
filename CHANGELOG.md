@@ -4,6 +4,75 @@
 
 ### Features and behavior changes
 
+- Added: infra-outage classification for the extract backend. A health probe
+  (GET `{base}/models`, the same endpoint the naming stage checks) now runs
+  before each ollama-backed `extract`/`bootstrap` child is spawned — a
+  per-launch re-probe, so both a start-of-run outage and mid-run recovery are
+  caught — and again after a child fails. The probe is tri-state: a connect
+  error, DNS failure, timeout, or 5xx is an **outage**; any **4xx** means the
+  probe itself is misconfigured (bad key, wrong path, TLS/gateway) and fails
+  **open** — logged once per run at ERROR naming the URL and status code,
+  children spawn normally, real failures stay plain `failed`. Preflight-outage
+  repos become `infra_skipped` without spawning the child; a failure with a
+  down backend becomes `infra_failed` (`bootstrap_failed`/`shrink_refused` are
+  never reclassified, and only genuine bootstrap failures are reported in
+  `auto_add_failed`). Both statuses keep an existing last-good graph flowing
+  to the merge (a first-time bootstrap has none and is omitted from the
+  generation until the backend recovers) and are removed from the publish-gate
+  ratios entirely — numerator **and** denominator, so in-grace repos never
+  dilute the ratios for the repos that still count — for
+  `GRAPHIFY_MESH_INFRA_GRACE_HOURS` (default `24`, finite and `>= 0`, measured
+  from the outage start persisted as `infra_since`, cleared on the next
+  successful refresh); past the grace they count toward the unrefreshed ratio.
+  When an outage means not a single actionable repo was refreshed, the run is
+  a noop: merge/naming/embedding/overlay/lexical-index/validate/publish are
+  skipped with `publish_blocked_reason` "noop: infra outage — no repo
+  refreshed, nothing to integrate" — unless a repo was removed (the removal
+  must still be merged out and published) or any infra repo is past its grace
+  window (a >grace total outage ends blocked on the unrefreshed threshold
+  instead of looking like routine idling). When both publish gates trip in
+  one run, `publish_blocked_reason` names both, joined with `"; "`.
+  `status.json` now also reports `publish_blocking_repos`,
+  `unrefreshed_repos`, `infra_repos_in_grace`, and `infra_repos_past_grace`.
+  The probe URL falls back to `OLLAMA_BASE_URL` (the extract child's own
+  endpoint env, deliberately not `GRAPHIFY_MESH_OLLAMA_BASE_URL`) only when
+  `GRAPHIFY_MESH_EXTRACT_HEALTH_URL` is entirely unset — set-but-empty keeps
+  the feature inert — with `_API_KEY`/`_TIMEOUT` companions; setting
+  `GRAPHIFY_MESH_EXTRACT_HEALTH=off` (or an empty URL) disables the feature
+  entirely, restoring the previous behavior where every failure stays
+  `failed`. Motivation: a remote-Ollama blip marked 8/16 repos `failed` within
+  seconds and blocked publish at 50% > 40% although the merged graph was
+  complete — the healthy repos' work was discarded.
+- Fixed: the manifest digest now keys on file **content** instead of
+  `(size, mtime_ns)`. A `git checkout`, an editor save-without-edit, or a
+  regenerated lockfile used to bump `semantic_hash` with byte-identical content,
+  scheduling a full non-deterministic `graphify extract` whose output legitimately
+  differs run to run. Measured cost is ~66 MB hashed per four repos — seconds
+  against a multi-minute extract. `GRAPHIFY_MESH_CONTENT_DIGEST=0` restores the
+  old mtime behaviour. An unreadable file degrades to the mtime marker for that
+  entry instead of aborting the manifest.
+- Fixed: a shrink refusal now advances *attempted* state (`refused_semantic_hash`
+  + `refusal_streak`) while leaving accepted state and the last-good graph
+  untouched. Previously a refusal recorded nothing, so `decide_action` saw a
+  changed source forever and the repo re-extracted and was re-refused on every
+  run — a permanent retry loop that also kept it in the stale bucket. After
+  `REFUSAL_RETRY_LIMIT` refusals of the same digest, the repo holds its last-good
+  graph until the source actually changes. The deterministic AST path stays
+  available while the LLM path is suppressed.
+- Changed: the publish gate no longer treats all stale statuses alike.
+  `bootstrap_failed` (no graph) and `shrink_refused` (suspect graph) keep the
+  `STALE_PUBLISH_THRESHOLD` (30%) gate; `failed` (refresh did not complete, e.g.
+  an extract timeout, leaving valid last-good data) is gated separately at
+  `UNREFRESHED_PUBLISH_THRESHOLD` (40%, env `GRAPHIFY_MESH_UNREFRESHED_THRESHOLD`).
+  A couple of slow repos no longer veto a generation that is strictly newer for
+  everyone else — an unpublished generation also freezes the embedding channel —
+  while a systemic failure rate still blocks. `publish_blocking_repos` and
+  `unrefreshed_repos` are reported separately so a refusal names its cause.
+- Added: `GRAPHIFY_MESH_CLI_TIMEOUT` makes the per-subprocess timeout
+  configurable (default unchanged at `900` s, clamped to `60`–`7200`). `extract`
+  wall time scales with repo size and Ollama load, and a repo that needs longer
+  failed with returncode `124` on every run without ever advancing state, so it
+  counted toward the stale-ratio publish gate indefinitely.
 - Changed: the per-repo shrink guard now tolerates a configurable fraction of
   loss instead of refusing any decrease. `extract` re-derives entities with an
   LLM and is non-deterministic, so an unchanged repo varies a few percent per
