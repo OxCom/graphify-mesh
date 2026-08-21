@@ -38,7 +38,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from graphify_mesh.sync.embedding import build_snippet, node_key
+from graphify_mesh.sync.embedding import build_snippet, node_key, node_line
 
 try:
     from graphify.export import _strip_diacritics as _graphify_strip_diacritics
@@ -240,7 +240,7 @@ def build_lexical_index(
                 continue
             label = node.get("label") or ""
             source_file = node.get("source_file") or ""
-            snippet = build_snippet(source_root, source_file, node.get("line"))
+            snippet = build_snippet(source_root, source_file, node_line(node))
 
             doc_id = len(documents)
             documents.append([repo_id, key])

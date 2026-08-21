@@ -426,6 +426,15 @@ IGNORED_DIR_NAMES = frozenset(
         "node_modules",
         "vendor",
         "graphify-out",
+        # Documentation trees are never indexed (operator decision 2026-08-20):
+        # a docs/ page is prose about the code, and in the KB benchmark the
+        # graph served docs/tasks/ ground-truth and the judge script back to a
+        # run that had those files removed from its working copy. The per-repo
+        # `--exclude docs/ doc/` in <graphify-out>/.graphify_build.json keeps
+        # the upstream extractor out of them; this entry keeps the mesh's own
+        # staleness hashing from marking a repo dirty on a docs-only commit.
+        "docs",
+        "doc",
         "__pycache__",
         ".venv",
         "venv",

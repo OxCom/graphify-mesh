@@ -26,7 +26,7 @@ from graphify_mesh.server import ranking
 from graphify_mesh.server.retrieval import EmbedQueryFn, Hit, rank
 from graphify_mesh.server.scope import RegistryEntry
 from graphify_mesh.server.store import Generation
-from graphify_mesh.sync.embedding import build_snippet
+from graphify_mesh.sync.embedding import build_snippet, node_line
 
 # Rough, dependency-free token estimate — no tokenizer dependency added just
 # for a budget heuristic. ~4 chars/token is the commonly-cited English-text
@@ -149,7 +149,7 @@ def _card_from_hit(
     generation_created_at: float | None,
 ) -> EvidenceCard:
     node = generation.node_by_id.get(hit.node_id, {})
-    line = node.get("line")
+    line = node_line(node)
     root = _root_for_repo(hit.repo, registry_entries)
     snippet = build_snippet(root, hit.source_file, line) if hit.source_file else ""
 

@@ -961,7 +961,11 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # in that case instead of requiring the operator to pass --allow-shrink.
     effective_allow_shrink = settings.allow_shrink or bool(reconciliation.removed)
     validation = validate.run_all(
-        graph_data, previous_counts, effective_allow_shrink, settings.skip_labeling
+        graph_data,
+        previous_counts,
+        effective_allow_shrink,
+        settings.skip_labeling,
+        shrink_tolerance=settings.shrink_tolerance,
     )
     report.validation_ok = validation.ok
     report.validation_errors = validation.errors

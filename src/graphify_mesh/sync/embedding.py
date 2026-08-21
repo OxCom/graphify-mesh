@@ -243,6 +243,31 @@ def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+# graphify writes a node's position as `source_location: "L34"`, never as a `line`
+# field — so every consumer that asked for node["line"] received None, build_snippet
+# fell back to `start = 0`, and every evidence card carried the first 20 lines of its
+# file. For PHP and TypeScript that is the import block: ~800 characters of near-zero
+# signal per card. Citations lost the position too and rendered as `path:?`, forcing a
+# second locator call and making `grep -n` strictly cheaper than asking the graph.
+# Measured consequence: 4 graph calls across 12 benchmark cells, 8 of which never
+# called it at all. 4364 of this repo's 5499 nodes carry a usable source_location.
+_SOURCE_LOCATION_LINE = re.compile(r"^L(\d+)$")
+
+
+def node_line(node: dict) -> int | None:
+    """The node's 1-based line, from `line` or from graphify's `source_location`."""
+    value = node.get("line")
+    if isinstance(value, int) and value > 0:
+        return value
+    match = _SOURCE_LOCATION_LINE.match(str(node.get("source_location") or "").strip())
+    if not match:
+        return None
+    # "L0" is not a line: lines are 1-based, and 0 is falsy downstream, so it would slip
+    # back into the head-of-file fallback this helper exists to remove.
+    parsed = int(match.group(1))
+    return parsed if parsed > 0 else None
+
+
 def build_snippet(source_root: Path | None, source_file: str | None, line: int | None) -> str:
     """C6 bounded source snippet. Returns "" (not an error) whenever a
     snippet cannot be produced — missing root, missing file, unreadable file,
@@ -399,7 +424,7 @@ def _iter_embeddable_nodes(repo_id: str, graph_data: dict, source_root: Path | N
         label = node["label"]
         source_file = node["source_file"]
         community_name = node.get("community_name")
-        snippet = build_snippet(source_root, source_file, node.get("line"))
+        snippet = build_snippet(source_root, source_file, node_line(node))
         yield key, label, source_file, community_name, snippet, is_trivial_node(label, snippet)
 
 

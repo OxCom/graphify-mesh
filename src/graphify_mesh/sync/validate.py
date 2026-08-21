@@ -6,11 +6,16 @@ everything before deciding to publish or not.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from graphify_mesh.sync.config import FORBIDDEN_OVERLAY_RELATION_TYPES
+from graphify_mesh.sync.sync_project import _shrink_floor
 
-PLACEHOLDER_PREFIX = "Community "
+# A placeholder is exactly the literal the CLI stamps when no label exists —
+# "Community <cid>". A prefix match is wrong: real LLM labels can start with
+# the word ("Community Management", observed 2026-08-18) and must pass.
+PLACEHOLDER_RE = re.compile(r"^Community \d+$")
 
 # Per-check cap on collected error strings: a badly broken merge can yield
 # millions of dangling/forbidden edges, and status.json must not balloon.
@@ -58,19 +63,30 @@ def validate_schema(data: dict) -> ValidationResult:
 
 
 def validate_shrink_guard(
-    new_counts: tuple[int, int], previous_counts: tuple[int, int] | None, allow_shrink: bool
+    new_counts: tuple[int, int],
+    previous_counts: tuple[int, int] | None,
+    allow_shrink: bool,
+    tolerance: float = 0.0,
 ) -> ValidationResult:
+    """Global-graph counterpart of the per-repo shrink guard.
+
+    `tolerance` mirrors sync_project._classify_shrink: the naming stage's
+    canonicalization merges (doc twins, ghosts) and LLM extraction jitter
+    legitimately shrink the merged graph by a fraction of a percent per run,
+    and a strict guard blocks every subsequent publish (observed 2026-07-21..
+    08-18). A material collapse is still refused.
+    """
     if previous_counts is None or allow_shrink:
         return ValidationResult(ok=True)
     new_nodes, new_edges = new_counts
     prev_nodes, prev_edges = previous_counts
     errors = []
-    if new_nodes < prev_nodes:
+    if new_nodes < _shrink_floor(prev_nodes, tolerance):
         errors.append(
             f"shrink-guard: new global graph has {new_nodes} nodes, "
             f"previous published had {prev_nodes}"
         )
-    if new_edges < prev_edges:
+    if new_edges < _shrink_floor(prev_edges, tolerance):
         errors.append(
             f"shrink-guard: new global graph has {new_edges} edges, "
             f"previous published had {prev_edges}"
@@ -170,7 +186,7 @@ def validate_community_names(data: dict, skip_labeling: bool) -> ValidationResul
         if node.get("community") is None:
             continue
         name = node.get("community_name")
-        if not name or name.startswith(PLACEHOLDER_PREFIX):
+        if not name or PLACEHOLDER_RE.match(name):
             errors.append(f"placeholder community_name on node {node.get('id')!r}: {name!r}")
     return ValidationResult(ok=not errors, errors=errors)
 
@@ -203,6 +219,7 @@ def run_all(
     previous_counts: tuple[int, int] | None,
     allow_shrink: bool,
     skip_labeling: bool,
+    shrink_tolerance: float = 0.0,
 ) -> ValidationResult:
     schema = validate_schema(data)
     if not schema.ok:
@@ -212,7 +229,7 @@ def run_all(
     new_counts = (len(data.get("nodes", [])), len(data.get("links", data.get("edges", []))))
     checks = [
         schema,
-        validate_shrink_guard(new_counts, previous_counts, allow_shrink),
+        validate_shrink_guard(new_counts, previous_counts, allow_shrink, shrink_tolerance),
         validate_dangling_ids(data),
         validate_forbidden_edges(data),
         validate_community_names(data, skip_labeling),
