@@ -30,7 +30,6 @@ from graphify_mesh.server import protocol, ranking
 from graphify_mesh.server import similar as similar_mod
 from graphify_mesh.server.config import ServerConfig
 from graphify_mesh.server.embed_query import make_embed_query_fn
-from graphify_mesh.sync.embedding import node_line
 from graphify_mesh.server.retrieval import Hit, rank
 from graphify_mesh.server.scope import (
     ScopeResolutionError,
@@ -39,6 +38,7 @@ from graphify_mesh.server.scope import (
     resolve_scope,
 )
 from graphify_mesh.server.store import Generation, GenerationStore, GenerationUnavailableError
+from graphify_mesh.sync.embedding import node_line
 
 log = logging.getLogger("graphify_mesh.server.server")
 
