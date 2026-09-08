@@ -8,7 +8,7 @@ Runs as a new pipeline stage AFTER overlay-resolve and BEFORE validate/publish
 pipeline.py's `RunReport.skipped_stages`.
 
 Why this exists instead of reusing graphify's own query-time tokenizer
-(serve.py): verified against the installed graphify 0.9.20 package
+(serve.py): verified against the installed graphify 0.9.56 package
 (`graphify/serve.py:86` and `:180`) — its tokenizer is a single
 `re.findall(r"\\w+", text.lower())`. That is Unicode-word-character-only: it
 never splits `Namespace\\Class::method` into (`Namespace`, `Class`, `method`),

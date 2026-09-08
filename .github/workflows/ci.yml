@@ -151,7 +151,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
         module: [sync, server, hardening]
 
     steps:
@@ -172,6 +172,47 @@ jobs:
 
       - name: Run the ${{ matrix.module }} test suite
         run: python -m pytest tests/${{ matrix.module }} -q --cov=graphify_mesh --cov-report=term
+
+  graphify-compat:
+    # Protects the two real coupling points to upstream graphifyy — the
+    # in-process `graphify.build.distinct_repo_tags` import (sync/repo_tags.py)
+    # and the `merge-graphs ... --out` argv (sync/graphify_cli.py) — against
+    # every pinned graphifyy version, including the declared floor
+    # (graphifyy>=0.9.20 in pyproject.toml). The rest of the suite fakes the
+    # CLI, so a breaking upstream change would otherwise land unnoticed.
+    needs: [gitleaks, trufflehog, pip-audit, lint, hadolint]
+    runs-on: ubuntu-latest
+    name: graphify-compat (graphifyy ${{ matrix.graphifyy || 'resolved-latest' }})
+    strategy:
+      fail-fast: false
+      matrix:
+        graphifyy: ["0.9.20", "0.9.56", ""]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # hatch-vcs needs tag history to compute a real version
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install graphify-mesh with test extras
+        # Pulls whatever graphifyy the declared dependency range resolves to.
+        run: pip install -e ".[test]"
+
+      - name: Pin graphifyy to ${{ matrix.graphifyy }}
+        # Empty matrix entry = the floating-latest lane: keep the resolved
+        # version so a breaking upstream release shows up here early.
+        if: matrix.graphifyy != ''
+        run: pip install "graphifyy==${{ matrix.graphifyy }}"
+
+      - name: Run the graphify version-compatibility suite
+        env:
+          GRAPHIFY_COMPAT_EXPECTED_VERSION: ${{ matrix.graphifyy }}
+        run: python -m pytest tests/compat -q
 
   smoke-test:
     needs: [gitleaks, trufflehog, pip-audit, lint, hadolint]

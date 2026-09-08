@@ -626,7 +626,7 @@ class TestDefaultExtractBackendProbe:
             def __exit__(self, *exc_info):
                 return False
 
-        def fake_urlopen(req, timeout=None):
+        def fake_urlopen(req, timeout=None, context=None):
             captured["url"] = req.full_url
             captured["auth"] = req.get_header("Authorization")
             captured["timeout"] = timeout
@@ -651,7 +651,7 @@ class TestDefaultExtractBackendProbe:
         ],
     )
     def test_classification(self, monkeypatch, exc, expected_state, detail_fragment):
-        def raising_urlopen(req, timeout=None):
+        def raising_urlopen(req, timeout=None, context=None):
             raise exc
 
         monkeypatch.setattr(pipeline.urllib.request, "urlopen", raising_urlopen)
@@ -660,7 +660,7 @@ class TestDefaultExtractBackendProbe:
         assert detail_fragment in detail
 
     def test_non_http_url_is_misconfigured_without_any_request(self, monkeypatch):
-        def exploding_urlopen(req, timeout=None):
+        def exploding_urlopen(req, timeout=None, context=None):
             raise AssertionError("no request may be attempted for a non-http(s) URL")
 
         monkeypatch.setattr(pipeline.urllib.request, "urlopen", exploding_urlopen)
@@ -677,7 +677,7 @@ class TestMisconfiguredProbeFailsOpenInPipeline:
         # Both repos need an ollama-backed extract this run.
         (root_b / "touched.md").write_text("# semantic touch\n", encoding="utf-8")
 
-        def raising_urlopen(req, timeout=None):
+        def raising_urlopen(req, timeout=None, context=None):
             raise _http_error(401)
 
         monkeypatch.setattr(pipeline.urllib.request, "urlopen", raising_urlopen)
@@ -705,7 +705,7 @@ class TestMisconfiguredProbeFailsOpenInPipeline:
     def test_connection_error_is_still_an_outage(self, env, monkeypatch):
         _setup_extract_and_update_repos(env)
 
-        def raising_urlopen(req, timeout=None):
+        def raising_urlopen(req, timeout=None, context=None):
             raise urllib.error.URLError(ConnectionRefusedError("refused"))
 
         monkeypatch.setattr(pipeline.urllib.request, "urlopen", raising_urlopen)

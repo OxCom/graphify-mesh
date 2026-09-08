@@ -76,6 +76,7 @@ from graphify_mesh.sync.sync_project import (
     apply_action,
     decide_action,
 )
+from graphify_mesh.sync.tls import ssl_context
 from graphify_mesh.sync.vectors import RepoVectors
 
 log = logging.getLogger("graphify_mesh.sync")
@@ -211,7 +212,9 @@ def default_extract_backend_probe(base_url: str, api_key: str, timeout: float) -
         url, headers={"Authorization": f"Bearer {api_key}"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed internal endpoint
+        with urllib.request.urlopen(  # noqa: S310 - fixed internal endpoint
+            req, timeout=timeout, context=ssl_context()
+        ) as resp:
             status = getattr(resp, "status", resp.getcode())
     except urllib.error.HTTPError as exc:
         if 400 <= exc.code < 500:

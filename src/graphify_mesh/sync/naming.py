@@ -40,6 +40,7 @@ from pathlib import Path
 from graphify_mesh.sync import graphify_cli, publish
 from graphify_mesh.sync.backend import BackendCheckResult, assert_pinned_backend
 from graphify_mesh.sync.config import Settings, is_valid_http_base_url
+from graphify_mesh.sync.tls import ssl_context
 
 log = logging.getLogger("graphify_mesh.sync.naming")
 
@@ -81,7 +82,9 @@ def default_ollama_health_check(base_url: str, api_key: str, timeout: float) -> 
         url, headers={"Authorization": f"Bearer {api_key}"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed internal endpoint
+        with urllib.request.urlopen(  # noqa: S310 - fixed internal endpoint
+            req, timeout=timeout, context=ssl_context()
+        ) as resp:
             status = getattr(resp, "status", resp.getcode())
             return 200 <= status < 300
     except Exception as exc:  # noqa: BLE001 - any failure => unhealthy, never crash the pipeline

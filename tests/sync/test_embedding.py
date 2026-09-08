@@ -115,7 +115,7 @@ class _FakeResponse:
 def test_embed_batch_request_shape_matches_verified_native_contract(monkeypatch):
     captured = {}
 
-    def fake_urlopen(req, timeout=None):
+    def fake_urlopen(req, timeout=None, context=None):
         captured["url"] = req.full_url
         captured["method"] = req.get_method()
         captured["headers"] = dict(req.header_items())
@@ -144,7 +144,7 @@ def test_embed_batch_request_shape_matches_verified_native_contract(monkeypatch)
 
 
 def test_embed_batch_raises_on_shape_mismatch(monkeypatch):
-    def fake_urlopen(req, timeout=None):
+    def fake_urlopen(req, timeout=None, context=None):
         return _FakeResponse(
             {"model": "x", "embeddings": [[0.1, 0.2]]}
         )  # only 1, but 2 inputs requested
@@ -156,7 +156,7 @@ def test_embed_batch_raises_on_shape_mismatch(monkeypatch):
 
 
 def test_embed_batch_empty_input_short_circuits_without_a_call(monkeypatch):
-    def fake_urlopen(req, timeout=None):
+    def fake_urlopen(req, timeout=None, context=None):
         raise AssertionError("must not be called for empty input")
 
     monkeypatch.setattr(embedding.urllib.request, "urlopen", fake_urlopen)

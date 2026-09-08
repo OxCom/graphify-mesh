@@ -77,6 +77,7 @@ from graphify_mesh.sync.config import Settings, is_valid_http_base_url
 from graphify_mesh.sync.overlay_refs import LogicalRef
 from graphify_mesh.sync.publish import _fsync_dir
 from graphify_mesh.sync.source_cache import get_source_lines
+from graphify_mesh.sync.tls import ssl_context
 from graphify_mesh.sync.vectors import RepoVectors
 
 log = logging.getLogger("graphify_mesh.sync.embedding")
@@ -343,7 +344,9 @@ def default_embed_health_check(base_url: str, timeout: float) -> bool:
         return False
     req = urllib.request.Request(url)  # noqa: S310 - scheme validated above
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed internal endpoint
+        with urllib.request.urlopen(  # noqa: S310 - fixed internal endpoint
+            req, timeout=timeout, context=ssl_context()
+        ) as resp:
             status = getattr(resp, "status", resp.getcode())
             return 200 <= status < 300
     except Exception as exc:  # noqa: BLE001 - any failure => unhealthy, never crash the pipeline
@@ -371,7 +374,9 @@ def embed_batch(
         url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed internal endpoint
+        with urllib.request.urlopen(  # noqa: S310 - fixed internal endpoint
+            req, timeout=timeout, context=ssl_context()
+        ) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
         raise RuntimeError(f"embed_batch request to {url} failed: {exc}") from exc

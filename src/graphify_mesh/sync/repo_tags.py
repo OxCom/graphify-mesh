@@ -1,6 +1,6 @@
 """Repo-tag normalization after `graphify merge-graphs` (WS5 prerequisite).
 
-Verified against the installed graphify 0.9.20 package
+Verified against the installed graphify 0.9.56 package
 (`graphify/cli.py:1902`, `graphify/build.py:distinct_repo_tags`): the real
 `merge-graphs` CLI has no flag to pin an explicit per-input repo tag. It
 derives each merged node's id-prefix/`repo` attribute purely from
