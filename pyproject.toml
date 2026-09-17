@@ -40,10 +40,26 @@ dependencies = [
     #   vectors that cost ~8x the RAM at 38K nodes (see
     #   docs/superpowers/plans/2026-07-21-numpy-embeddings.md).
     "numpy>=1.26,<3",
+    # mcp: the official MCP SDK. Both transports (stdio and streamable HTTP)
+    #   run through its low-level Server, so the 5 tools have exactly one
+    #   registration path and cannot drift between modes. Replaced this
+    #   package's own newline-delimited JSON-RPC transport (server/protocol.py)
+    #   — see docs/superpowers/specs/2026-09-17-shared-http-daemon-design.md.
+    #   Floor is the version the suite is actually run against: the HTTP
+    #   adapter passes `max_request_body_size` to
+    #   StreamableHTTPSessionManager, which older releases do not accept, and
+    #   an SDK that raises TypeError before the port opens is worse than a
+    #   resolver conflict. `tests/server/test_sdk_surface.py` pins it.
+    "mcp>=1.30,<2",
+    # starlette + uvicorn: ASGI app and server for the shared HTTP daemon
+    #   (graphify_mesh.server.http_app). Required, not optional: the daemon is
+    #   the mode that makes one instance serve every agent.
+    "starlette>=0.37,<1",
+    "uvicorn>=0.30,<1",
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=9.0.3,<10", "pytest-cov>=5,<8"]
+test = ["pytest>=9.0.3,<10", "pytest-cov>=5,<8", "httpx>=0.27,<1"]
 lint = [
     "ruff>=0.5,<1.0",
     "mypy>=1.10,<2",

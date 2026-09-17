@@ -1,14 +1,17 @@
 """`graphify-mesh` stdio MCP server (WS5 deliverable 2): wires the 5 hybrid/
 cross-project/evidence tools (`search`, `cross_project`, `find_similar`,
-`project_map`, `context_pack`) onto the newline-delimited JSON-RPC 2.0
-transport in `protocol.py`.
+`project_map`, `context_pack`) onto the MCP SDK's stdio transport
+(`mcp.server.stdio.stdio_server`), wrapped by `stdio_guard.capped_stdin` for
+the line-size cap the SDK's own reader does not provide.
 
-One process per client session (plan: "stdio per-session"). Scope
-resolution (`scope.py`) is anchored to THIS PROCESS's cwd, resolved fresh on
-every `search`/`context_pack` call against `registry.json` — matches a
-dedicated per-project session, not a shared daemon serving many cwds at
-once (see C26 in `graphify_mesh.server/__init__.py` for why this is not an
-arbitrary-path cache).
+Scope resolution (`scope.py`) runs fresh on every `search`/`context_pack`
+call against `registry.json`. `scope='current'` resolves the CLIENT's cwd:
+the optional per-call `cwd` argument when given, otherwise this process's
+cwd. The per-call form is what makes a shared daemon serving many sessions
+work — one process per client session ("stdio per-session") leaves `cwd`
+out and keeps the original behavior. Either way an unregistered directory
+fails closed (see C26 in `graphify_mesh.server/__init__.py` for why this is
+not an arbitrary-path cache).
 
 Every tool call is wrapped so `ScopeResolutionError` and
 `GenerationUnavailableError` degrade to an MCP tool-error result
@@ -26,9 +29,9 @@ from pathlib import Path
 
 from graphify_mesh.server import context_pack as context_pack_mod
 from graphify_mesh.server import project_map as project_map_mod
-from graphify_mesh.server import protocol, ranking
+from graphify_mesh.server import ranking
 from graphify_mesh.server import similar as similar_mod
-from graphify_mesh.server.config import ServerConfig
+from graphify_mesh.server.config import ConfigError, ServerConfig
 from graphify_mesh.server.embed_query import make_embed_query_fn
 from graphify_mesh.server.retrieval import Hit, rank
 from graphify_mesh.server.scope import (
@@ -44,7 +47,6 @@ log = logging.getLogger("graphify_mesh.server.server")
 
 SERVER_NAME = "graphify-mesh"
 SERVER_VERSION = "0.1.0"
-PROTOCOL_VERSION = "2024-11-05"
 
 DEFAULT_TOKEN_BUDGET = 2000
 
@@ -106,6 +108,26 @@ def _validate_scope(arguments: dict) -> str | None:
     return scope
 
 
+def _validate_cwd(arguments: dict) -> Path | None:
+    """`cwd` is an optional per-call client working directory. The server is
+    run as ONE shared daemon for many sessions (see module docstring), so
+    `Path.cwd()` is the daemon's directory and is meaningless for
+    `scope='current'`; nothing injects the caller's directory automatically,
+    so passing `cwd` on every call is the caller's own contract to honor —
+    one session can move between projects. It is only ever matched against
+    registered roots in registry.json — an unregistered path still fails
+    closed."""
+    cwd = arguments.get("cwd")
+    if cwd is None:
+        return None
+    if not isinstance(cwd, str) or not cwd:
+        raise ToolError("'cwd' must be a non-empty string (an absolute client directory)")
+    path = Path(cwd)
+    if not path.is_absolute():
+        raise ToolError("'cwd' must be an absolute path")
+    return path
+
+
 def _validate_repos(arguments: dict) -> list[str] | None:
     """`repos` is optional; when present it must be a list of strings — the
     repo_ids themselves are validated against the registry downstream."""
@@ -153,6 +175,12 @@ class GraphifyMeshServer:
     def cwd(self) -> Path:
         return self._cwd_override if self._cwd_override is not None else Path.cwd()
 
+    def _scope_cwd(self, arguments: dict) -> Path:
+        """The client's directory for `scope='current'`: the per-call `cwd`
+        argument when the caller sent one, otherwise this process's."""
+        call_cwd = _validate_cwd(arguments)
+        return call_cwd if call_cwd is not None else self.cwd
+
     def _registry_entries(self):
         return load_registry_entries(self.config.registry_path)
 
@@ -162,9 +190,10 @@ class GraphifyMeshServer:
         query = _validate_str(arguments, "q")
         k = _validate_k(arguments)
         scope = _validate_scope(arguments)
+        scope_cwd = self._scope_cwd(arguments)
         entries = self._registry_entries()
         try:
-            decision = resolve_scope(scope, self.cwd, entries)
+            decision = resolve_scope(scope, scope_cwd, entries)
         except ScopeResolutionError as exc:
             raise ToolError(str(exc)) from exc
         generation = self._generation()
@@ -237,9 +266,10 @@ class GraphifyMeshServer:
         goal = _validate_str(arguments, "goal")
         token_budget = _validate_token_budget(arguments)
         scope = _validate_scope(arguments)
+        scope_cwd = self._scope_cwd(arguments)
         entries = self._registry_entries()
         try:
-            decision = resolve_scope(scope, self.cwd, entries)
+            decision = resolve_scope(scope, scope_cwd, entries)
         except ScopeResolutionError as exc:
             raise ToolError(str(exc)) from exc
         generation = self._generation()
@@ -313,6 +343,17 @@ class GraphifyMeshServer:
                             "description": "'current' (default), 'all', or 'repo:<id>'",
                         },
                         "k": {"type": "integer", "default": ranking.DEFAULT_K},
+                        "cwd": {
+                            "type": "string",
+                            "description": (
+                                "Absolute path of the project directory this call is "
+                                "about, used to resolve scope='current'. Pass it on "
+                                "every call — one session can move between projects. "
+                                "Omit it only with an explicit scope ('all' or "
+                                "'repo:<id>'); a directory outside registry.json is "
+                                "refused."
+                            ),
+                        },
                     },
                     "required": ["q"],
                 },
@@ -372,6 +413,17 @@ class GraphifyMeshServer:
                         "goal": {"type": "string"},
                         "scope": {"type": "string"},
                         "token_budget": {"type": "integer", "default": DEFAULT_TOKEN_BUDGET},
+                        "cwd": {
+                            "type": "string",
+                            "description": (
+                                "Absolute path of the project directory this call is "
+                                "about, used to resolve scope='current'. Pass it on "
+                                "every call — one session can move between projects. "
+                                "Omit it only with an explicit scope ('all' or "
+                                "'repo:<id>'); a directory outside registry.json is "
+                                "refused."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -401,77 +453,74 @@ class GraphifyMeshServer:
 
     # --- JSON-RPC method dispatch ------------------------------------------
 
-    def handle_message(self, message: dict) -> dict | None:
-        method = message.get("method")
-        request_id = message.get("id")
-        is_notification = "id" not in message
-
-        # JSON-RPC 2.0: a notification (no "id" member) NEVER gets a
-        # response — not a result, not an error — regardless of whether the
-        # method is known. Guard here so no branch below can answer an
-        # id-less request with `"id": null`.
-        if is_notification:
-            return None
-
-        if method == "initialize":
-            return protocol.result_response(
-                request_id,
-                {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                    "capabilities": {"tools": {}},
-                },
-            )
-        if method == "tools/list":
-            return protocol.result_response(request_id, {"tools": self.tool_schemas()})
-        if method == "tools/call":
-            params = message.get("params")
-            if params is None:
-                params = {}
-            if not isinstance(params, dict):
-                return protocol.error_response(
-                    request_id, -32602, "invalid params: 'params' must be an object"
-                )
-            name = params.get("name", "")
-            if not isinstance(name, str):
-                return protocol.error_response(
-                    request_id, -32602, "invalid params: 'name' must be a string"
-                )
-            arguments = params.get("arguments")
-            if arguments is None:
-                arguments = {}
-            if not isinstance(arguments, dict):
-                return protocol.error_response(
-                    request_id, -32602, "invalid params: 'arguments' must be an object"
-                )
-            result = self.call_tool(name, arguments)
-            return protocol.result_response(request_id, result)
-        if method == "ping":
-            return protocol.result_response(request_id, {})
-        return protocol.error_response(request_id, -32601, f"method not found: {method!r}")
-
 
 def build_server() -> GraphifyMeshServer:
     config = ServerConfig.from_env()
     return GraphifyMeshServer(config)
 
 
+def serve_stdio(mesh: GraphifyMeshServer) -> None:
+    """Blocking stdio transport. Returns on stdin EOF — the clean-exit
+    contract that keeps closed sessions from leaking resident processes."""
+    import anyio
+    from mcp.server.stdio import stdio_server
+
+    from graphify_mesh.server.sdk_app import build_sdk_server
+    from graphify_mesh.server.stdio_guard import capped_stdin
+
+    sdk = build_sdk_server(mesh)
+
+    async def _run() -> None:
+        async with stdio_server(stdin=capped_stdin()) as (read_stream, write_stream):
+            await sdk.run(read_stream, write_stream, sdk.create_initialization_options())
+
+    anyio.run(_run)
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
+    import sys
+
+    # Deferred: http_app imports GraphifyMeshServer from this module, so a
+    # module-level import here would deadlock whichever module is imported
+    # first (see tests/server/test_http_app.py, which imports http_app
+    # before server). Safe at call time: by then both modules are fully
+    # loaded.
+    from graphify_mesh.server import http_app
 
     parser = argparse.ArgumentParser(
         prog="graphify-mesh-server",
         description=(
-            "Stdio MCP server for the merged global graph. Speaks newline-delimited "
-            "JSON-RPC 2.0 on stdin/stdout; one process per client session. Takes no "
-            "options — configure via GRAPHIFY_MESH_ROOT / GRAPHIFY_MESH_REGISTRY."
+            "MCP server for the merged global graph. Default transport is stdio "
+            "(one process per client session). --transport http runs one shared "
+            "daemon for every local agent; it requires GRAPHIFY_MESH_HTTP_TOKEN."
         ),
     )
-    parser.parse_args(argv)
+    parser.add_argument("--transport", choices=("stdio", "http"), default=None)
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--path", default=None)
+    parser.add_argument("--allow-public-bind", action="store_true", default=None)
+    args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    server = build_server()
-    protocol.serve(server.handle_message)
+    try:
+        config = ServerConfig.from_env(
+            transport=args.transport,
+            http_host=args.host,
+            http_port=args.port,
+            http_path=args.path,
+            allow_public_bind=args.allow_public_bind,
+        )
+    except ConfigError as exc:
+        print(f"graphify-mesh-server: {exc}", file=sys.stderr)
+        return 2
+
+    mesh = GraphifyMeshServer(config)
+    if config.transport == "http":
+        http_app.serve_http(mesh, config)
+    else:
+        serve_stdio(mesh)
     return 0
 
 

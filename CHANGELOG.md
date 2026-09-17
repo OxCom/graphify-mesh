@@ -4,6 +4,100 @@
 
 ### Features and behavior changes
 
+- Added: optional per-call `cwd` argument on `search` and `context_pack`.
+  `scope: "current"` resolves the CLIENT's directory, which is this argument
+  when the caller sends one and the server process's cwd otherwise. The server
+  documented "one process per client session"; run as one shared daemon for
+  many sessions (a systemd user unit, cwd `$HOME`), `Path.cwd()` matched no
+  registered repo root, so every implicit-scope call failed closed with
+  "cannot resolve implicit scope". Resolution is unchanged otherwise: the
+  directory is only matched against registered roots in `registry.json`, a
+  relative or empty `cwd` is a tool error, and an unregistered one still fails
+  closed rather than widening to a global search.
+- Added: `graphify-mesh-server --transport http`, a shared streamable-HTTP
+  daemon (stateless, `mcp` SDK, bearer token required via
+  `GRAPHIFY_MESH_HTTP_TOKEN`, loopback bind with Host/Origin validation) so
+  one process can serve every local agent instead of one process per client
+  session. stdio stays the default and unchanged. With a shared daemon, `cwd`
+  above stops being optional in practice: nothing injects the caller's
+  directory automatically, so the caller passes it on every call. The tool
+  descriptions for `search`/`context_pack` were reworded to say so, replacing
+  the earlier "injected by the session proxy" wording.
+- Changed: the server's own JSON-RPC transport (`server/protocol.py`) is
+  removed; both stdio and HTTP now run through the `mcp` SDK's low-level
+  `Server`, registered once from the same tool schemas/`call_tool` pair so
+  the two transports cannot serve different tools. `mcp`, `starlette`, and
+  `uvicorn` become required dependencies. `server/stdio_guard.py` keeps the
+  line-size cap and the malformed-frame `-32700`/`-32600` responses the
+  retired transport provided. An unrecognized JSON-RPC method now answers
+  `-32602` instead of the retired dispatcher's `-32601` — accepted, since
+  matching `-32601` would mean tracking the SDK's own valid-method set.
+- Changed: generation reads and reloads run under a writer-preferring
+  read/write lock (`server/rwlock.py`) instead of being fused, so concurrent
+  reads in the shared daemon no longer serialize behind each other while a
+  reload is in flight. The registry cache (`server/scope.py`) and the
+  per-generation similarity index cache (`server/similar.py`) are now
+  individually lock-guarded against duplicate concurrent builds.
+- Fixed: in HTTP mode one slow tool call blocked every other client. The
+  synchronous `call_tool` ran inline in the async handler, so a `search`
+  waiting on the embedding endpoint held the event loop for that whole
+  timeout — other clients' calls, initialization and even the `401` for an
+  unauthenticated request could not progress. Tool execution now runs off the
+  loop under a bounded limiter (`sdk_app.TOOL_WORKER_LIMIT`, 8 threads).
+- Fixed: a stale-capture race in `GenerationStore.ensure_fresh` could move the
+  store onto an OLDER generation. The double check under the write lock
+  compared the signature captured BEFORE the wait, so a thread that waited
+  through a publish another thread had already loaded concluded a reload of
+  its captured generation was due. The decision now comes from a fresh stat
+  taken under the write lock; `_try_reload` still reads every artifact from
+  the one realpath it is handed, so a publish landing mid-load cannot mix two
+  generations.
+- Fixed: a JSON object that is not a legal JSON-RPC 2.0 envelope
+  (`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":[]}`) got no
+  correlated response. It reached the SDK's envelope validation, which raises
+  instead of answering request 7, so the client waited for its own timeout.
+  Both transports now check the envelope themselves
+  (`server/frames.py:envelope_error`) and answer `-32602` for a params-shape
+  error, `-32600` otherwise, preserving the request id. The existing `-32700`
+  and `-32600` answers are unchanged.
+- Fixed: HTTP parse and envelope errors returned the SDK's `str(JSONDecode
+  Error)` / `str(ValidationError)`, which quote validation details and
+  excerpts of the input, where stdio answers generically. The HTTP frame guard
+  now answers the same generic coded error and logs the detail instead. The
+  token gate stays outermost and unchanged: an unauthenticated request is
+  still answered before a byte of its body is read.
+- Changed: the incoming-message cap is one number for both transports
+  (`server/frames.py:MAX_MESSAGE_BYTES`, 4 MiB), enforced on bytes actually
+  received. HTTP previously took whatever default the installed SDK had, so
+  the two transports stated different limits and the HTTP one moved with the
+  SDK; stdio previously capped a line at 10 MB. The lower ceiling is
+  deliberate: the shared daemon is one process serving every local agent, so
+  its memory is a machine-wide resource, and no legitimate JSON-RPC frame for
+  these five tools approaches 4 MiB.
+- Added: the HTTP frame guard bounds concurrent body buffering with an
+  `anyio.Semaphore` of `http_app.BODY_BUFFER_SLOTS` (8), held only while it
+  reads a body and released the moment the body reaches the layer below, so
+  its share of request bodies is capped at 8 x 4 MiB = 32 MiB. It queues
+  rather than rejecting, and an idle keep-alive connection holds no slot.
+  uvicorn's `limit_concurrency` is not used: it answers `503` on a count of
+  open CONNECTIONS, which would reject a long-lived local client with nothing
+  in flight. The guard also drops its parsed object and hands its buffer down
+  without copying it, so it no longer keeps three representations of a body
+  alive across the downstream call. Total inbound memory is still not a single
+  number: the parsed-object cost is not a fixed multiple of the byte cap, and
+  nothing here bounds how many requests sit below the guard at once.
+- Changed: the `mcp` floor is `>=1.30`, up from `>=1.12`. The HTTP adapter
+  passes `max_request_body_size`, which older releases do not accept, and an
+  SDK that raises `TypeError` before the port opens is worse than a resolver
+  conflict. `session_idle_timeout=None` was dropped instead of pinned: the SDK
+  documents it as unused in stateless mode. `tests/server/test_sdk_surface.py`
+  pins both facts.
+- Fixed: the `cwd` hook (`examples/hooks/graphify-mesh-cwd.py`) overwrote an
+  explicitly supplied invalid `cwd` — `""`, whitespace or a number became the
+  session directory, so a call that should have failed validation was answered
+  for a different repository. It now fills `cwd` only when the key is absent,
+  and still fails open on anything unexpected.
+
 - Added: infra-outage classification for the extract backend. A health probe
   (GET `{base}/models`, the same endpoint the naming stage checks) now runs
   before each ollama-backed `extract`/`bootstrap` child is spawned — a

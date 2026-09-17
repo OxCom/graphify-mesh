@@ -12,14 +12,14 @@ SDK package, no third-party JSON-RPC/transport library, and therefore no
 dedicated virtualenv is required. It runs under the same interpreter as
 `graphify_mesh.sync`.
 
-Why no `mcp` SDK: the MCP stdio transport is exactly newline-delimited
-JSON-RPC 2.0 request/response objects on stdin/stdout (see `protocol.py`),
-which stdlib `json` + `sys` implements completely. This keeps the server
-dependency-free beyond `graphify` / `graphify_mesh`, and trivially portable
-to any Python 3.11+ interpreter without an install step. If a richer MCP
-feature (resources, prompts, sampling) is needed later, introduce the
-official SDK at that time — nothing here needs to change to add one alongside
-this package.
+This section is historical: the server has since moved onto the official
+`mcp` SDK (`server/sdk_app.py`, `server/stdio_guard.py`) for its stdio
+transport, because a second transport (streamable HTTP, for the shared
+daemon) needed a real MCP session/protocol implementation rather than a
+hand-rolled newline-delimited JSON-RPC loop. The size-cap guard the old
+hand-rolled reader provided (`MAX_LINE_BYTES`) is carried forward in
+`stdio_guard.capped_stdin`, since the SDK's own stdio reader has no such
+bound.
 
 ## Two MCP servers: this one vs graphify's own
 

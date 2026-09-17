@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 
+import anyio
 import pytest
 from conftest import build_generation, fake_embed_query_fn, make_node, registry_repo, write_registry
 
-from graphify_mesh.server import protocol
+from graphify_mesh.server import stdio_guard
 from graphify_mesh.server.config import ServerConfig
 from graphify_mesh.server.retrieval import exact_alias_hits, lexical_candidates
 from graphify_mesh.server.server import MAX_K, MAX_TOKEN_BUDGET, GraphifyMeshServer
@@ -22,13 +24,6 @@ def _server(tmp_path: Path, cwd: Path) -> GraphifyMeshServer:
         mesh_root=tmp_path, registry_path=tmp_path / "bin" / "registry.json"
     )
     return GraphifyMeshServer(config, cwd=cwd, embed_query_fn=fake_embed_query_fn())
-
-
-def _rpc(method: str, params: dict | None = None, request_id: int = 1) -> dict:
-    message = {"jsonrpc": "2.0", "id": request_id, "method": method}
-    if params is not None:
-        message["params"] = params
-    return message
 
 
 def _search_server(tmp_path, monkeypatch) -> GraphifyMeshServer:
@@ -45,73 +40,60 @@ def _search_server(tmp_path, monkeypatch) -> GraphifyMeshServer:
     return server
 
 
-# --- protocol.read_messages: oversized-line cap -----------------------------
+# --- stdio_guard.capped_stdin: oversized-line cap ---------------------------
+#
+# The size cap protocol.py used to provide moved to stdio_guard (see that
+# module's docstring): the SDK's own stdio reader has no bound at all.
+
+
+def _drain(async_file) -> list[str]:
+    async def _collect() -> list[str]:
+        collected: list[str] = []
+        it: AsyncIterator[str] = async_file.__aiter__()
+        async for line in it:
+            collected.append(line)
+        return collected
+
+    return anyio.run(_collect)
 
 
 def test_oversized_line_is_skipped_and_loop_keeps_serving(monkeypatch):
-    monkeypatch.setattr(protocol, "MAX_LINE_BYTES", 64)
+    monkeypatch.setattr(stdio_guard, "MAX_LINE_BYTES", 64)
     giant = "x" * 500  # one newline-less-within-cap giant line
     good = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
     stream = io.StringIO(giant + "\n" + good + "\n")
-    messages = list(protocol.read_messages(stream))
-    assert messages == [{"jsonrpc": "2.0", "id": 1, "method": "ping"}]
+    lines = _drain(stdio_guard.capped_stdin(stream))
+    assert [json.loads(line) for line in lines] == [{"jsonrpc": "2.0", "id": 1, "method": "ping"}]
 
 
 def test_oversized_line_without_trailing_newline_at_eof(monkeypatch):
-    monkeypatch.setattr(protocol, "MAX_LINE_BYTES", 64)
+    monkeypatch.setattr(stdio_guard, "MAX_LINE_BYTES", 64)
     stream = io.StringIO("y" * 500)  # oversized AND no newline before EOF
-    assert list(protocol.read_messages(stream)) == []
+    assert _drain(stdio_guard.capped_stdin(stream)) == []
 
 
 def test_line_at_cap_is_still_parsed(monkeypatch):
-    monkeypatch.setattr(protocol, "MAX_LINE_BYTES", 4096)
+    monkeypatch.setattr(stdio_guard, "MAX_LINE_BYTES", 4096)
     message = {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"pad": "z" * 4000}}
     line = json.dumps(message)
     assert len(line) <= 4096
     stream = io.StringIO(line + "\n")
-    assert list(protocol.read_messages(stream)) == [message]
+    lines = _drain(stdio_guard.capped_stdin(stream))
+    assert [json.loads(line) for line in lines] == [message]
 
 
-# --- protocol.serve: crashing handler ----------------------------------------
-
-
-def test_serve_survives_raising_handler_and_answers_requests_with_32603():
-    def handler(message: dict):
-        if message.get("method") == "boom":
-            raise ValueError("secret internal detail")
-        return {"jsonrpc": "2.0", "id": message.get("id"), "result": {}}
-
-    in_stream = io.StringIO(
-        json.dumps({"jsonrpc": "2.0", "id": 7, "method": "boom"})
-        + "\n"
-        + json.dumps({"jsonrpc": "2.0", "id": 8, "method": "ping"})
-        + "\n"
-    )
-    out_stream = io.StringIO()
-    protocol.serve(handler, in_stream, out_stream)
-
-    responses = [json.loads(line) for line in out_stream.getvalue().splitlines()]
-    assert responses[0] == {
-        "jsonrpc": "2.0",
-        "id": 7,
-        "error": {"code": -32603, "message": "internal error"},
-    }
-    # Loop survived: the follow-up request got its normal response.
-    assert responses[1] == {"jsonrpc": "2.0", "id": 8, "result": {}}
-    # Exception detail never leaks to the client stream.
-    assert "secret internal detail" not in out_stream.getvalue()
-
-
-def test_serve_never_responds_to_raising_notification():
-    def handler(message: dict):
-        raise ValueError("boom")
-
-    in_stream = io.StringIO(
-        json.dumps({"jsonrpc": "2.0", "method": "notifications/whatever"}) + "\n"
-    )
-    out_stream = io.StringIO()
-    protocol.serve(handler, in_stream, out_stream)
-    assert out_stream.getvalue() == ""
+# --- handler exceptions: a raise ABOVE the tool layer (inside the SDK's own
+# request/notification dispatch) is exercised at the real-subprocess level
+# now, in tests/server/test_stdio_e2e.py:
+# test_request_handler_exception_above_the_tool_layer_gets_error_and_loop_survives
+# and test_notification_handler_exception_still_gets_no_response — that
+# dispatch lives in mcp.server.lowlevel.Server, not in this package's code
+# anymore. `GraphifyMeshServer.call_tool`'s own try/except below is a
+# narrower, separate guarantee: "no exception text leaks" for a raise INSIDE
+# a tool handler specifically (call_tool sanitizes to "internal error"; the
+# SDK's own dispatch, verified in the tests above, does not sanitize a
+# raising handler's message — it only guarantees no traceback/path leak and
+# that the transport loop survives).
 
 
 # --- call_tool: unexpected exception -----------------------------------------
@@ -143,30 +125,20 @@ def test_call_tool_non_serializable_result_hits_generic_branch(monkeypatch):
 @pytest.mark.parametrize("bad_k", [0, -5, MAX_K + 1, 10**9, "abc", 1.5, True])
 def test_search_rejects_invalid_k_and_server_survives(tmp_path, monkeypatch, bad_k):
     server = _search_server(tmp_path, monkeypatch)
-    response = server.handle_message(
-        _rpc("tools/call", {"name": "search", "arguments": {"q": "OrderService", "k": bad_k}})
-    )
-    result = response["result"]
+    result = server.call_tool("search", {"q": "OrderService", "k": bad_k})
     assert result["isError"] is True
     assert "'k' must be" in result["content"][0]["text"]
 
     # Server survives: a subsequent valid call succeeds.
-    ok = server.handle_message(
-        _rpc(
-            "tools/call",
-            {"name": "search", "arguments": {"q": "OrderService", "k": 5}},
-            request_id=2,
-        )
-    )
-    assert ok["result"]["isError"] is False
+    ok = server.call_tool("search", {"q": "OrderService", "k": 5})
+    assert ok["isError"] is False
 
 
 @pytest.mark.parametrize("tool", ["cross_project", "find_similar"])
 def test_other_k_tools_reject_invalid_k(tmp_path, monkeypatch, tool):
     server = _search_server(tmp_path, monkeypatch)
     arguments = {"q": "x", "node": "x", "k": "abc"}
-    response = server.handle_message(_rpc("tools/call", {"name": tool, "arguments": arguments}))
-    result = response["result"]
+    result = server.call_tool(tool, arguments)
     assert result["isError"] is True
     assert "'k' must be" in result["content"][0]["text"]
 
@@ -177,26 +149,15 @@ def test_other_k_tools_reject_invalid_k(tmp_path, monkeypatch, tool):
 @pytest.mark.parametrize("bad_budget", [0, -1, MAX_TOKEN_BUDGET + 1, "lots", True])
 def test_context_pack_rejects_invalid_token_budget(tmp_path, monkeypatch, bad_budget):
     server = _search_server(tmp_path, monkeypatch)
-    response = server.handle_message(
-        _rpc(
-            "tools/call",
-            {"name": "context_pack", "arguments": {"goal": "g", "token_budget": bad_budget}},
-        )
-    )
-    result = response["result"]
+    result = server.call_tool("context_pack", {"goal": "g", "token_budget": bad_budget})
     assert result["isError"] is True
     assert "'token_budget' must be" in result["content"][0]["text"]
 
 
 def test_context_pack_accepts_valid_token_budget(tmp_path, monkeypatch):
     server = _search_server(tmp_path, monkeypatch)
-    response = server.handle_message(
-        _rpc(
-            "tools/call",
-            {"name": "context_pack", "arguments": {"goal": "OrderService", "token_budget": 500}},
-        )
-    )
-    assert response["result"]["isError"] is False
+    result = server.call_tool("context_pack", {"goal": "OrderService", "token_budget": 500})
+    assert result["isError"] is False
 
 
 # --- retrieval: malformed lexical-index entry ---------------------------------
@@ -240,10 +201,8 @@ def test_search_tool_survives_malformed_lexical_entry(tmp_path, monkeypatch):
     for entries in generation.lexical.get("postings", {}).values():
         entries.append(["acme.repo"])  # malformed: wrong length, no key
 
-    response = server.handle_message(
-        _rpc("tools/call", {"name": "search", "arguments": {"q": "OrderService"}})
-    )
-    assert response["result"]["isError"] is False
+    result = server.call_tool("search", {"q": "OrderService"})
+    assert result["isError"] is False
 
 
 # --- constant alignment --------------------------------------------------------

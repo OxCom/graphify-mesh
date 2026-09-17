@@ -123,8 +123,8 @@ alternative, troubleshooting) in
 
 ## 7. Register the MCP server
 
-`graphify-mesh-server` speaks newline-delimited JSON-RPC 2.0 over stdio, one
-process per client session. Register it with your MCP-capable client:
+`graphify-mesh-server` defaults to stdio, one process per client session.
+Register it with your MCP-capable client:
 
 ```json
 {
@@ -138,3 +138,120 @@ process per client session. Register it with your MCP-capable client:
 ```
 
 See [`mcp-server.md`](mcp-server.md) for the tools and protocol details.
+
+## 8. Running the shared HTTP daemon
+
+`--transport http` runs one `graphify-mesh-server` process serving every
+local agent over a URL instead of spawning a process per client session.
+stdio keeps working and stays the default; this is an opt-in alternative for
+a machine running many agent sessions against the same generation.
+
+### Env file
+
+Put the port and a generated token in `~/.config/claude-mcp/graphify-mesh.env`
+(never in the systemd unit file, which `systemctl cat` would expose to any
+local user):
+
+```bash
+GRAPHIFY_MESH_HTTP_PORT=19744
+GRAPHIFY_MESH_HTTP_TOKEN=<generate one, do not reuse a token from elsewhere>
+```
+
+An empty or whitespace-only `GRAPHIFY_MESH_HTTP_TOKEN` counts as absent: the
+daemon exits `2` with the reason on stderr instead of starting unauthenticated.
+
+### systemd unit
+
+Point the unit's `ExecStart` at the HTTP transport and have it read the env
+file above via `EnvironmentFile`:
+
+```ini
+[Service]
+EnvironmentFile=%h/.config/claude-mcp/graphify-mesh.env
+Environment=GRAPHIFY_MESH_ROOT=/path/to/your/workspace/graph-mesh
+ExecStart=graphify-mesh-server --transport http
+```
+
+Restarting the unit drops graphify-mesh tools from every open session for a
+few seconds while it comes back up.
+
+### Client entry
+
+Point the client at the daemon's URL with the bearer token in the
+`Authorization` header:
+
+```json
+{
+  "mcpServers": {
+    "graphify-mesh": {
+      "type": "http",
+      "url": "http://127.0.0.1:19744/mcp",
+      "headers": { "Authorization": "Bearer <token from the env file>" }
+    }
+  }
+}
+```
+
+Every `search`/`context_pack` call must pass its own absolute `cwd`: the
+shared daemon has no per-session directory to fall back to, and an
+unregistered or absent `cwd` fails closed.
+
+### PreToolUse hook: filling cwd automatically
+
+A client that calls `search` or `context_pack` with `scope: "current"` and no
+`cwd` argument gets a `cwd` resolved against the daemon's own process
+directory, which matches no registered repository. The call fails closed. A
+Claude Code `PreToolUse` hook can fill `cwd` before the call reaches the
+server, so the model does not have to pass it on every call from a
+registered repository.
+
+`examples/hooks/graphify-mesh-cwd.py` is that hook: stdlib-only Python, no
+dependencies. Copy it somewhere Claude Code can execute:
+
+```bash
+mkdir -p ~/.claude/hooks
+cp examples/hooks/graphify-mesh-cwd.py ~/.claude/hooks/graphify-mesh-cwd.py
+chmod +x ~/.claude/hooks/graphify-mesh-cwd.py
+```
+
+Add a `PreToolUse` entry to `~/.claude/settings.json` matching this server's
+tools:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__graphify-mesh__*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/graphify-mesh-cwd.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Verify from a registered repository: call `search` with `scope: "current"`
+and no `cwd` argument. A working hook returns results scoped to that repo
+instead of the closed-scope error.
+
+The hook fills `cwd` only when the argument is absent. A call that already
+carries `cwd` is passed through untouched, including an invalid one such as
+`""` or a relative path: the server rejects those, and a hook that replaced
+them with the session directory would turn a call that should fail into a
+call answered for a different repository.
+
+This hook is Claude-Code-specific: it relies on Claude Code's `PreToolUse`
+stdin/stdout contract. A different MCP client needs its own equivalent, or
+its calls must pass `cwd` themselves, or use an explicit `scope` such as
+`repo:<id>` instead of `current`.
+
+### Rollback
+
+Restore two things: the unit's `ExecStart` back to the stdio command, and the
+client's `mcpServers` entry back to the `command`/stdio form. stdio never
+stopped working, so rollback is configuration-only, no data migration.

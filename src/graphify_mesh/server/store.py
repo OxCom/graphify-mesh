@@ -35,6 +35,7 @@ from pathlib import Path
 import numpy as np
 
 from graphify_mesh.server.config import ServerConfig
+from graphify_mesh.server.rwlock import ReadWriteLock
 from graphify_mesh.sync.embedding import (
     SHARD_MATRIX_SUFFIX,
     SHARD_META_SUFFIX,
@@ -438,6 +439,7 @@ class GenerationStore:
         self._manifest_mtime: float | None = None
         self._current_target: str | None = None
         self.degraded: list[str] = []
+        self._lock = ReadWriteLock()
 
     def _stat_signature(self) -> tuple[str | None, float | None]:
         current = self.config.current_symlink
@@ -454,14 +456,42 @@ class GenerationStore:
     def ensure_fresh(self) -> None:
         target, mtime = self._stat_signature()
         if target is None:
-            if self._generation is None:
-                self.degraded = ["no_generation_published"]
+            with self._lock.write():
+                if self._generation is None:
+                    self.degraded = ["no_generation_published"]
             return
-        if target == self._current_target and mtime == self._manifest_mtime:
-            return  # unchanged, nothing to do
-        self._try_reload(target, mtime)
+        with self._lock.read():
+            if target == self._current_target and mtime == self._manifest_mtime:
+                return  # unchanged, nothing to do
+        with self._lock.write():
+            # Re-check under the write lock, from a FRESH stat — never from
+            # the signature captured above. Two reasons, and only the second
+            # one needs the fresh stat:
+            #   * another thread may have reloaded this exact generation
+            #     while this one waited for the lock, and without a re-check
+            #     N concurrent readers each trigger their own full reload;
+            #   * a publish may have advanced `current` during that wait and
+            #     another thread may have already loaded the newer
+            #     generation. Deciding from the stale capture then concludes
+            #     that a reload is due and loads the OLDER generation over
+            #     the newer one — the store goes backwards.
+            # Which generation to load is therefore decided here; `_try_reload`
+            # still reads every artifact from the one realpath it is handed,
+            # so a publish landing mid-load cannot mix two generations.
+            fresh_target, fresh_mtime = self._stat_signature()
+            if fresh_target is None:
+                # `current` disappeared while this thread waited. Keep
+                # serving what is loaded rather than reloading a path that
+                # is no longer published.
+                if self._generation is None:
+                    self.degraded = ["no_generation_published"]
+                return
+            if fresh_target == self._current_target and fresh_mtime == self._manifest_mtime:
+                return
+            self._try_reload(fresh_target, fresh_mtime)
 
     def _try_reload(self, target: str, mtime: float | None) -> None:
+        # Only ever called under `self._lock.write()` — see `ensure_fresh`.
         # Every artifact read goes through the CAPTURED realpath (`target`),
         # never the live `current` symlink: a sync publish flipping `current`
         # mid-load must not mix files from two generations into one
@@ -606,10 +636,12 @@ class GenerationStore:
     @property
     def generation(self) -> Generation:
         self.ensure_fresh()
-        if self._generation is None:
-            raise GenerationUnavailableError(
-                "no consistent published generation is available yet "
-                "(fresh install, or every publish so far "
-                "failed manifest consistency) — run the graphify-mesh-sync pipeline at least once"
-            )
-        return self._generation
+        with self._lock.read():
+            if self._generation is None:
+                raise GenerationUnavailableError(
+                    "no consistent published generation is available yet "
+                    "(fresh install, or every publish so far "
+                    "failed manifest consistency) — run the graphify-mesh-sync "
+                    "pipeline at least once"
+                )
+            return self._generation

@@ -76,8 +76,9 @@ overlay, and a query server that only widens scope when you ask it to.
        +-- lexical-index.json          (tokenized postings for hybrid search)
                  |
                  v
-        +------------------+        graphify-mesh-server  (stdio MCP, one per session)
-        |  MCP query server |  tools: search, cross_project, find_similar,
+        +------------------+        graphify-mesh-server  (stdio, one per session,
+        |  MCP query server |         or --transport http, one shared daemon)
+        |                   |  tools: search, cross_project, find_similar,
         |                   |         project_map, context_pack
         +------------------+
 ```
@@ -121,9 +122,11 @@ graphify-mesh-sync --once \
   --scan-root /path/to/your/workspace/checkouts \
   --scan-depth 4
 
-# 6. Register the MCP server with your MCP-capable client (stdio):
+# 6. Register the MCP server with your MCP-capable client (stdio, default):
 #    command: graphify-mesh-server
 #    env:     GRAPHIFY_MESH_ROOT=/path/to/your/workspace/graph-mesh
+#    Or run one shared daemon for every local agent: graphify-mesh-server --transport http
+#    (needs GRAPHIFY_MESH_HTTP_TOKEN — see docs/setup.md)
 ```
 
 Full walkthrough: [`docs/setup.md`](docs/setup.md).
@@ -138,7 +141,7 @@ Full walkthrough: [`docs/setup.md`](docs/setup.md).
 | [`docs/keeping-sync-up-to-date.md`](docs/keeping-sync-up-to-date.md) | Scheduled re-indexing: step-by-step systemd timer setup (env file, units, cadence, reaper), cron alternative, adding/removing repos, troubleshooting. |
 | [`docs/configuration.md`](docs/configuration.md) | Every `GRAPHIFY_MESH_*` env var, every `Settings` field, the `registry.json` and `manual-relations.json` schemas. |
 | [`docs/architecture.md`](docs/architecture.md) | Pipeline stages, the two-MCP-server concept, and the structural-vs-overlay / rebuild-from-empty invariants. |
-| [`docs/mcp-server.md`](docs/mcp-server.md) | The 5 tools, the stdio JSON-RPC protocol, how to register the server. |
+| [`docs/mcp-server.md`](docs/mcp-server.md) | The 5 tools, both transports (stdio and shared HTTP), how to register the server. |
 | [`docs/publishing.md`](docs/publishing.md) | Why GitHub Packages does **not** host Python, and how the gh-pages PEP 503 "simple" index substitutes for it. |
 
 ## License

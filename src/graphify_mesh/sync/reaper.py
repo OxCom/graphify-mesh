@@ -26,8 +26,9 @@ touched by this tool, regardless of RSS or how long it has been running.
 Design notes:
   * Report-only by default. `--kill` (wired in the `reap-graphify-serve.py`
     CLI, not here) is required, explicit opt-in to send SIGTERM. Never
-    SIGKILL first — cooperative shutdown matches protocol.py's
-    clean-exit-on-stdin-EOF contract for graphify.serve, and a leaked
+    SIGKILL first — cooperative shutdown matches the stdio transport's
+    clean-exit-on-stdin-EOF contract for graphify.serve (now the SDK's
+    `stdio_server`, wrapped by `server/stdio_guard.py`), and a leaked
     process with a dead parent has nothing left reading its stdin anyway,
     so SIGTERM is sufficient.
   * The live-parent check is a hard filter applied BEFORE any candidate is

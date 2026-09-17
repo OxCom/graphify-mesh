@@ -45,6 +45,12 @@ keep their upstream names: `GRAPHIFY_BIN` and `GRAPHIFY_NO_BACKUP`.
 | `GRAPHIFY_MESH_TLS_INSECURE` | sync (all outbound HTTPS) | unset | Boolean shorthand for `GRAPHIFY_MESH_TLS_MODE=insecure` (`1`/`true`/`yes`/`on`). An explicit `GRAPHIFY_MESH_TLS_MODE` wins over it. |
 | `GRAPHIFY_BIN` | sync | `graphify` | Name/path of the upstream `graphify` binary. |
 | `GRAPHIFY_NO_BACKUP` | sync | (set to `1` on child calls) | Suppresses `graphify`'s dated backup dirs; the sync engine always sets this on the graphify subprocesses it spawns. |
+| `GRAPHIFY_MESH_TRANSPORT` | server | `stdio` | `stdio` or `http`. A CLI `--transport` flag beats this; this beats the default. |
+| `GRAPHIFY_MESH_HTTP_HOST` | server | `127.0.0.1` | Bind address for `--transport http`. |
+| `GRAPHIFY_MESH_HTTP_PORT` | server | `19744` | Bind port for `--transport http`. |
+| `GRAPHIFY_MESH_HTTP_PATH` | server | `/mcp` | Mount path for `--transport http`. |
+| `GRAPHIFY_MESH_HTTP_TOKEN` | server | none | Bearer token required for `--transport http`. Blank or whitespace-only counts as absent: the daemon exits `2` with the reason on stderr rather than starting unauthenticated. stdio mode ignores this variable. |
+| `GRAPHIFY_MESH_ALLOW_PUBLIC_BIND` | server | off (`0`/`false`/`no`) | Opt-in to bind a non-loopback host (`0.0.0.0`, `::`, or empty) with `--transport http`. Without it, `ServerConfig.from_env` raises `ConfigError` before the daemon starts. |
 
 ## CLI flags (`graphify-mesh-sync`)
 
@@ -61,6 +67,20 @@ keep their upstream names: `GRAPHIFY_BIN` and `GRAPHIFY_NO_BACKUP`.
 | `--allow-shrink` | Authorize publishing a smaller graph than the previous generation; also authorizes per-repo (per-project) shrink acceptance — a shrunken per-repo graph is accepted and state advances instead of being refused. |
 | `--extract-concurrency N` | Override `GRAPHIFY_MESH_EXTRACT_CONCURRENCY` (default 2, floor 1). |
 | `-v`, `--verbose` | Debug logging. |
+
+## CLI flags (`graphify-mesh-server`)
+
+| Flag | Meaning |
+|------|---------|
+| `--transport {stdio,http}` | Override `GRAPHIFY_MESH_TRANSPORT`. |
+| `--host HOST` | Override `GRAPHIFY_MESH_HTTP_HOST`. |
+| `--port PORT` | Override `GRAPHIFY_MESH_HTTP_PORT`. |
+| `--path PATH` | Override `GRAPHIFY_MESH_HTTP_PATH`. |
+| `--allow-public-bind` | Override `GRAPHIFY_MESH_ALLOW_PUBLIC_BIND` (opt-in only; no flag to force it off once the env var is set). |
+
+A flag beats its environment variable, which beats the default. There is no
+`--token` flag: the bearer token is env-only (`GRAPHIFY_MESH_HTTP_TOKEN`), so
+it never appears in a process listing.
 
 ## Discovery behavior
 
@@ -162,8 +182,14 @@ Derived path properties (all under `mesh_root`):
 ## `ServerConfig` fields (server)
 
 `graphify_mesh.server.config.ServerConfig` — `mesh_root` and `registry_path`,
-plus derived `global_dir`, `current_symlink`, and `embeddings_current_symlink`.
-Resolved from `GRAPHIFY_MESH_ROOT` / `GRAPHIFY_MESH_REGISTRY`.
+plus derived `global_dir`, `current_symlink`, and `embeddings_current_symlink`
+resolved from `GRAPHIFY_MESH_ROOT` / `GRAPHIFY_MESH_REGISTRY`, plus the
+transport fields: `transport` (`"stdio"` or `"http"`), `http_host`,
+`http_port`, `http_path`, `http_token` (`str | None`), and
+`allow_public_bind`. `ServerConfig.from_env` raises `ConfigError` at startup
+for an invalid transport, an out-of-range port, a path not starting with
+`/`, a public bind without `allow_public_bind`, or `transport="http"` with no
+usable token — never per request.
 
 ## `registry.json`
 

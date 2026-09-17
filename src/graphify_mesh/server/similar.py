@@ -55,16 +55,24 @@ def _per_generation_cache(build_fn: Callable[[Generation], _T]) -> Callable[[Gen
     generations don't pin their indexes in memory. (`Generation` is a
     non-frozen `eq=True` dataclass, hence unhashable — a plain
     `WeakKeyDictionary` keyed on the instance is not an option.)"""
+    import threading
+
     cache: dict[int, _T] = {}
+    lock = threading.Lock()
 
     def get(generation: Generation) -> _T:
         cache_key = id(generation)
-        if cache_key in cache:
-            return cache[cache_key]
-        value = build_fn(generation)
-        cache[cache_key] = value
-        weakref.finalize(generation, cache.pop, cache_key, None)
-        return value
+        hit = cache.get(cache_key)
+        if hit is not None:
+            return hit
+        with lock:
+            hit = cache.get(cache_key)
+            if hit is not None:
+                return hit
+            value = build_fn(generation)
+            cache[cache_key] = value
+            weakref.finalize(generation, cache.pop, cache_key, None)
+            return value
 
     return get
 

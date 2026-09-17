@@ -65,6 +65,36 @@ There are two MCP servers in play, and they are complementary:
   `find_similar`, `project_map`, `context_pack`. These need scope resolution,
   the lexical index, the embedding index, and the cross-project overlay.
 
+### Two transports, one tool surface
+
+`graphify-mesh-server` runs as either transport, both registered once against
+the `mcp` SDK's low-level `Server` (`server/sdk_app.py`) from the same
+`GraphifyMeshServer.tool_schemas()` / `.call_tool()` pair, so the tool set
+cannot drift between modes:
+
+- **stdio** (default): one process per client session, unchanged behavior.
+- **`--transport http`**: one shared daemon serving every local agent over
+  stateless streamable HTTP, gated by a mandatory bearer token and Host/Origin
+  validation. See [`mcp-server.md`](mcp-server.md) for the protocol detail and
+  [`configuration.md`](configuration.md) for the flags and env vars.
+
+A shared daemon has one process's `cwd`, not each caller's, so `scope='current'`
+resolution depends on the caller passing its own absolute directory in the
+per-call `cwd` tool argument instead of relying on the process's working
+directory.
+
+### Concurrency in the shared daemon
+
+Reads run in parallel; a generation reload takes an exclusive lock
+(`server/rwlock.py`, a writer-preferring read/write lock, so a steady stream
+of reads cannot postpone a reload indefinitely). `GenerationStore` re-checks
+the generation signature under the write lock before reloading, so two
+threads racing a reload never load the same generation twice, and the loaded
+`Generation` object is only published to readers once it is fully built. The
+registry cache (`server/scope.py`) and the per-generation similarity index
+cache (`server/similar.py`) are each guarded by their own lock, with the fast
+cache-hit path lock-free.
+
 ### Why community names can legitimately differ between them
 
 graphify's server reads a graph's `community_name` attribute verbatim.

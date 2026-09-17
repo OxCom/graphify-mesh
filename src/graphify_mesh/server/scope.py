@@ -18,6 +18,7 @@ crowd out every current-project hit before the filter ever runs).
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +51,7 @@ class ScopeDecision:
 # cached, so the fail-closed behavior (no entries -> ScopeResolutionError
 # downstream) is preserved and recovers the instant the file (re)appears.
 _registry_cache: dict[str, tuple[tuple[int, int, int], list[RegistryEntry]]] = {}
+_registry_cache_lock = threading.Lock()
 
 
 def load_registry_entries(registry_path: Path) -> list[RegistryEntry]:
@@ -64,21 +66,25 @@ def load_registry_entries(registry_path: Path) -> list[RegistryEntry]:
     cached = _registry_cache.get(cache_key)
     if cached is not None and cached[0] == signature:
         return cached[1]
-    data = json.loads(registry_path.read_text(encoding="utf-8"))
-    disabled = set(data.get("disabled", []))
-    entries = []
-    for repo in data.get("repos", []):
-        if not isinstance(repo, dict) or "repo_id" not in repo or "root" not in repo:
-            continue
-        entries.append(
-            RegistryEntry(
-                repo_id=repo["repo_id"],
-                root=Path(repo["root"]).resolve(),
-                enabled=bool(repo.get("enabled", True)) and repo["repo_id"] not in disabled,
+    with _registry_cache_lock:
+        cached = _registry_cache.get(cache_key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        data = json.loads(registry_path.read_text(encoding="utf-8"))
+        disabled = set(data.get("disabled", []))
+        entries = []
+        for repo in data.get("repos", []):
+            if not isinstance(repo, dict) or "repo_id" not in repo or "root" not in repo:
+                continue
+            entries.append(
+                RegistryEntry(
+                    repo_id=repo["repo_id"],
+                    root=Path(repo["root"]).resolve(),
+                    enabled=bool(repo.get("enabled", True)) and repo["repo_id"] not in disabled,
+                )
             )
-        )
-    _registry_cache[cache_key] = (signature, entries)
-    return entries
+        _registry_cache[cache_key] = (signature, entries)
+        return entries
 
 
 def _match_cwd(cwd: Path, entries: list[RegistryEntry]) -> str | None:

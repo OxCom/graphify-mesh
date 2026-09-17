@@ -1,19 +1,50 @@
 # MCP server
 
-`graphify-mesh-server` is a stdio MCP server implemented with the Python
-standard library only (no `mcp` SDK). It speaks newline-delimited JSON-RPC 2.0
-over stdin/stdout, one process per client session, and exits cleanly the moment
-the client closes stdin.
+`graphify-mesh-server` is one console script with two transports, both
+registered once against the `mcp` SDK's low-level `Server`
+(`server/sdk_app.py`) from the same `tool_schemas()` / `call_tool()` pair, so
+the 5-tool surface cannot drift between modes.
+
+- **stdio** (default, no flags): one process per client session, unchanged
+  behavior. Exits cleanly the moment the client closes stdin.
+- **`--transport http`**: one shared daemon serving every local agent over
+  streamable HTTP, reachable by URL instead of a spawned process per session.
 
 The advertised server name is **`graphify-mesh`**.
 
+## Transport selection
+
+| Flag | Env | Default | Meaning |
+|------|-----|---------|---------|
+| `--transport {stdio,http}` | `GRAPHIFY_MESH_TRANSPORT` | `stdio` | Which transport to run. |
+| `--host HOST` | `GRAPHIFY_MESH_HTTP_HOST` | `127.0.0.1` | HTTP bind address. |
+| `--port PORT` | `GRAPHIFY_MESH_HTTP_PORT` | `19744` | HTTP bind port. |
+| `--path PATH` | `GRAPHIFY_MESH_HTTP_PATH` | `/mcp` | HTTP mount path. |
+| `--allow-public-bind` | `GRAPHIFY_MESH_ALLOW_PUBLIC_BIND` | off | Required to bind a non-loopback host (`0.0.0.0`, `::`, empty). |
+| — | `GRAPHIFY_MESH_HTTP_TOKEN` | none | Bearer token; required when `transport=http`. |
+
+A flag beats its environment variable, which beats the default. stdio mode
+ignores the HTTP variables and the token entirely.
+
 ## Protocol
 
-- Transport: newline-delimited JSON-RPC 2.0 objects on stdin/stdout.
-- Methods: `initialize`, `tools/list`, `tools/call`.
-- Lifecycle: the client starts the process, exchanges messages, then closes
-  stdin; the server then exits with code 0. It is never a long-lived shared
-  daemon.
+**stdio**: newline-delimited JSON-RPC 2.0 objects on stdin/stdout. Methods:
+`initialize`, `tools/list`, `tools/call`. The client starts the process,
+exchanges messages, then closes stdin; the server exits with code 0.
+
+`server/stdio_guard.py` restores three protections the SDK's own stdin reader
+does not provide: a line over 4 MiB (`server/frames.py:MAX_MESSAGE_BYTES`) is
+drained in bounded chunks rather than buffered whole; a line that is not
+parseable JSON, or not a single JSON object (including a batch array), is
+answered with the exact JSON-RPC `-32700` or `-32600` before it reaches the
+SDK; and a JSON object that is not a legal JSON-RPC 2.0 envelope is answered
+`-32602` for a params-shape error and `-32600` otherwise, correlated with the
+request id when the frame carries a legal one. Without that third check such
+a frame reached the SDK's pydantic validation, which raises instead of
+answering the request, leaving the client to wait for its own timeout. An
+unrecognized JSON-RPC method answers `-32602`, not the `-32601` the retired
+dispatcher used — an accepted change, since matching `-32601` would mean
+tracking the SDK's own set of valid methods.
 
 Minimal handshake:
 
@@ -24,8 +55,64 @@ Minimal handshake:
  "params": {"name": "search", "arguments": {"q": "auth guard", "scope": "current"}}}
 ```
 
+**HTTP**: streamable HTTP at `http://<host>:<port><path>` (default
+`http://127.0.0.1:19744/mcp`), stateless (`json_response=True`,
+`stateless=True`, no sessions, no SSE, no `Mcp-Session-Id`). Every request
+needs `Authorization: Bearer <token>`; a missing or wrong token gets `401`
+with body exactly `{"error": "unauthorized"}`. The token is never logged.
+`Host`/`Origin` are validated against the bind address and the localhost
+aliases (MCP's DNS-rebinding protection) unless `--allow-public-bind` is set.
+
+Past the token gate, `http_app.py`'s frame guard applies the same two rules
+stdio applies, so a client sees one protocol whichever transport it speaks: a
+request body is capped at `MAX_MESSAGE_BYTES` counted on bytes actually
+received (a chunked client has no `Content-Length` to trust), answered `413`
+with `{"error": "request body too large"}` and the rest of the body never
+read; and a malformed frame gets the generic `-32700`/`-32600`/`-32602` error
+with HTTP `400`, with the parse or validation detail logged instead of
+returned. The SDK's own errors quote the offending input, which is what the
+guard replaces. The same cap is passed to the session manager as
+`max_request_body_size`, so both layers state one number.
+
+### Inbound memory
+
+A body being read is held whole in this one shared process, so the guard
+bounds how many it reads at once: an `anyio.Semaphore` of
+`http_app.BODY_BUFFER_SLOTS` (8), taken before the first byte and handed back
+the moment the body reaches the layer below. That caps the guard's own share
+of request bodies at 8 x 4 MiB = **32 MiB**.
+
+Reaching the bound queues, it never rejects. A request waits for a slot,
+typically for microseconds, and an operator sees latency on a burst rather
+than an error; a client sitting on an idle keep-alive connection holds no slot
+and is unaffected. uvicorn's `limit_concurrency` is deliberately NOT used: it
+answers HTTP `503` once the number of open **connections** reaches the limit,
+which on a daemon whose whole purpose is many long-lived local clients would
+reject a client with nothing in flight.
+
+Below the guard the session manager keeps its own buffer and copy of each body
+it is handed, and both layers parse the JSON. The parsed Python objects are
+the larger cost and are not a fixed multiple of the byte cap: a 4 MiB
+document of many small values expands several times over as Python objects,
+while a 4 MiB single string barely expands. The guard drops its own parsed
+object and its buffer before dispatching downstream, so the copies below it
+are the ones that live for the call. Nothing in this package bounds how many
+requests are in that state at once, so total inbound memory is not a single
+number — `BODY_BUFFER_SLOTS` x 4 MiB is the bound on the guard's share, not on
+the daemon's.
+
 If no consistent generation has been published yet, tool calls fail closed
-(an error result), rather than serving a partial or stale graph.
+(an error result) on either transport, rather than serving a partial or stale
+graph.
+
+## Concurrency (HTTP mode)
+
+Reads run in parallel; a generation reload takes an exclusive lock
+(`server/rwlock.py`, writer-preferring, so a steady stream of reads cannot
+postpone a reload indefinitely). The two read-path caches — the registry
+cache in `server/scope.py` and the per-generation index cache in
+`server/similar.py` — are each guarded by their own lock, with the fast hit
+path lock-free.
 
 ## The 5 tools
 
@@ -39,6 +126,7 @@ to the current project and only widens when asked. Fails closed if
 | `q` | string | — (required) | Query text. |
 | `scope` | string | `current` | `current`, `all`, or `repo:<id>`. |
 | `k` | integer | ranking default | Max results. |
+| `cwd` | string | — | "Absolute path of the project directory this call is about, used to resolve scope='current'. Pass it on every call — one session can move between projects. Omit it only with an explicit scope ('all' or 'repo:<id>'); a directory outside registry.json is refused." |
 
 ### `cross_project`
 Explicit cross-repo hybrid search, optionally restricted to a list of repos.
@@ -77,8 +165,11 @@ token budget without ever splitting a card mid-way.
 | `goal` | string | — (required) | What you are trying to do. |
 | `scope` | string | — | Same scope grammar as `search`. |
 | `token_budget` | integer | server default | Hard cap on returned card volume. |
+| `cwd` | string | — | Same contract as `search`'s `cwd`: "Absolute path of the project directory this call is about, used to resolve scope='current'. Pass it on every call — one session can move between projects. Omit it only with an explicit scope ('all' or 'repo:<id>'); a directory outside registry.json is refused." |
 
 ## Registering with a client
+
+Stdio (unchanged, one process per client session):
 
 ```json
 {
@@ -91,9 +182,31 @@ token budget without ever splitting a card mid-way.
 }
 ```
 
+HTTP (one shared daemon, started separately — see
+[`setup.md`](setup.md#8-running-the-shared-http-daemon) for the operator
+walkthrough):
+
+```json
+{
+  "mcpServers": {
+    "graphify-mesh": {
+      "type": "http",
+      "url": "http://127.0.0.1:19744/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+Every call to `search` or `context_pack` against an HTTP daemon must pass
+`cwd`: with one process serving many sessions there is no per-session cwd for
+`scope='current'` to fall back to, and an absent `cwd` fails closed with an
+error naming the fix (pass `cwd`, or use `scope='repo:<id>'`).
+
 You can also invoke the module directly (useful before an install, with the
 package on `PYTHONPATH`):
 
 ```bash
 PYTHONPATH=src python -m graphify_mesh.server.server
+PYTHONPATH=src python -m graphify_mesh.server.server --transport http
 ```
