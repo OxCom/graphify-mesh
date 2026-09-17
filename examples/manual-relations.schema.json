@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://agentscopex.github.io/graphify-mesh/schemas/manual-relations.schema.json",
+  "$id": "https://oxcom.github.io/graphify-mesh/schemas/manual-relations.schema.json",
   "title": "graphify-mesh manual cross-project relations",
   "description": "Human-declared cross-project overlay edges the sync engine cannot infer. Every source/target must resolve against the current generation's per-repo graphs at load time; a dangling reference is a hard error.",
   "type": "object",

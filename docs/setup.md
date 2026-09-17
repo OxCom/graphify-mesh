@@ -42,20 +42,21 @@ This provides three console scripts: `graphify-mesh-sync`,
 
 ### Installing from the project's own package index
 
-graphify-mesh is published to a PEP 503 "simple" index hosted on GitHub Pages
-(see [`publishing.md`](publishing.md) for why this is used instead of GitHub
-Packages). Once Pages is enabled on the repo, install a specific version with:
+graphify-mesh is published to a PEP 503 "simple" index, built and pushed to
+the `gh-pages` branch of this repository by the release workflow
+(`.github/workflows/release.yml`). Once Pages is enabled on the repo, install
+a specific version with:
 
 ```bash
 pip install \
-  --index-url https://agentscopex.github.io/graphify-mesh/simple/ \
+  --index-url https://oxcom.github.io/graphify-mesh/simple/ \
   graphify-mesh==0.1.0
 ```
 
 The exact URL scheme is:
 
-- **Index root:** `https://agentscopex.github.io/graphify-mesh/simple/`
-- **Project page:** `https://agentscopex.github.io/graphify-mesh/simple/graphify-mesh/`
+- **Index root:** `https://oxcom.github.io/graphify-mesh/simple/`
+- **Project page:** `https://oxcom.github.io/graphify-mesh/simple/graphify-mesh/`
 - Each release's wheel and sdist are linked from the project page, pointing at
   the GitHub Release asset download URLs.
 

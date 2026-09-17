@@ -72,8 +72,8 @@ lint = [
 dev = ["graphify-mesh[test,lint]"]
 
 [project.urls]
-Homepage = "https://github.com/AgentScopeX/graphify-mesh"
-Repository = "https://github.com/AgentScopeX/graphify-mesh"
+Homepage = "https://github.com/OxCom/graphify-mesh"
+Repository = "https://github.com/OxCom/graphify-mesh"
 
 [project.scripts]
 graphify-mesh-sync = "graphify_mesh.sync.cli:main"
