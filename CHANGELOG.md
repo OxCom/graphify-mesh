@@ -29,9 +29,8 @@
   the two transports cannot serve different tools. `mcp`, `starlette`, and
   `uvicorn` become required dependencies. `server/stdio_guard.py` keeps the
   line-size cap and the malformed-frame `-32700`/`-32600` responses the
-  retired transport provided. An unrecognized JSON-RPC method now answers
-  `-32602` instead of the retired dispatcher's `-32601` — accepted, since
-  matching `-32601` would mean tracking the SDK's own valid-method set.
+  retired transport provided. An unrecognized JSON-RPC method answers
+  `-32601`, matching the retired dispatcher.
 - Changed: generation reads and reloads run under a writer-preferring
   read/write lock (`server/rwlock.py`) instead of being fused, so concurrent
   reads in the shared daemon no longer serialize behind each other while a
@@ -86,12 +85,17 @@
   alive across the downstream call. Total inbound memory is still not a single
   number: the parsed-object cost is not a fixed multiple of the byte cap, and
   nothing here bounds how many requests sit below the guard at once.
-- Changed: the `mcp` floor is `>=1.30`, up from `>=1.12`. The HTTP adapter
-  passes `max_request_body_size`, which older releases do not accept, and an
-  SDK that raises `TypeError` before the port opens is worse than a resolver
-  conflict. `session_idle_timeout=None` was dropped instead of pinned: the SDK
-  documents it as unused in stateless mode. `tests/server/test_sdk_surface.py`
-  pins both facts.
+- Changed: the `mcp` floor is `>=2.2,<3`, up from `>=1.12`, then `>=1.30`. The
+  HTTP adapter passes `max_request_body_size`, which older releases do not
+  accept, and an SDK that raises `TypeError` before the port opens is worse
+  than a resolver conflict. `session_idle_timeout=None` was dropped instead of
+  pinned: the SDK documents it as unused in stateless mode.
+  `tests/server/test_sdk_surface.py` pins both facts. `starlette` moves to
+  `>=1.6,<2`, closing five advisories present in 0.52.1 and unreachable under
+  the old `<1` cap (PYSEC-2026-161, -248, -249, -2280, -2281); `uvicorn` moves
+  to `>=0.53,<1`. In the lint extra, `mypy` moves to `>=2.3,<3`. Floors also
+  rise for `pytest`, `pytest-cov`, `httpx`, `ruff`, `graphifyy`, `jsonschema`
+  and `PyYAML`.
 - Fixed: the `cwd` hook (`examples/hooks/graphify-mesh-cwd.py`) overwrote an
   explicitly supplied invalid `cwd` — `""`, whitespace or a number became the
   session directory, so a call that should have failed validation was answered

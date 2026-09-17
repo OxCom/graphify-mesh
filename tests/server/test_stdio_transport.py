@@ -88,7 +88,10 @@ async def test_sdk_stdout_shares_our_buffer_or_frames_can_interleave(monkeypatch
     monkeypatch.setattr(sys, "stdout", fake_stdout)
 
     async with stdio_server(stdin=capped_stdin(io.StringIO(""))) as (_read_stream, write_stream):
-        message = types.JSONRPCMessage(types.JSONRPCNotification(jsonrpc="2.0", method="probe"))
+        # `types.JSONRPCMessage` is a union type alias, not a constructible
+        # class, as of mcp 2.x — `SessionMessage.message` takes a union
+        # member (e.g. `JSONRPCNotification`) directly.
+        message = types.JSONRPCNotification(jsonrpc="2.0", method="probe")
         await write_stream.send(SessionMessage(message=message))
         await anyio.sleep(0.1)  # let stdio_server's stdout_writer task drain and flush
         written = raw.getvalue()

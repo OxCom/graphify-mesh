@@ -3,7 +3,9 @@
 `graphify-mesh-server` is one console script with two transports, both
 registered once against the `mcp` SDK's low-level `Server`
 (`server/sdk_app.py`) from the same `tool_schemas()` / `call_tool()` pair, so
-the 5-tool surface cannot drift between modes.
+the 5-tool surface cannot drift between modes. Both the `list_tools` and
+`call_tool` handlers catch any unexpected exception, log the traceback to
+stderr, and return a generic error with no exception text to the client.
 
 - **stdio** (default, no flags): one process per client session, unchanged
   behavior. Exits cleanly the moment the client closes stdin.
@@ -42,9 +44,7 @@ SDK; and a JSON object that is not a legal JSON-RPC 2.0 envelope is answered
 request id when the frame carries a legal one. Without that third check such
 a frame reached the SDK's pydantic validation, which raises instead of
 answering the request, leaving the client to wait for its own timeout. An
-unrecognized JSON-RPC method answers `-32602`, not the `-32601` the retired
-dispatcher used — an accepted change, since matching `-32601` would mean
-tracking the SDK's own set of valid methods.
+unrecognized JSON-RPC method answers `-32601`.
 
 Minimal handshake:
 

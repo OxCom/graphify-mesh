@@ -15,7 +15,7 @@ async def test_list_tools_matches_the_native_schemas(mesh_server):
     tools = await _list_tools(sdk)
     assert [t.name for t in tools] == [s["name"] for s in mesh_server.tool_schemas()]
     for tool, schema in zip(tools, mesh_server.tool_schemas(), strict=True):
-        assert tool.inputSchema == schema["inputSchema"]
+        assert tool.input_schema == schema["inputSchema"]
         assert tool.description == schema["description"]
 
 
@@ -67,21 +67,18 @@ async def test_call_tool_exception_stays_generic(mesh_server, monkeypatch):
 
 
 # The only place that knows how to reach the SDK's registered request
-# handlers directly (Task 1 probe): `Server.request_handlers` keys by
-# request type, and the `list_tools`/`call_tool` handlers take that
-# request object (or `None` for the no-arg `list_tools` style).
+# handlers directly (Task 1 probe): `Server.get_request_handler(method)`
+# returns a `HandlerEntry(params_type, handler)` keyed by JSON-RPC method
+# string, and the `handler` itself takes `(ctx, params)` and returns the
+# result model directly (no `.root` unwrap — that was the pre-2.x shape).
 async def _list_tools(sdk):
-    handler = sdk.request_handlers[types.ListToolsRequest]
-    result = await handler(None)
-    return result.root.tools
+    entry = sdk.get_request_handler("tools/list")
+    result = await entry.handler(None, None)
+    return result.tools
 
 
 async def _call_tool(sdk, name: str, arguments: dict):
-    handler = sdk.request_handlers[types.CallToolRequest]
-    request = types.CallToolRequest(
-        method="tools/call",
-        params=types.CallToolRequestParams(name=name, arguments=arguments),
-    )
-    result = await handler(request)
-    call_result = result.root
-    return call_result.content, call_result.isError
+    entry = sdk.get_request_handler("tools/call")
+    params = types.CallToolRequestParams(name=name, arguments=arguments)
+    result = await entry.handler(None, params)
+    return result.content, result.is_error

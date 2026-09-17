@@ -33,18 +33,20 @@ An unparseable, non-object or unusably-identified frame is answered with
 carries a legal id (case 3) is answered with that id, so the client can
 correlate the error with its pending request instead of waiting.
 
-Both error responses and the SDK's own responses (via
-`mcp.server.stdio.stdio_server`'s default stdout, a fresh `TextIOWrapper`
-over `sys.stdout.buffer`) end up writing to the *same* underlying
-`sys.stdout.buffer` `BufferedWriter` object. CPython's `io.BufferedWriter`
-serializes concurrent `write()` calls on one buffer with an internal lock
-(each call's bytes are appended as a whole under that lock), so two writers
-sharing the same buffer can never interleave *within* a line. This module
-deliberately does not add a second, unrelated lock of its own — instead the
-two things that guarantee are conditional on (CPython's `BufferedWriter`
-locking its `write()` calls; the SDK's stdout and `capped_stdin`'s default
-`out_stream` wrapping the identical `sys.stdout.buffer`) are each pinned by
-a test in `tests/server/test_stdio_transport.py`, so a future CPython or
+Both error responses and the SDK's own responses end up writing to the same
+underlying wire (the process's original fd 1) through two *independent*
+duplicates of it: `capped_stdin`'s default `out_stream` is a private `dup()`
+taken before `mcp.server.stdio.stdio_server()` claims fd 1 for its own use
+(see `_real_wire_stdout`), and the SDK makes its own separate duplicate at
+claim time. Since these are two different Python objects (not one shared
+`BufferedWriter` anymore, as an earlier `mcp` release let this module
+assume), the no-interleaving guarantee moves to POSIX: a `write()` no larger
+than `PIPE_BUF` is atomic, so two duplicates of the same pipe fd still never
+interleave *within* a line. This module deliberately does not add a lock of
+its own — instead the two things that guarantee is conditional on (POSIX
+`PIPE_BUF` atomicity for a line-sized write; `stdio_guard` and the SDK each
+holding their own duplicate of the one original fd 1) are each pinned by a
+test in `tests/server/test_stdio_transport.py`, so a future CPython or
 `mcp` release that breaks either one fails a test instead of silently
 corrupting stdout:
 `test_sdk_stdout_shares_our_buffer_or_frames_can_interleave` (the SDK still
@@ -59,6 +61,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from typing import IO, cast
 
@@ -146,6 +149,31 @@ class _CappedLineReader:
             return raw_line
 
 
+def _real_wire_stdout() -> IO[str]:
+    """A private duplicate of the real stdout descriptor, taken now — before
+    `mcp.server.stdio.stdio_server()` claims fd 1 for its own writes and
+    `dup2()`s it to stderr for the connection's duration (its stray-write
+    guard: PR #3117; confirmed by reading `_claim_fd`/`_open_stdout_diversion`
+    in the installed `mcp.server.stdio`) — so a coded error frame written to
+    `sys.stdout` at that later point would land on stderr, never the wire.
+    `os.dup()` here, before the claim, gives a descriptor that keeps
+    pointing at the original open file description regardless of what fd 1
+    itself gets pointed at afterward; POSIX guarantees a `write()` no larger
+    than `PIPE_BUF` lands whole, so this descriptor and the SDK's own
+    (a later, separate duplicate of the same original fd 1) still never
+    interleave a line, without sharing one Python object's lock the way the
+    pre-mcp-2.x same-`sys.stdout.buffer` version of this function did.
+    Falls back to `sys.stdout` itself when it has no real OS descriptor to
+    duplicate (e.g. a test's in-memory stand-in), which is this function's
+    only caller's exact pre-existing default in that case.
+    """
+    try:
+        fd = os.dup(sys.stdout.fileno())
+    except (AttributeError, OSError, ValueError):
+        return sys.stdout
+    return os.fdopen(fd, "w", buffering=1)
+
+
 def capped_stdin(
     stream: IO[str] | None = None, out_stream: IO[str] | None = None
 ) -> anyio.AsyncFile[str]:
@@ -153,12 +181,12 @@ def capped_stdin(
     complete, valid-shaped lines; drains and drops any line over
     `MAX_LINE_BYTES` with a stderr warning instead of buffering it; answers
     an unparseable or non-object/batch line with the matching JSON-RPC error
-    on `out_stream` (default `sys.stdout`, the same stream the SDK writes
-    its own responses to) instead of forwarding it; skips blank lines; stops
-    at EOF."""
+    on `out_stream` (default: a private duplicate of the real stdout
+    descriptor, taken now — see `_real_wire_stdout`) instead of forwarding
+    it; skips blank lines; stops at EOF."""
     reader = _CappedLineReader(
         stream if stream is not None else sys.stdin,
-        out_stream if out_stream is not None else sys.stdout,
+        out_stream if out_stream is not None else _real_wire_stdout(),
     )
     # `_CappedLineReader` only implements the one method `anyio.AsyncFile`
     # actually calls (`readline()`) — not the full `IO[str]` surface — so the

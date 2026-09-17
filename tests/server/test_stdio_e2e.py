@@ -264,16 +264,16 @@ def test_notification_without_id_gets_no_response_over_real_subprocess(tmp_path)
 def test_unknown_method_returns_json_rpc_error_over_real_subprocess(tmp_path):
     """Moved from the deleted `GraphifyMeshServer.handle_message` dispatcher
     (tests/server/test_server.py::test_unknown_method_returns_json_rpc_error):
-    method routing is now the SDK's. Its `mcp.server.lowlevel.Server` reports
-    an unrecognized method as -32602 (invalid params), not the -32601
-    (method not found) the hand-rolled dispatcher used to return — verified
+    method routing is now the SDK's. mcp 1.x's `mcp.server.lowlevel.Server`
+    reported an unrecognized method as -32602 (invalid params); mcp 2.x
+    reports the spec-correct -32601 (method not found) instead — verified
     against a real subprocess, not assumed."""
     _write_registry(tmp_path)
     proc = _spawn(tmp_path)
     try:
         _initialize(proc)
         response = _send(proc, {"jsonrpc": "2.0", "id": 5, "method": "bogus/method"})
-        assert response["error"]["code"] == -32602
+        assert response["error"]["code"] == -32601
     finally:
         proc.stdin.close()
         proc.wait(timeout=5)
@@ -343,9 +343,15 @@ mesh = GraphifyMeshServer(ServerConfig.from_env())
 sdk = build_sdk_server(mesh)
 
 
-@sdk.progress_notification()
-async def _raise(progress_token, progress, total=None, message=None):
+# `sdk.progress_notification()` (decorator registration) no longer exists on
+# mcp 2.x's `Server` — notification handlers register by method string via
+# `add_notification_handler`, and take `(ctx, params)` instead of the old
+# unpacked-keyword shape.
+async def _raise(ctx, params: types.ProgressNotificationParams) -> None:
     raise RuntimeError("boom: notification handler failed")
+
+
+sdk.add_notification_handler("notifications/progress", types.ProgressNotificationParams, _raise)
 
 
 async def _run():
