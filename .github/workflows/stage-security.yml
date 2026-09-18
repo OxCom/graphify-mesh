@@ -1,0 +1,141 @@
+name: stage-security
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: gitleaks — scan git history for hardcoded secrets
+        # Plain OSS gitleaks CLI, not gitleaks/gitleaks-action: that Action now
+        # requires a paid GITLEAKS_LICENSE for GitHub Organizations. The CLI
+        # itself stays free/open-source.
+        # The sha256 below is pinned from the official release checksums file:
+        # https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_checksums.txt
+        run: |
+          curl -sSfL -o gitleaks_8.30.1_linux_x64.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks_8.30.1_linux_x64.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks_8.30.1_linux_x64.tar.gz gitleaks
+          ./gitleaks detect --source . --no-banner --redact
+
+  trufflehog:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # The two scans below differ in one deliberate way: the pull-request scan
+      # reports the `unknown` result class and the history scan does not.
+      #
+      # An `unknown` result is a string that looks like a credential and cannot
+      # be verified — a placeholder in a docstring reads exactly like a real
+      # password that happens to be revoked. On a pull request that distinction
+      # is worth having, because whatever fires is in the diff under review and
+      # can still be changed before it is merged. Against full history it is
+      # not: a finding in an old commit can only be silenced by rewriting the
+      # history that contains it. Two such strings exist today
+      # (src/graphify_mesh/sync/embedding.py, the `http://user:pass@host:11434`
+      # example in display_url's docstring, which documents the very redaction
+      # that function performs), and no edit can remove them from the commits
+      # they already live in. Reporting `unknown` there would fail this job on
+      # every future run, on a repository that leaks nothing.
+      #
+      # Both scans report every verified result, from every detector, with no
+      # exclusion. A real leak fails this job wherever it lands.
+      - name: trufflehog — scan PR commits for verified and unknown secrets (pull_request)
+        if: github.event_name == 'pull_request'
+        uses: trufflesecurity/trufflehog@363923b901c911a9164f50b6c423f47c15372b1c # v3.97.4
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          # --exclude-paths names one test file whose fake credential URLs are
+          # the fixtures the redaction code is measured against; the file itself
+          # explains which URLs and why. Excluding that one path is what keeps
+          # the `unknown` class switched on for every other file in the diff.
+          extra_args: --results=verified,unknown --exclude-paths=.trufflehog-exclude.txt
+
+      # Runs on push, and on the nightly schedule and manual dispatch too: a
+      # scan that only ever ran on push would leave the two triggers added for
+      # exactly this kind of periodic check with no secret scanning at all.
+      - name: trufflehog — scan full git history for verified secrets
+        if: github.event_name != 'pull_request'
+        uses: trufflesecurity/trufflehog@363923b901c911a9164f50b6c423f47c15372b1c # v3.97.4
+        with:
+          path: ./
+          base: ""
+          head: ${{ github.ref_name }}
+          # No --exclude-paths here, unlike the pull-request scan above: this
+          # scan reports only verified results, and a verified credential must
+          # fail the job whatever file it sits in, test fixture included.
+          extra_args: --results=verified
+
+  pip-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # hatch-vcs needs tag history to compute a real version
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install graphify-mesh with test extras
+        # graphifyy (the upstream graphify CLI/library) is a declared
+        # dependency, so this pulls it from PyPI automatically.
+        run: pip install -e ".[test]"
+
+      - name: pip-audit — audit installed Python dependencies for known CVEs
+        # pip-audit exits 1 when it finds known vulnerabilities — that MUST
+        # fail the job. Only other nonzero exit codes (infra/network errors,
+        # e.g. the PyPI advisory DB being unreachable) are downgraded to a
+        # logged warning so a transient hiccup doesn't block the pipeline.
+        run: |
+          pip install pip-audit
+          set +e
+          pip-audit
+          code=$?
+          set -e
+          case "$code" in
+            0)
+              echo "pip-audit: no known vulnerabilities found."
+              ;;
+            1)
+              echo "::error::pip-audit found known vulnerabilities in installed dependencies."
+              exit 1
+              ;;
+            *)
+              echo "::warning::pip-audit exited with code $code (infra/network error, not a vulnerability finding); not failing the job."
+              ;;
+          esac
+
+  hadolint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: hadolint — lint Dockerfile.test
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: Dockerfile.test

@@ -4,235 +4,47 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The nightly run asks a question no push-triggered run can ask: did the
+  # world change while this repository stood still? pip-audit answers it for
+  # the dependency tree, since a CVE gets published against code that has not
+  # been touched, and the floating-latest lane of graphify-compat answers it
+  # for upstream graphifyy, whose next release can break the two coupling
+  # points this package imports. Both stay green on the last push and go red
+  # on their own schedule.
+  schedule:
+    - cron: '0 3 * * *'
+  # Manual re-run for the same two checks, without waiting for 03:00.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# A newer push to the same branch or pull request makes the run in flight
+# pointless, so cancel it.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# One pipeline, four stages, in this order: security, tests, build, smoke. Each
+# stage is a reusable workflow whose jobs run in parallel; the stages themselves
+# are sequential, so a leaked secret stops the run before anything is built and
+# a failing test stops it before anything is published. release.yml calls these
+# same four stage workflows in the same order and adds the release stage on top,
+# so a tag cannot take a shortcut past a check a pull request has to pass.
 jobs:
-  gitleaks:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
+  security:
+    uses: ./.github/workflows/stage-security.yml
 
-      - name: gitleaks — scan git history for hardcoded secrets
-        # Plain OSS gitleaks CLI, not gitleaks/gitleaks-action: that Action now
-        # requires a paid GITLEAKS_LICENSE for GitHub Organizations. The CLI
-        # itself stays free/open-source.
-        # The sha256 below is pinned from the official release checksums file:
-        # https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_checksums.txt
-        run: |
-          curl -sSfL -o gitleaks_8.30.1_linux_x64.tar.gz \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks_8.30.1_linux_x64.tar.gz" | sha256sum -c -
-          tar -xzf gitleaks_8.30.1_linux_x64.tar.gz gitleaks
-          ./gitleaks detect --source . --no-banner --redact
+  tests:
+    needs: security
+    uses: ./.github/workflows/stage-tests.yml
 
-  trufflehog:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
+  # No expected_version on this path: outside a release there is no tag to
+  # compare the built wheel against, so the build runs without the version gate.
+  build:
+    needs: tests
+    uses: ./.github/workflows/stage-build.yml
 
-      - name: trufflehog — scan PR commits for verified secrets (pull_request)
-        if: github.event_name == 'pull_request'
-        uses: trufflesecurity/trufflehog@27b0417c16317ca9a472a9a8092acce143b49c55 # v3.95.9
-        with:
-          path: ./
-          base: ${{ github.event.pull_request.base.sha }}
-          head: ${{ github.event.pull_request.head.sha }}
-          extra_args: --results=verified,unknown
-
-      - name: trufflehog — scan full git history for verified secrets (push)
-        if: github.event_name == 'push'
-        uses: trufflesecurity/trufflehog@27b0417c16317ca9a472a9a8092acce143b49c55 # v3.95.9
-        with:
-          path: ./
-          base: ""
-          head: ${{ github.ref_name }}
-          extra_args: --results=verified,unknown
-
-  pip-audit:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0 # hatch-vcs needs tag history to compute a real version
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Install graphify-mesh with test extras
-        # graphifyy (the upstream graphify CLI/library) is a declared
-        # dependency, so this pulls it from PyPI automatically.
-        run: pip install -e ".[test]"
-
-      - name: pip-audit — audit installed Python dependencies for known CVEs
-        # pip-audit exits 1 when it finds known vulnerabilities — that MUST
-        # fail the job. Only other nonzero exit codes (infra/network errors,
-        # e.g. the PyPI advisory DB being unreachable) are downgraded to a
-        # logged warning so a transient hiccup doesn't block the pipeline.
-        run: |
-          pip install pip-audit
-          set +e
-          pip-audit
-          code=$?
-          set -e
-          case "$code" in
-            0)
-              echo "pip-audit: no known vulnerabilities found."
-              ;;
-            1)
-              echo "::error::pip-audit found known vulnerabilities in installed dependencies."
-              exit 1
-              ;;
-            *)
-              echo "::warning::pip-audit exited with code $code (infra/network error, not a vulnerability finding); not failing the job."
-              ;;
-          esac
-
-  hadolint:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: hadolint — lint Dockerfile.test
-        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
-        with:
-          dockerfile: Dockerfile.test
-
-  lint:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0 # hatch-vcs needs tag history to compute a real version
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Install graphify-mesh with lint extras
-        run: pip install -e ".[lint]"
-
-      - name: ruff — lint
-        run: ruff check .
-
-      - name: ruff — format check
-        run: ruff format --check .
-
-      - name: mypy — type-check src/
-        run: mypy src/
-
-  test:
-    needs: [gitleaks, trufflehog, pip-audit, lint, hadolint]
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
-        module: [sync, server, hardening]
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0 # hatch-vcs needs tag history to compute a real version
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: "pip"
-
-      - name: Install graphify-mesh with test extras
-        # graphifyy (the upstream graphify CLI/library) is a declared
-        # dependency, so this pulls it from PyPI automatically.
-        run: pip install -e ".[test]"
-
-      - name: Run the ${{ matrix.module }} test suite
-        run: python -m pytest tests/${{ matrix.module }} -q --cov=graphify_mesh --cov-report=term
-
-  graphify-compat:
-    # Protects the two real coupling points to upstream graphifyy — the
-    # in-process `graphify.build.distinct_repo_tags` import (sync/repo_tags.py)
-    # and the `merge-graphs ... --out` argv (sync/graphify_cli.py) — against
-    # every pinned graphifyy version, including the declared floor
-    # (graphifyy>=0.9.20 in pyproject.toml). The rest of the suite fakes the
-    # CLI, so a breaking upstream change would otherwise land unnoticed.
-    needs: [gitleaks, trufflehog, pip-audit, lint, hadolint]
-    runs-on: ubuntu-latest
-    name: graphify-compat (graphifyy ${{ matrix.graphifyy || 'resolved-latest' }})
-    strategy:
-      fail-fast: false
-      matrix:
-        graphifyy: ["0.9.20", "0.9.56", ""]
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0 # hatch-vcs needs tag history to compute a real version
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Install graphify-mesh with test extras
-        # Pulls whatever graphifyy the declared dependency range resolves to.
-        run: pip install -e ".[test]"
-
-      - name: Pin graphifyy to ${{ matrix.graphifyy }}
-        # Empty matrix entry = the floating-latest lane: keep the resolved
-        # version so a breaking upstream release shows up here early.
-        if: matrix.graphifyy != ''
-        run: pip install "graphifyy==${{ matrix.graphifyy }}"
-
-      - name: Run the graphify version-compatibility suite
-        env:
-          GRAPHIFY_COMPAT_EXPECTED_VERSION: ${{ matrix.graphifyy }}
-        run: python -m pytest tests/compat -q
-
-  smoke-test:
-    needs: [gitleaks, trufflehog, pip-audit, lint, hadolint]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0 # hatch-vcs needs tag history to compute a real version
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Install graphify-mesh with test extras
-        run: pip install -e ".[test]"
-
-      - name: Smoke-test the console scripts
-        run: |
-          graphify-mesh-sync --help
-          graphify-mesh-server --help
-          graphify-mesh-reap --help
+  smoke:
+    needs: build
+    uses: ./.github/workflows/stage-smoke.yml

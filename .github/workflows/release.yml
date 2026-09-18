@@ -8,94 +8,70 @@ on:
 # Default deny; each job below requests only what it needs.
 permissions: {}
 
+# There is deliberately no `concurrency` block here, unlike ci.yml: cancelling a
+# publish half-way is worse than paying for the runner. A cancelled release can
+# leave a GitHub release created with no simple-index entry pointing at it.
+
+# The same four stage workflows ci.yml runs — security, tests, build, smoke — in
+# the same order, with the release stage on top. They are shared files, not
+# copies, so a check cannot drift between the pull-request path and the release
+# path: before this split, a tag push ran `pytest tests/ -q` and nothing else,
+# skipping every scanner, both linters, the type-check and the compat matrix
+# that a pull request had to pass.
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  # The stage workflows inherit their permissions from the calling job, and the
+  # workflow-level default above grants none, so each call has to request the
+  # read access its checkout needs.
+  security:
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        # Release gate must cover both the declared floor (3.11, from requires-python)
-        # and the daemon's deployed Python (3.14), not just the middle version.
-        python-version: ["3.11", "3.12", "3.14"]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # hatch-vcs (see [tool.hatch.version] in pyproject.toml) derives the
-          # installed version from `git describe` against reachable tags — a
-          # shallow (default) clone has no tag history and silently produces
-          # a bogus "0+unknown"-style version instead of failing loudly.
-          fetch-depth: 0
+    uses: ./.github/workflows/stage-security.yml
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install graphify-mesh with test extras
-        # graphifyy (the upstream graphify CLI/library) is a declared
-        # dependency (pinned in pyproject.toml), so this pulls the released
-        # version from PyPI — same as ci.yml, never an unpinned git HEAD.
-        run: pip install -e ".[test]"
-
-      - name: Run the full test suite (release aborts if this fails)
-        run: python -m pytest tests/ -q
-
-  build:
-    needs: [test]
-    runs-on: ubuntu-latest
+  tests:
+    needs: security
     permissions:
       contents: read
+    uses: ./.github/workflows/stage-tests.yml
+
+  # stage-build takes a bare PEP 440 version, not a tag, so that it stays usable
+  # from ci.yml where no tag exists. Stripping the leading "v" needs a shell:
+  # GitHub's expression syntax has no substring operator.
+  version:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      value: ${{ steps.strip.outputs.value }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # Same reason as the `test` job above — `python -m build` triggers
-          # hatch-vcs, which needs the full tag history to compute a real
-          # version instead of a shallow-clone fallback.
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-
-      - name: Build sdist + wheel
-        run: |
-          python -m pip install --upgrade build
-          python -m build
-
-      - name: Verify built version matches the pushed tag
-        # hatch-vcs derives the version from `git describe` — this should
-        # always equal the tag that triggered this workflow, but "should
-        # always" is exactly the class of bug this whole workflow exists to
-        # prevent from shipping silently (see CHANGELOG 0.0.4: __version__
-        # drifted from the tag for two releases before anyone noticed). Fail
-        # loudly instead of trusting it.
+      - id: strip
         env:
           TAG: ${{ github.ref_name }}
-        run: |
-          expected="${TAG#v}"
-          built=$(ls dist/*.whl | grep -oP 'graphify_mesh-\K[^-]+(?=-py3)')
-          echo "tag=${TAG} expected=${expected} built=${built}"
-          if [ "$built" != "$expected" ]; then
-            echo "::error::Built version '${built}' does not match pushed tag '${TAG}' (expected '${expected}'). Refusing to release."
-            exit 1
-          fi
+        run: echo "value=${TAG#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload dist artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: dist
-          path: dist/
-          if-no-files-found: error
+  build:
+    needs: [tests, version]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/stage-build.yml
+    with:
+      # Non-empty only on this path: it turns on the check that the version
+      # hatch-vcs computed from git history equals the tag being released.
+      expected_version: ${{ needs.version.outputs.value }}
+
+  smoke:
+    needs: build
+    permissions:
+      contents: read
+    uses: ./.github/workflows/stage-smoke.yml
 
   github-release:
-    needs: [build]
+    needs: [smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # The published files are the ones stage-build produced and then proved
+      # installable from a clean venv. Nothing is rebuilt here: a second build
+      # could differ from the one the gates ran against.
       - name: Download dist artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

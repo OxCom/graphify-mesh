@@ -1,0 +1,117 @@
+name: stage-tests
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # hatch-vcs needs tag history to compute a real version
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install graphify-mesh with lint extras
+        run: pip install -e ".[lint]"
+
+      - name: ruff — lint
+        run: ruff check .
+
+      - name: ruff — format check
+        run: ruff format --check .
+
+      - name: mypy — type-check src/
+        run: mypy src/
+
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      # One Python version or one module failing must not hide the state of the
+      # other eleven cells: a version-specific break looks identical to a
+      # module-specific one until both matrices have finished.
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        module: [sync, server, hardening]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # hatch-vcs needs tag history to compute a real version
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install graphify-mesh with test extras
+        # graphifyy (the upstream graphify CLI/library) is a declared
+        # dependency, so this pulls it from PyPI automatically.
+        run: pip install -e ".[test]"
+
+      - name: Run the ${{ matrix.module }} test suite
+        # No --cov here on purpose. Coverage used to be measured on all twelve
+        # matrix cells and then discarded: nothing gated on a threshold, no
+        # report was uploaded, no artifact was kept, so the number only ever
+        # reached a log nobody reads. Re-add it together with whatever consumes
+        # it, not before.
+        run: python -m pytest tests/${{ matrix.module }} -q
+
+  graphify-compat:
+    # Protects the two real coupling points to upstream graphifyy — the
+    # in-process `graphify.build.distinct_repo_tags` import (sync/repo_tags.py)
+    # and the `merge-graphs ... --out` argv (sync/graphify_cli.py) — against
+    # every pinned graphifyy version, including the declared floor
+    # (graphifyy>=0.9.20 in pyproject.toml). The rest of the suite fakes the
+    # CLI, so a breaking upstream change would otherwise land unnoticed.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    name: graphify-compat (graphifyy ${{ matrix.graphifyy || 'resolved-latest' }})
+    strategy:
+      # The floating-latest lane goes red on its own schedule, when upstream
+      # publishes. Stopping the pinned lanes because of it would hide whether
+      # the break is ours or theirs.
+      fail-fast: false
+      matrix:
+        graphifyy: ["0.9.20", "0.9.56", ""]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # hatch-vcs needs tag history to compute a real version
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install graphify-mesh with test extras
+        # Pulls whatever graphifyy the declared dependency range resolves to.
+        run: pip install -e ".[test]"
+
+      - name: Pin graphifyy to ${{ matrix.graphifyy }}
+        # Empty matrix entry = the floating-latest lane: keep the resolved
+        # version so a breaking upstream release shows up here early.
+        if: matrix.graphifyy != ''
+        run: pip install "graphifyy==${{ matrix.graphifyy }}"
+
+      - name: Run the graphify version-compatibility suite
+        env:
+          GRAPHIFY_COMPAT_EXPECTED_VERSION: ${{ matrix.graphifyy }}
+        run: python -m pytest tests/compat -q

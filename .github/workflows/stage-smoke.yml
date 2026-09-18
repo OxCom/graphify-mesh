@@ -1,0 +1,49 @@
+name: stage-smoke
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # A real end-to-end run, not an import check. The `--help` calls this job used
+  # to make are now done by stage-build.yml against the installed wheel, where
+  # they belong: that job can catch a console script the wheel failed to ship,
+  # and this one cannot.
+  #
+  # What is left is the seam no other job covers. The unit suite points
+  # GRAPHIFY_BIN at tests/fixtures/fake_graphify/graphify
+  # (tests/sync/conftest.py), so the pipeline's contract with the real graphify
+  # CLI — argv shape, merge-graphs output, the graph document it accepts — is
+  # only ever asserted against a stub. The HTTP transport's socket is likewise
+  # never opened outside the unit tests' in-process client. Both are exercised
+  # here for real.
+  smoke-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # hatch-vcs needs tag history to compute a real version
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install graphify-mesh with test extras
+        # The declared `graphifyy` dependency is what puts the real `graphify`
+        # binary on PATH; GRAPHIFY_BIN is deliberately left unset so the
+        # pipeline resolves that one and not the test stub.
+        run: pip install -e ".[test]"
+
+      - name: End-to-end smoke
+        # The logic lives in a committed script instead of a long `run:` block
+        # so a developer can reproduce a CI failure with one command, including
+        # inside the repo's own test container:
+        #   docker run --rm -v "$PWD":/app -w /app graphify-mesh-test \
+        #     bash .github/smoke/end-to-end.sh /tmp/smokework
+        run: bash .github/smoke/end-to-end.sh "$RUNNER_TEMP/smoke"

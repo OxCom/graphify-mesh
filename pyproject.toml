@@ -105,7 +105,7 @@ source = "vcs"
 # fetches without tags) otherwise builds as "0+unknown". Falling back to the
 # last released tag keeps the wheel's version orderable and recognizable;
 # a real tagged build always overrides this.
-fallback-version = "0.0.10"
+fallback_version = "0.0.10"
 
 [tool.hatch.build.hooks.vcs]
 version-file = "src/graphify_mesh/_version.py"

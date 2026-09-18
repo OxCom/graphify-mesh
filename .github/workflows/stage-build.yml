@@ -1,0 +1,94 @@
+name: stage-build
+
+on:
+  workflow_call:
+    inputs:
+      expected_version:
+        description: >
+          PEP 440 version the built wheel must carry, without a leading "v".
+          Empty (the default) skips the check, which is what a pull request
+          wants: there is no tag to compare against outside a release.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  # Every other job in this repository installs with `pip install -e .`, which
+  # imports straight from src/ and never builds anything. That leaves the
+  # packaging metadata untested: a console script removed from
+  # [project.scripts], or a package left out of
+  # [tool.hatch.build.targets.wheel], produces a wheel that installs cleanly and
+  # does nothing, and the first person to find out is whoever installs the
+  # release. This job is the gate for that.
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # hatch-vcs (see [tool.hatch.version] in pyproject.toml) derives the
+          # version from `git describe` against reachable tags — a shallow
+          # (default) clone has no tag history and silently produces a bogus
+          # "0+unknown"-style version instead of failing loudly.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Verify the built version matches the expected one
+        # hatch-vcs derives the version from `git describe` — on a release this
+        # should always equal the tag that triggered the run, but "should
+        # always" is exactly the class of bug this gate exists to prevent from
+        # shipping silently (see CHANGELOG 0.0.4: __version__ drifted from the
+        # tag for two releases before anyone noticed). Fail loudly instead of
+        # trusting it. The expected value arrives as an input rather than being
+        # read from github.ref_name, because this workflow also runs on pull
+        # requests where no tag exists.
+        if: inputs.expected_version != ''
+        env:
+          EXPECTED: ${{ inputs.expected_version }}
+        run: |
+          built=$(ls dist/*.whl | grep -oP 'graphify_mesh-\K[^-]+(?=-py3)')
+          echo "expected=${EXPECTED} built=${built}"
+          if [ "$built" != "$EXPECTED" ]; then
+            echo "::error::Built version '${built}' does not match the expected version '${EXPECTED}'. Refusing to release."
+            exit 1
+          fi
+
+      - name: Install the built wheel into a clean venv and run the entry points
+        # Installing the wheel rather than `-e .` is the entire point of this
+        # step: a fresh venv outside the checkout has no src/ on sys.path, so
+        # both the import and the three console scripts can only resolve
+        # against what the wheel actually shipped. Run from $RUNNER_TEMP for
+        # the same reason — from the repository root a stray sys.path entry
+        # could satisfy the import from the source tree.
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/wheelenv"
+          "$RUNNER_TEMP/wheelenv/bin/pip" install --upgrade pip
+          "$RUNNER_TEMP/wheelenv/bin/pip" install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheelenv/bin/python" -c "import graphify_mesh; print(graphify_mesh.__name__)"
+          "$RUNNER_TEMP/wheelenv/bin/graphify-mesh-sync" --help
+          "$RUNNER_TEMP/wheelenv/bin/graphify-mesh-server" --help
+          "$RUNNER_TEMP/wheelenv/bin/graphify-mesh-reap" --help
+
+      - name: Upload dist artifacts
+        # release.yml publishes exactly these files instead of building its own
+        # copy, so what a release ships is the artifact this job just proved
+        # installable.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error

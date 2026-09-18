@@ -1,0 +1,20 @@
+# Paths the pull-request trufflehog scan must not read. One Go regex per line,
+# matched against the file path relative to the repository root. Only the
+# pull-request scan uses this file; the full-history scan reports verified
+# results from every path, this one included.
+#
+# tests/sync/test_embedding.py asserts that the embedding backend strips
+# credentials out of every URL it logs or reports. Proving that requires URLs
+# that carry credentials, so the file holds seven fake http and ftp endpoints
+# with an invented username and password in the authority part. They
+# authenticate against nothing and no host in them exists: they are the input
+# the redaction code is measured on. Without this exclusion trufflehog reports
+# all seven as unknown-class results and exits 183, failing the job on a
+# repository that leaks nothing. Those strings are deliberately not repeated
+# here, so that excluding them does not turn this file into the next finding.
+#
+# Only this one path is excluded, and only for the unknown class. Every other
+# file in a pull request keeps both the verified and the unknown class, which
+# is why the fix is a path exclusion rather than dropping --results=unknown or
+# switching detectors off repository-wide.
+(^|/)tests/sync/test_embedding\.py$
