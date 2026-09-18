@@ -75,6 +75,24 @@ def test_forbidden_edge_cross_repo_depends_on_still_caught():
     assert not result.ok
 
 
+def test_forbidden_edge_cross_repo_structural_relation_caught():
+    data = {
+        "nodes": [{"id": "repo-a::x"}, {"id": "repo-b::y"}],
+        "links": [{"source": "repo-a::x", "target": "repo-b::y", "relation": "calls"}],
+    }
+    result = validate.validate_forbidden_edges(data)
+    assert not result.ok
+
+
+def test_forbidden_edge_same_repo_structural_relation_allowed():
+    data = {
+        "nodes": [{"id": "repo-a::x"}, {"id": "repo-a::y"}],
+        "links": [{"source": "repo-a::x", "target": "repo-a::y", "relation": "calls"}],
+    }
+    result = validate.validate_forbidden_edges(data)
+    assert result.ok
+
+
 def test_shrink_guard_refuses_smaller_graph():
     result = validate.validate_shrink_guard((5, 5), (10, 10), allow_shrink=False)
     assert not result.ok

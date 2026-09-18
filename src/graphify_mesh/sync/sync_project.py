@@ -11,6 +11,7 @@ import math
 import os
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -152,7 +153,14 @@ def _classify_shrink(
     return STATUS_UPDATED
 
 
-_INVOKERS = {
+# Every invoker takes (graphify_bin, root, collection_path, staging_home) plus a
+# keyword `policy`. The staging home is per-run and per-repo: both calls parse
+# untrusted repository source under a substituted HOME so upstream cannot read
+# the operator's ~/.graphify provider config (see
+# graphify_cli._isolated_home_env). `collection_path` is passed explicitly so
+# the sandbox binds the registry-declared output directory rather than resolving
+# the `graphify-out` symlink that lives inside the scanned repository.
+_INVOKERS: dict[str, Callable[..., graphify_cli.CliResult]] = {
     ACTION_UPDATE: graphify_cli.run_update,
     ACTION_EXTRACT: graphify_cli.run_extract,
     ACTION_BOOTSTRAP: graphify_cli.run_extract,
@@ -166,9 +174,11 @@ def apply_action(
     collection_path: Path,
     action: str,
     current_manifest: SourceDigest,
+    staging_home: Path,
     *,
     allow_shrink: bool = False,
     shrink_tolerance: float = 0.0,
+    sandbox_policy: graphify_cli.SandboxPolicy | None = None,
 ) -> ProjectOutcome:
     graph_path = collection_path / "graph.json"
     dirty = is_worktree_dirty(root)
@@ -189,7 +199,15 @@ def apply_action(
         shutil.copy2(graph_path, snapshot_path)
 
     invoker = _INVOKERS[action]
-    result = invoker(graphify_bin, root)
+    try:
+        result = invoker(graphify_bin, root, collection_path, staging_home, policy=sandbox_policy)
+    except BaseException:
+        # The invoker raises on a sandbox that is configured but unavailable and
+        # on a write path that escapes containment. Both used to leave the
+        # mkstemp snapshot behind, one file per refused launch, in a directory
+        # nothing sweeps.
+        _cleanup_snapshot(snapshot_path)
+        raise
 
     if not result.ok:
         _restore_snapshot(snapshot_path, graph_path)
@@ -313,7 +331,21 @@ def apply_action(
 def _restore_snapshot(snapshot_path: Path | None, graph_path: Path) -> None:
     if snapshot_path is None:
         return
-    shutil.copy2(snapshot_path, graph_path)
+    # Copying straight onto the live graph.json leaves a truncated last-good
+    # graph if the process dies mid-copy, and the next run would take that
+    # truncation as its baseline. Stage next to the target (same filesystem,
+    # so os.replace is atomic) and swap.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{graph_path.name}.restore.", dir=str(graph_path.parent)
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        shutil.copy2(snapshot_path, tmp_path)
+        os.replace(tmp_path, graph_path)
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def _cleanup_snapshot(snapshot_path: Path | None) -> None:

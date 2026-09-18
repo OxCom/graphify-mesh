@@ -57,6 +57,7 @@ def _fake_apply_action_factory(active, lock, delay=0.05):
         collection_path,
         action,
         current_manifest,
+        staging_home=None,
         *,
         allow_shrink=False,
         # Accept any further keyword-only guard settings the real apply_action

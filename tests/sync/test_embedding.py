@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import urllib.error
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +25,24 @@ def _settings(tmp_path: Path, **overrides) -> Settings:
         graphify_bin=str(FAKE_GRAPHIFY),
         **overrides,
     )
+
+
+def _write_stamped_shard(gen_dir, repo_id, key, vector, model):
+    """A published v3 shard for `repo_id`, stamped with `model`'s recipe."""
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    (gen_dir / f"{repo_id}.meta.json").write_text(
+        json.dumps(
+            {
+                "repo_id": repo_id,
+                "shard_format": embedding.SHARD_FORMAT_VERSION,
+                "dim": len(vector),
+                "recipe_stamp": embedding.recipe_stamp_for_model(model),
+                "entries": {key: {"content_hash": "abc", "row": 0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    np.save(gen_dir / f"{repo_id}.npy", np.array([vector], dtype=np.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +122,9 @@ class _FakeResponse:
         self._body = json.dumps(body).encode("utf-8")
         self.status = 200
 
-    def read(self):
-        return self._body
+    def read(self, amt=None):
+        # embed_batch reads a bounded prefix, so honor the byte count.
+        return self._body if amt is None else self._body[:amt]
 
     def __enter__(self):
         return self
@@ -227,6 +248,7 @@ def test_compute_repo_shard_reuses_unchanged_node_without_calling_embed(tmp_path
 
     monkeypatch.setattr(embedding, "embed_batch", fake_embed_batch)
 
+    stamp = embedding.recipe_stamp_for_model("m")
     first_shard = embedding.compute_repo_shard(
         "repo.a",
         graph,
@@ -235,6 +257,7 @@ def test_compute_repo_shard_reuses_unchanged_node_without_calling_embed(tmp_path
         base_url="https://host",
         model="m",
         stats=stats,
+        recipe_stamp=stamp,
     )
     assert call_count["n"] == 1
     key = next(iter(first_shard.entries))
@@ -251,6 +274,7 @@ def test_compute_repo_shard_reuses_unchanged_node_without_calling_embed(tmp_path
         base_url="https://host",
         model="m",
         stats=stats,
+        recipe_stamp=stamp,
     )
     assert call_count["n"] == 1  # unchanged: no new call
     assert list(second_shard.vectors.get(key)) == pytest.approx([1.0, 2.0])
@@ -434,17 +458,21 @@ def test_run_embedding_stage_reuses_whole_shard_for_unchanged_repo(tmp_path, mon
     # Seed a "previous published" shard by writing directly under embeddings_current_symlink target.
     prev_gen_dir = settings.embeddings_dir / "generations" / "gen-0"
     prev_gen_dir.mkdir(parents=True)
-    (prev_gen_dir / "repo.a.json").write_text(
+    # v3 shard stamped with the recipe this run is configured for — whole-shard
+    # reuse requires a recipe match, not just unchanged sources.
+    (prev_gen_dir / "repo.a.meta.json").write_text(
         json.dumps(
             {
                 "repo_id": "repo.a",
-                "entries": {
-                    "repo.a\x1fsrc/w.py\x1fWidget": {"content_hash": "abc", "embedding": [9.0]}
-                },
+                "shard_format": embedding.SHARD_FORMAT_VERSION,
+                "dim": 1,
+                "recipe_stamp": embedding.recipe_stamp_for_model(settings.ollama_embed_model),
+                "entries": {"repo.a\x1fsrc/w.py\x1fWidget": {"content_hash": "abc", "row": 0}},
             }
         ),
         encoding="utf-8",
     )
+    np.save(prev_gen_dir / "repo.a.npy", np.array([[9.0]], dtype=np.float32))
     (prev_gen_dir / "id-map.json").write_text(json.dumps({}), encoding="utf-8")
     settings.embeddings_dir.mkdir(parents=True, exist_ok=True)
     (settings.embeddings_dir / "current").symlink_to(prev_gen_dir, target_is_directory=True)
@@ -471,20 +499,9 @@ def test_run_embedding_stage_reuses_whole_shard_for_unchanged_repo(tmp_path, mon
 
 
 def test_run_embedding_stage_degraded_carries_forward_previous_vectors(tmp_path):
-    settings = _settings(tmp_path)
+    settings = _settings(tmp_path, ollama_embed_model="model-a")
     prev_gen_dir = settings.embeddings_dir / "generations" / "gen-0"
-    prev_gen_dir.mkdir(parents=True)
-    (prev_gen_dir / "repo.a.json").write_text(
-        json.dumps(
-            {
-                "repo_id": "repo.a",
-                "entries": {
-                    "repo.a\x1fsrc/w.py\x1fWidget": {"content_hash": "abc", "embedding": [7.0]}
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+    _write_stamped_shard(prev_gen_dir, "repo.a", "repo.a\x1fsrc/w.py\x1fWidget", [7.0], "model-a")
     (prev_gen_dir / "id-map.json").write_text(json.dumps({}), encoding="utf-8")
     (settings.embeddings_dir / "current").symlink_to(prev_gen_dir, target_is_directory=True)
 
@@ -501,6 +518,95 @@ def test_run_embedding_stage_degraded_carries_forward_previous_vectors(tmp_path)
 
     assert result.status == embedding.EMBED_DEGRADED
     assert list(result.vectors_by_repo["repo.a"].get("repo.a\x1fsrc/w.py\x1fWidget")) == [7.0]
+    assert result.vectors_dropped_repos == []
+
+
+def test_degraded_run_drops_a_shard_from_another_recipe(tmp_path):
+    """A published shard from a different recipe must not be carried forward:
+    the manifest records THIS run's recipe, so staging it would publish two
+    vector spaces under one generation and nothing downstream could tell."""
+    settings = _settings(tmp_path, ollama_embed_model="model-b")
+    prev_gen_dir = settings.embeddings_dir / "generations" / "gen-0"
+    _write_stamped_shard(prev_gen_dir, "repo.a", "repo.a\x1fsrc/w.py\x1fWidget", [7.0], "model-a")
+    (prev_gen_dir / "id-map.json").write_text(json.dumps({}), encoding="utf-8")
+    (settings.embeddings_dir / "current").symlink_to(prev_gen_dir, target_is_directory=True)
+
+    result = embedding.run_embedding_stage(
+        graph_paths_by_repo={},
+        repo_roots_by_id={"repo.a": tmp_path},
+        graphs_by_repo={"repo.a": _graph_with_one_node()},
+        unchanged_repo_ids=set(),
+        settings=settings,
+        provisional_generation_id="gen-1",
+        health_check=lambda base_url, timeout: False,
+    )
+
+    assert result.status == embedding.EMBED_DEGRADED
+    assert result.vectors_dropped_repos == ["repo.a"]
+    assert len(result.vectors_by_repo["repo.a"]) == 0
+    assert result.shards_by_repo["repo.a"].entries == {}
+    assert result.shards_by_repo["repo.a"].recipe_stamp is None
+
+
+def test_degraded_run_reports_no_drop_when_nothing_was_published_before(tmp_path):
+    settings = _settings(tmp_path, ollama_embed_model="model-a")
+
+    result = embedding.run_embedding_stage(
+        graph_paths_by_repo={},
+        repo_roots_by_id={"repo.a": tmp_path},
+        graphs_by_repo={"repo.a": _graph_with_one_node()},
+        unchanged_repo_ids=set(),
+        settings=settings,
+        provisional_generation_id="gen-1",
+        health_check=lambda base_url, timeout: False,
+    )
+
+    assert result.status == embedding.EMBED_DEGRADED
+    assert result.vectors_dropped_repos == []
+
+
+def test_stage_level_health_failure_does_not_log_url_credentials(tmp_path, caplog):
+    """The stage-level degraded path renders the configured URL itself, and
+    `display_url` on the helper functions does not cover that call site."""
+    settings = _settings(
+        tmp_path, ollama_embed_base_url="http://embeduser:hunter2@embed.host:11434"
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = embedding.run_embedding_stage(
+            graph_paths_by_repo={},
+            repo_roots_by_id={"repo.a": tmp_path},
+            graphs_by_repo={"repo.a": _graph_with_one_node()},
+            unchanged_repo_ids=set(),
+            settings=settings,
+            provisional_generation_id="gen-1",
+            health_check=lambda base_url, timeout: False,
+        )
+
+    assert result.status == embedding.EMBED_DEGRADED
+    assert "hunter2" not in caplog.text
+    assert "embeduser" not in caplog.text
+    assert "embed.host:11434" in caplog.text
+    assert "hunter2" not in result.reason
+
+
+def test_invalid_base_url_degrade_reason_carries_no_credentials(tmp_path):
+    """`reason` reaches the run report and status.json, so it is redacted too."""
+    settings = _settings(tmp_path, ollama_embed_base_url="ftp://embeduser:hunter2@embed.host")
+
+    result = embedding.run_embedding_stage(
+        graph_paths_by_repo={},
+        repo_roots_by_id={"repo.a": tmp_path},
+        graphs_by_repo={"repo.a": _graph_with_one_node()},
+        unchanged_repo_ids=set(),
+        settings=settings,
+        provisional_generation_id="gen-1",
+        health_check=lambda base_url, timeout: True,
+    )
+
+    assert result.status == embedding.EMBED_DEGRADED
+    assert "hunter2" not in result.reason
+    assert "embeduser" not in result.reason
 
 
 def test_run_embedding_stage_mid_run_failure_is_partial_not_crash(tmp_path, monkeypatch):
@@ -512,17 +618,12 @@ def test_run_embedding_stage_mid_run_failure_is_partial_not_crash(tmp_path, monk
     rather than being silently skipped or crashing the process."""
     settings = _settings(tmp_path)
     prev_gen_dir = settings.embeddings_dir / "generations" / "gen-0"
-    prev_gen_dir.mkdir(parents=True)
-    (prev_gen_dir / "repo.c.json").write_text(
-        json.dumps(
-            {
-                "repo_id": "repo.c",
-                "entries": {
-                    "repo.c\x1fsrc/z.py\x1fZeta": {"content_hash": "prevc", "embedding": [3.0]}
-                },
-            }
-        ),
-        encoding="utf-8",
+    _write_stamped_shard(
+        prev_gen_dir,
+        "repo.c",
+        "repo.c\x1fsrc/z.py\x1fZeta",
+        [3.0],
+        settings.ollama_embed_model,
     )
     (prev_gen_dir / "id-map.json").write_text(json.dumps({}), encoding="utf-8")
     (settings.embeddings_dir / "current").symlink_to(prev_gen_dir, target_is_directory=True)
@@ -571,6 +672,55 @@ def test_run_embedding_stage_mid_run_failure_is_partial_not_crash(tmp_path, monk
     # repo.c (not yet reached when the failure hit) fell back to its
     # previous published vector rather than being lost or crashing.
     assert list(result.vectors_by_repo["repo.c"].get("repo.c\x1fsrc/z.py\x1fZeta")) == [3.0]
+    assert result.vectors_dropped_repos == []
+
+
+def test_mid_run_failure_drops_fallback_shards_from_another_recipe(tmp_path, monkeypatch):
+    """Same rule as the fully-degraded path: the mid-run fallback may not
+    carry a shard from another recipe into a generation whose manifest
+    advertises this run's."""
+    settings = _settings(tmp_path, ollama_embed_model="model-b")
+    prev_gen_dir = settings.embeddings_dir / "generations" / "gen-0"
+    _write_stamped_shard(prev_gen_dir, "repo.c", "repo.c\x1fsrc/z.py\x1fZeta", [3.0], "model-a")
+    (prev_gen_dir / "id-map.json").write_text(json.dumps({}), encoding="utf-8")
+    (settings.embeddings_dir / "current").symlink_to(prev_gen_dir, target_is_directory=True)
+
+    def flaky_embed_batch(base_url, model, inputs, timeout=30.0):
+        if "network-blip-marker" in inputs[0]:
+            raise RuntimeError("embed_batch request failed: simulated blip")
+        return [[1.0] for _ in inputs]
+
+    monkeypatch.setattr(embedding, "embed_batch", flaky_embed_batch)
+
+    def _graph_with_marker(marker: str) -> dict:
+        return {
+            "nodes": [
+                {
+                    "id": "n1",
+                    "label": marker,
+                    "source_file": "src/w.py",
+                    "loc": "L1",
+                    "community_name": "Widgets",
+                }
+            ]
+        }
+
+    result = embedding.run_embedding_stage(
+        graph_paths_by_repo={},
+        repo_roots_by_id={"repo.b": tmp_path, "repo.c": tmp_path},
+        graphs_by_repo={
+            "repo.b": _graph_with_marker("network-blip-marker-Bravo"),
+            "repo.c": _graph_with_marker("Gamma"),
+        },
+        unchanged_repo_ids=set(),
+        settings=settings,
+        provisional_generation_id="gen-1",
+        health_check=lambda base_url, timeout: True,
+    )
+
+    assert result.status == embedding.EMBED_PARTIAL
+    assert result.vectors_dropped_repos == ["repo.c"]
+    assert len(result.vectors_by_repo["repo.c"]) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -850,9 +1000,13 @@ def test_persist_generation_writes_current_and_gcs_old(tmp_path):
     )
     (staged_dir / "id-map.json").write_text("{}", encoding="utf-8")
 
-    embedding.persist_generation(embeddings_dir, "20260101T000000Z-aaa", staged_dir, keep=2)
-    embedding.persist_generation(embeddings_dir, "20260102T000000Z-bbb", staged_dir, keep=2)
-    embedding.persist_generation(embeddings_dir, "20260103T000000Z-ccc", staged_dir, keep=2)
+    for generation_id in (
+        "20260101T000000Z-aaa",
+        "20260102T000000Z-bbb",
+        "20260103T000000Z-ccc",
+    ):
+        embedding.persist_generation(embeddings_dir, generation_id, staged_dir)
+        embedding.gc_embedding_generations(embeddings_dir, keep=2)
 
     generations = sorted(p.name for p in (embeddings_dir / "generations").iterdir())
     assert generations == ["20260102T000000Z-bbb", "20260103T000000Z-ccc"]
@@ -902,3 +1056,399 @@ def test_build_snippet_rejects_dotdot_traversal(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
     assert embedding.build_snippet(root, "../secret.txt", line=1) == ""
+
+
+# ---------------------------------------------------------------------------
+# bounded response read + credential redaction
+# ---------------------------------------------------------------------------
+
+
+class _OversizedResponse:
+    """Streams more bytes than the caller may buffer, one chunk per read()."""
+
+    def __init__(self, total: int):
+        self._remaining = total
+        self.status = 200
+
+    def read(self, amt=None):
+        take = self._remaining if amt is None else min(amt, self._remaining)
+        self._remaining -= take
+        return b"x" * take
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_embed_batch_rejects_response_over_the_size_ceiling(monkeypatch):
+    def fake_urlopen(req, timeout=None, context=None):
+        return _OversizedResponse(embedding.MAX_EMBED_RESPONSE_BYTES + 4096)
+
+    monkeypatch.setattr(embedding.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(RuntimeError, match="ceiling"):
+        embedding.embed_batch("https://host", "model", ["a"])
+
+
+def test_embed_batch_reads_at_most_the_ceiling_plus_one(monkeypatch):
+    requested = []
+
+    class _Recording(_OversizedResponse):
+        def read(self, amt=None):
+            requested.append(amt)
+            return super().read(amt)
+
+    def fake_urlopen(req, timeout=None, context=None):
+        return _Recording(embedding.MAX_EMBED_RESPONSE_BYTES * 4)
+
+    monkeypatch.setattr(embedding.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(RuntimeError):
+        embedding.embed_batch("https://host", "model", ["a"])
+
+    assert requested == [embedding.MAX_EMBED_RESPONSE_BYTES + 1]
+
+
+def test_display_url_strips_userinfo():
+    assert (
+        embedding.display_url("http://user:s3cret@ollama.internal:11434/api/embed")
+        == "http://ollama.internal:11434/api/embed"
+    )
+    assert embedding.display_url("http://user@host/api/embed") == "http://host/api/embed"
+    # No userinfo: returned untouched.
+    assert embedding.display_url("https://host:11434/api/embed") == "https://host:11434/api/embed"
+
+
+def test_embed_batch_transport_error_never_leaks_credentials(monkeypatch):
+    def fake_urlopen(req, timeout=None, context=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(embedding.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        embedding.embed_batch("http://user:s3cret@ollama.internal:11434", "model", ["a"])
+
+    message = str(excinfo.value)
+    assert "s3cret" not in message
+    assert "user" not in message
+    assert "ollama.internal:11434" in message
+
+
+def test_embed_batch_shape_mismatch_never_leaks_credentials(monkeypatch):
+    def fake_urlopen(req, timeout=None, context=None):
+        return _FakeResponse({"model": "x", "embeddings": []})
+
+    monkeypatch.setattr(embedding.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        embedding.embed_batch("http://user:s3cret@ollama.internal:11434", "model", ["a"])
+
+    assert "s3cret" not in str(excinfo.value)
+
+
+def test_embed_batch_non_http_refusal_never_leaks_credentials():
+    with pytest.raises(RuntimeError) as excinfo:
+        embedding.embed_batch("ftp://user:s3cret@host", "model", ["a"])
+
+    assert "s3cret" not in str(excinfo.value)
+
+
+def test_health_check_failure_log_never_leaks_credentials(monkeypatch, caplog):
+    def fake_urlopen(req, timeout=None, context=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(embedding.urllib.request, "urlopen", fake_urlopen)
+    with caplog.at_level("WARNING"):
+        assert embedding.default_embed_health_check("http://user:s3cret@host:11434", 1.0) is False
+
+    assert "s3cret" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# recipe stamp gating reuse
+# ---------------------------------------------------------------------------
+
+
+def _shard_from_one_run(tmp_path, monkeypatch, model, vector):
+    stats = embedding.EmbeddingStats()
+    monkeypatch.setattr(
+        embedding, "embed_batch", lambda base_url, m, inputs, timeout=30.0: [vector] * len(inputs)
+    )
+    return embedding.compute_repo_shard(
+        "repo.a",
+        _graph_with_one_node(),
+        tmp_path,
+        previous_shard=embedding.RepoShard.empty(),
+        base_url="https://host",
+        model=model,
+        stats=stats,
+        recipe_stamp=embedding.recipe_stamp_for_model(model),
+    )
+
+
+def test_recipe_stamp_changes_with_the_model():
+    stamp_a = embedding.recipe_stamp_for_model("model-a")
+    assert stamp_a != embedding.recipe_stamp_for_model("model-b")
+    assert stamp_a == embedding.recipe_stamp_for_model("model-a")
+
+
+def test_compute_repo_shard_reuses_when_recipe_stamp_matches(tmp_path, monkeypatch):
+    first = _shard_from_one_run(tmp_path, monkeypatch, "model-a", [1.0, 2.0])
+
+    calls = {"n": 0}
+
+    def counting_embed_batch(base_url, model, inputs, timeout=30.0):
+        calls["n"] += 1
+        return [[7.0, 7.0] for _ in inputs]
+
+    monkeypatch.setattr(embedding, "embed_batch", counting_embed_batch)
+    stats = embedding.EmbeddingStats()
+    second = embedding.compute_repo_shard(
+        "repo.a",
+        _graph_with_one_node(),
+        tmp_path,
+        previous_shard=first,
+        base_url="https://host",
+        model="model-a",
+        stats=stats,
+        recipe_stamp=embedding.recipe_stamp_for_model("model-a"),
+    )
+
+    assert calls["n"] == 0
+    assert stats.reused == 1
+    key = next(iter(second.entries))
+    assert list(second.vectors.get(key)) == pytest.approx([1.0, 2.0])
+
+
+def test_compute_repo_shard_refuses_reuse_when_recipe_stamp_differs(tmp_path, monkeypatch):
+    first = _shard_from_one_run(tmp_path, monkeypatch, "model-a", [1.0, 2.0])
+
+    calls = {"n": 0}
+
+    def counting_embed_batch(base_url, model, inputs, timeout=30.0):
+        calls["n"] += 1
+        return [[7.0, 7.0] for _ in inputs]
+
+    monkeypatch.setattr(embedding, "embed_batch", counting_embed_batch)
+    stats = embedding.EmbeddingStats()
+    second = embedding.compute_repo_shard(
+        "repo.a",
+        _graph_with_one_node(),
+        tmp_path,
+        previous_shard=first,
+        base_url="https://host",
+        model="model-b",
+        stats=stats,
+        recipe_stamp=embedding.recipe_stamp_for_model("model-b"),
+    )
+
+    # Same input text, so the content hash still matches — only the recipe
+    # changed, and that alone must force a re-embed.
+    assert calls["n"] == 1
+    assert stats.reused == 0
+    assert stats.embedded == 1
+    key = next(iter(second.entries))
+    assert list(second.vectors.get(key)) == pytest.approx([7.0, 7.0])
+    assert second.recipe_stamp == embedding.recipe_stamp_for_model("model-b")
+
+
+def test_compute_repo_shard_refuses_reuse_from_an_unstamped_shard(tmp_path, monkeypatch):
+    first = _shard_from_one_run(tmp_path, monkeypatch, "model-a", [1.0, 2.0])
+    # A shard written before the stamp existed (v1 or v2 on disk).
+    unstamped = embedding.RepoShard(entries=first.entries, vectors=first.vectors)
+
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        embedding,
+        "embed_batch",
+        lambda base_url, model, inputs, timeout=30.0: (
+            calls.__setitem__("n", calls["n"] + 1) or [[7.0, 7.0] for _ in inputs]
+        ),
+    )
+    stats = embedding.EmbeddingStats()
+    embedding.compute_repo_shard(
+        "repo.a",
+        _graph_with_one_node(),
+        tmp_path,
+        previous_shard=unstamped,
+        base_url="https://host",
+        model="model-a",
+        stats=stats,
+        recipe_stamp=embedding.recipe_stamp_for_model("model-a"),
+    )
+
+    assert calls["n"] == 1
+    assert stats.reused == 0
+
+
+def test_stage_embeddings_writes_the_recipe_stamp_and_read_back_surfaces_it(tmp_path, monkeypatch):
+    shard = _shard_from_one_run(tmp_path, monkeypatch, "model-a", [1.0, 2.0])
+    out_dir = embedding.stage_embeddings(tmp_path / "staging", {"repo.a": shard}, {})
+
+    meta = json.loads((out_dir / "repo.a.meta.json").read_text(encoding="utf-8"))
+    assert meta["shard_format"] == embedding.SHARD_FORMAT_VERSION
+    assert meta["recipe_stamp"] == embedding.recipe_stamp_for_model("model-a")
+    assert meta["recipe"]["model"] == "model-a"
+    assert meta["recipe"]["dim"] == 2
+
+    read_back = embedding.read_previous_shard(out_dir, "repo.a")
+    assert read_back.recipe_stamp == embedding.recipe_stamp_for_model("model-a")
+    assert embedding.read_shard_recipe_stamp(out_dir, "repo.a") == (
+        embedding.recipe_stamp_for_model("model-a")
+    )
+    assert embedding.stale_recipe_repo_ids(out_dir, {"repo.a"}, "model-a") == set()
+    assert embedding.stale_recipe_repo_ids(out_dir, {"repo.a"}, "model-b") == {"repo.a"}
+
+
+def test_v2_shard_without_a_stamp_reads_back_unstamped(tmp_path):
+    gen_dir = tmp_path / "gen"
+    gen_dir.mkdir()
+    (gen_dir / "repo.a.meta.json").write_text(
+        json.dumps(
+            {
+                "repo_id": "repo.a",
+                "shard_format": 2,
+                "dim": 1,
+                "entries": {"repo.a\x1fsrc/w.py\x1fWidget": {"content_hash": "abc", "row": 0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    np.save(gen_dir / "repo.a.npy", np.array([[9.0]], dtype=np.float32))
+
+    shard = embedding.read_previous_shard(gen_dir, "repo.a")
+    assert shard.entries  # still readable
+    assert shard.recipe_stamp is None  # but never reusable
+    assert embedding.stale_recipe_repo_ids(gen_dir, {"repo.a"}, "model-a") == {"repo.a"}
+
+
+def test_run_embedding_stage_rebuilds_unchanged_repo_when_the_recipe_changed(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    prev_gen_dir = settings.embeddings_dir / "generations" / "gen-0"
+    prev_gen_dir.mkdir(parents=True)
+    (prev_gen_dir / "repo.a.meta.json").write_text(
+        json.dumps(
+            {
+                "repo_id": "repo.a",
+                "shard_format": embedding.SHARD_FORMAT_VERSION,
+                "dim": 1,
+                "recipe_stamp": embedding.recipe_stamp_for_model("some-older-model"),
+                "entries": {"repo.a\x1fsrc/w.py\x1fWidget": {"content_hash": "abc", "row": 0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    np.save(prev_gen_dir / "repo.a.npy", np.array([[9.0]], dtype=np.float32))
+    (prev_gen_dir / "id-map.json").write_text(json.dumps({}), encoding="utf-8")
+    settings.embeddings_dir.mkdir(parents=True, exist_ok=True)
+    (settings.embeddings_dir / "current").symlink_to(prev_gen_dir, target_is_directory=True)
+
+    monkeypatch.setattr(
+        embedding,
+        "embed_batch",
+        lambda base_url, model, inputs, timeout=30.0: [[4.0]] * len(inputs),
+    )
+
+    result = embedding.run_embedding_stage(
+        graph_paths_by_repo={},
+        repo_roots_by_id={"repo.a": tmp_path},
+        graphs_by_repo={"repo.a": _graph_with_one_node()},
+        unchanged_repo_ids={"repo.a"},
+        settings=settings,
+        provisional_generation_id="gen-1",
+        health_check=lambda base_url, timeout: True,
+    )
+
+    assert result.stats.reused_repos_unchanged == 0
+    assert result.stats.embedded == 1
+    assert list(result.vectors_by_repo["repo.a"].get("repo.a\x1fsrc/w.py\x1fWidget")) == [4.0]
+
+
+# ---------------------------------------------------------------------------
+# durability of copied shards
+# ---------------------------------------------------------------------------
+
+
+def test_persist_generation_fsyncs_copied_files_before_flipping_current(tmp_path, monkeypatch):
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "repo.a.meta.json").write_text("{}", encoding="utf-8")
+    np.save(staged / "repo.a.npy", np.zeros((1, 2), dtype=np.float32))
+
+    embeddings_dir = tmp_path / "embeddings"
+    embeddings_dir.mkdir()
+
+    events: list[str] = []
+    real_rename = embedding.os.rename
+    monkeypatch.setattr(
+        embedding, "_fsync_file", lambda path: events.append(f"fsync-file:{path.name}")
+    )
+
+    def recording_rename(src, dst):
+        events.append("rename")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(embedding.os, "rename", recording_rename)
+
+    embedding.persist_generation(embeddings_dir, "gen-1", staged)
+
+    assert "rename" in events
+    flip = events.index("rename")
+    synced = {e.split(":", 1)[1] for e in events[:flip] if e.startswith("fsync-file:")}
+    assert synced == {"repo.a.meta.json", "repo.a.npy"}
+    assert (embeddings_dir / "current").resolve() == (
+        embeddings_dir / "generations" / "gen-1"
+    ).resolve()
+
+
+def test_persist_generation_fsyncs_the_generations_dir_before_flipping(tmp_path, monkeypatch):
+    """The new generation's directory ENTRY lives in generations_dir. Fsyncing
+    embeddings_dir after the rename does not persist it, so a crash could
+    leave a durable `current` pointing at a directory that is not there."""
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "repo.a.meta.json").write_text("{}", encoding="utf-8")
+
+    embeddings_dir = tmp_path / "embeddings"
+    embeddings_dir.mkdir()
+
+    events: list[str] = []
+    real_rename = embedding.os.rename
+    monkeypatch.setattr(embedding, "_fsync_dir", lambda path: events.append(f"fsync-dir:{path}"))
+    monkeypatch.setattr(embedding, "_fsync_file", lambda path: None)
+
+    def recording_rename(src, dst):
+        events.append("rename")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(embedding.os, "rename", recording_rename)
+
+    embedding.persist_generation(embeddings_dir, "gen-1", staged)
+
+    flip = events.index("rename")
+    before_flip = {e.split(":", 1)[1] for e in events[:flip] if e.startswith("fsync-dir:")}
+    assert str(embeddings_dir / "generations") in before_flip
+
+
+def test_gc_embedding_generations_pins_whatever_current_points_at(tmp_path):
+    embeddings_dir = tmp_path / "embeddings"
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "id-map.json").write_text("{}", encoding="utf-8")
+
+    # `current` stays on the OLDEST generation, which keep=1 would otherwise
+    # sort away — exactly the crash window the GC split exists to protect.
+    embedding.persist_generation(embeddings_dir, "20260101T000000Z-aaa", staged)
+    embedding.persist_generation(embeddings_dir, "20260102T000000Z-bbb", staged)
+    current = embeddings_dir / "current"
+    current.unlink()
+    current.symlink_to(
+        embeddings_dir / "generations" / "20260101T000000Z-aaa", target_is_directory=True
+    )
+
+    removed = embedding.gc_embedding_generations(embeddings_dir, keep=1)
+
+    assert removed == []
+    assert (embeddings_dir / "generations" / "20260101T000000Z-aaa").is_dir()

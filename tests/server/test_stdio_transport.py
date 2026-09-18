@@ -4,20 +4,27 @@ validation that `mcp.server.stdio.stdio_server`'s own reader does not provide
 
 from __future__ import annotations
 
+import contextlib
+import inspect
 import io
 import json
 import os
 import sys
 import threading
+import types as types_module
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import anyio
-import mcp.types as types
-import pytest
 from mcp.server.stdio import stdio_server
-from mcp.shared.message import SessionMessage
 
-from graphify_mesh.server.stdio_guard import MAX_LINE_BYTES, _CappedLineReader, capped_stdin
+from graphify_mesh.server import server
+from graphify_mesh.server.stdio_guard import (
+    MAX_LINE_BYTES,
+    _CappedLineReader,
+    capped_stdin,
+    wire_stdout,
+)
 
 
 def test_oversized_line_is_dropped_not_buffered(caplog):
@@ -64,65 +71,155 @@ def test_batch_array_gets_invalid_request_and_is_not_forwarded():
     assert response["error"]["code"] == -32600
 
 
-# --- pinning the write-safety assumption stdio_guard's module docstring
-# relies on: the guard's error write and the SDK's own response write only
-# avoid interleaving because they end up calling .write() on the SAME
-# underlying io.BufferedWriter. Nothing in mcp or the stdlib promises this
-# will keep being true, so these tests exist to catch it breaking.
+# --- pinning the write path `serve_stdio` actually sets up: ONE Python
+# writer shared by the guard's error frames and the SDK's responses. Two
+# independent `os.dup()`s of fd 1 left atomicity resting on POSIX PIPE_BUF,
+# so a response over 4096 bytes could have an error frame spliced into it.
 
 
-@pytest.mark.anyio
-async def test_sdk_stdout_shares_our_buffer_or_frames_can_interleave(monkeypatch):
-    """This is the assumption stdio_guard's error-write safety relies on:
-    `mcp.server.stdio.stdio_server`'s default stdout must wrap whatever
-    `sys.stdout.buffer` is at call time, the same object `capped_stdin`'s
-    default `out_stream` (`sys.stdout`) writes through — that shared buffer
-    is the only thing that makes the two writers' lines never interleave
-    (see `stdio_guard.py`'s module docstring and
-    `test_error_write_and_sdk_style_write_do_not_interleave_on_shared_buffer`
-    below). If a future `mcp` release builds its stdout from something else
-    (a different global, a cached handle, a socket), this test fails instead
-    of corrupted frames showing up in production."""
-    raw = io.BytesIO()
-    fake_stdout = io.TextIOWrapper(raw, encoding="utf-8")
-    monkeypatch.setattr(sys, "stdout", fake_stdout)
-
-    async with stdio_server(stdin=capped_stdin(io.StringIO(""))) as (_read_stream, write_stream):
-        # `types.JSONRPCMessage` is a union type alias, not a constructible
-        # class, as of mcp 2.x — `SessionMessage.message` takes a union
-        # member (e.g. `JSONRPCNotification`) directly.
-        message = types.JSONRPCNotification(jsonrpc="2.0", method="probe")
-        await write_stream.send(SessionMessage(message=message))
-        await anyio.sleep(0.1)  # let stdio_server's stdout_writer task drain and flush
-        written = raw.getvalue()
-        await write_stream.aclose()
-
-    # Proof the SDK actually wrote through OUR fake sys.stdout.buffer, not
-    # some other stream it built or cached independently.
-    assert b"probe" in written
+def test_installed_sdk_still_accepts_an_explicit_stdout():
+    """The whole shared-writer fix depends on this argument existing. An
+    `mcp` release that drops it must fail here, not corrupt stdout."""
+    assert "stdout" in inspect.signature(stdio_server).parameters
 
 
-def test_error_write_and_sdk_style_write_do_not_interleave_on_shared_buffer():
-    """Scaled-down concurrency regression for the guarantee above: two
-    threads, one driving the guard's own error-write path
-    (`_CappedLineReader._write_error`) and one writing plain JSON lines the
-    way `stdio_server`'s `stdout_writer` does, both through independent
-    `TextIOWrapper`s over the SAME shared `io.BufferedWriter` — mirroring
-    `capped_stdin`'s default `out_stream=sys.stdout` and the SDK's own
-    `TextIOWrapper(sys.stdout.buffer, ...)`. Every line received must be a
-    complete, parseable JSON object: a fragment or a merge of two lines
-    means CPython's `io.BufferedWriter.write()` stopped serializing
-    concurrent calls, exactly what this module's write-safety argument
-    depends on."""
+def test_serve_stdio_shares_one_writer_between_guard_and_sdk(monkeypatch):
+    """`capped_stdin(out_stream=...)` and `stdio_server(stdout=...)` must be
+    handed the SAME object: that object's buffer lock is what serializes the
+    two writers. Records what `serve_stdio` passes, without touching real
+    stdio."""
+    recorded: dict[str, object] = {}
+
+    @asynccontextmanager
+    async def fake_stdio_server(stdin=None, stdout=None):
+        recorded["stdin"] = stdin
+        recorded["stdout"] = stdout
+        yield None, None
+
+    class _FakeSdk:
+        def create_initialization_options(self):
+            return {}
+
+        async def run(self, read_stream, write_stream, options):
+            return None
+
+    monkeypatch.setattr("mcp.server.stdio.stdio_server", fake_stdio_server)
+    monkeypatch.setattr("graphify_mesh.server.sdk_app.build_sdk_server", lambda mesh: _FakeSdk())
+    server.serve_stdio(mesh=None)
+
+    guard_reader = recorded["stdin"].wrapped  # type: ignore[union-attr]
+    sdk_writer = recorded["stdout"].wrapped  # type: ignore[union-attr]
+    assert guard_reader._out_stream is sdk_writer
+
+
+def test_wire_stdout_diverts_fd1_to_stderr_and_restores_it(tmp_path, monkeypatch):
+    """Passing `stdout` explicitly skips the SDK's own fd-1 claim, so
+    `wire_stdout` does that job: a stray write to fd 1 must land on stderr
+    while the connection is up, and fd 1 must be restored afterwards."""
+    out_path, err_path = tmp_path / "wire.out", tmp_path / "wire.err"
+    out_file = open(out_path, "wb", buffering=0)  # noqa: SIM115
+    err_file = open(err_path, "wb", buffering=0)  # noqa: SIM115
+    saved_fd1 = os.dup(1)
+    try:
+        os.dup2(out_file.fileno(), 1)
+        monkeypatch.setattr(sys, "stdout", os.fdopen(os.dup(1), "w", buffering=1))
+        monkeypatch.setattr(sys, "stderr", os.fdopen(os.dup(err_file.fileno()), "w", buffering=1))
+
+        with wire_stdout() as writer:
+            writer.write("wire\n")
+            writer.flush()
+            os.write(1, b"stray\n")
+        os.write(1, b"after\n")
+    finally:
+        os.dup2(saved_fd1, 1)
+        os.close(saved_fd1)
+        out_file.close()
+        err_file.close()
+
+    assert out_path.read_bytes() == b"wire\nafter\n"
+    assert b"stray" in err_path.read_bytes()
+
+
+class _BodyBoom(RuntimeError):
+    """Raised by a test body to take `wire_stdout`'s exception exit path."""
+
+
+def _buffered_wire_case(tmp_path, monkeypatch, body):
+    """Runs `body(writer)` inside `wire_stdout()` with a block-buffered
+    `sys.stdout` sitting on fd 1, the way a real process has it. Returns the
+    bytes that reached the wire and the bytes that reached stderr."""
+    out_path, err_path = tmp_path / "buf.out", tmp_path / "buf.err"
+    out_file = open(out_path, "wb", buffering=0)  # noqa: SIM115
+    err_file = open(err_path, "wb", buffering=0)  # noqa: SIM115
+    saved_fd1 = os.dup(1)
+    try:
+        os.dup2(out_file.fileno(), 1)
+        # fd 1 itself, block-buffered: a `print` stays in the Python buffer.
+        monkeypatch.setattr(sys, "stdout", open(1, "w", closefd=False))  # noqa: SIM115
+        monkeypatch.setattr(sys, "stderr", os.fdopen(os.dup(err_file.fileno()), "w", buffering=1))
+        try:
+            with contextlib.suppress(_BodyBoom), wire_stdout() as writer:
+                body(writer)
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+    finally:
+        os.dup2(saved_fd1, 1)
+        os.close(saved_fd1)
+        out_file.close()
+        err_file.close()
+    return out_path.read_bytes(), err_path.read_bytes()
+
+
+def test_buffered_print_during_the_connection_never_reaches_the_wire(tmp_path, monkeypatch):
+    """`os.write(1, ...)` bypasses Python buffering, so it cannot catch the
+    real leak: an ordinary buffered `print` sits in `sys.stdout`'s buffer
+    while fd 1 points at stderr, and lands on the protocol pipe the moment
+    fd 1 is restored unless the buffer is drained first."""
+
+    def body(writer):
+        writer.write("wire\n")
+        writer.flush()
+        print("buffered-leak")  # no flush: stays in sys.stdout's buffer
+
+    wire, err = _buffered_wire_case(tmp_path, monkeypatch, body)
+
+    assert b"buffered-leak" not in wire
+    assert wire == b"wire\n"
+    assert b"buffered-leak" in err
+
+
+def test_buffered_print_never_reaches_the_wire_when_the_body_raises(tmp_path, monkeypatch):
+    """Same drain on the exception exit path, which is the one a crashing
+    library takes."""
+
+    def body(writer):
+        writer.write("wire\n")
+        writer.flush()
+        print("buffered-leak")
+        raise _BodyBoom("boom")
+
+    wire, err = _buffered_wire_case(tmp_path, monkeypatch, body)
+
+    assert b"buffered-leak" not in wire
+    assert wire == b"wire\n"
+    assert b"buffered-leak" in err
+
+
+def test_error_write_and_sdk_write_do_not_interleave_on_the_shared_writer():
+    """Concurrency regression for the shared writer: one thread drives the
+    guard's error-write path (`_CappedLineReader._write_error`), the other
+    writes response frames the way `stdio_server`'s `stdout_writer` does,
+    both through the ONE writer `serve_stdio` hands to both. The response
+    frames are deliberately far larger than `PIPE_BUF`, the bound the
+    previous two-descriptor arrangement relied on. Every line received must
+    be a complete, parseable JSON object."""
     read_fd, write_fd = os.pipe()
-    raw_writer = os.fdopen(write_fd, "wb", buffering=0)
-    shared_buffer = io.BufferedWriter(raw_writer)
+    shared_writer = os.fdopen(write_fd, "w", buffering=1)
+    reader = _CappedLineReader(stream=io.StringIO(""), out_stream=shared_writer)
 
-    guard_stream = io.TextIOWrapper(shared_buffer, encoding="utf-8")
-    sdk_style_stream = io.TextIOWrapper(shared_buffer, encoding="utf-8")
-    reader = _CappedLineReader(stream=io.StringIO(""), out_stream=guard_stream)
-
-    n_per_thread = 300
+    n_per_thread = 200
+    big_payload = "y" * 60_000  # >> PIPE_BUF (4096 on Linux)
     received: list[bytes] = []
 
     def drain() -> None:
@@ -141,26 +238,76 @@ def test_error_write_and_sdk_style_write_do_not_interleave_on_shared_buffer():
         for _ in range(n_per_thread):
             reader._write_error(-32700, "parse error")
 
-    def write_direct() -> None:
+    def write_responses() -> None:
         for i in range(n_per_thread):
-            sdk_style_stream.write(json.dumps({"jsonrpc": "2.0", "id": i, "result": {}}) + "\n")
-            sdk_style_stream.flush()
+            shared_writer.write(
+                json.dumps({"jsonrpc": "2.0", "id": i, "result": {"blob": big_payload}}) + "\n"
+            )
+            shared_writer.flush()
 
     reader_thread = threading.Thread(target=drain)
     error_thread = threading.Thread(target=write_errors)
-    direct_thread = threading.Thread(target=write_direct)
+    response_thread = threading.Thread(target=write_responses)
     reader_thread.start()
     error_thread.start()
-    direct_thread.start()
-    error_thread.join(timeout=5)
-    direct_thread.join(timeout=5)
-    shared_buffer.close()  # closes raw_writer too: signals EOF to the drain thread
-    reader_thread.join(timeout=5)
+    response_thread.start()
+    error_thread.join(timeout=30)
+    response_thread.join(timeout=30)
+    shared_writer.close()  # signals EOF to the drain thread
+    reader_thread.join(timeout=30)
 
     assert len(received) == n_per_thread * 2
     for line in received:
         parsed = json.loads(line)  # raises on a fragment or a merge of two lines
         assert isinstance(parsed, dict)
+
+
+# --- the cap counts BYTES, not decoded characters -------------------------
+
+
+class _RecordingBytes(io.BytesIO):
+    def __init__(self, data: bytes) -> None:
+        super().__init__(data)
+        self.sizes: list[int] = []
+
+    def readline(self, size: int = -1) -> bytes:  # type: ignore[override]
+        self.sizes.append(size)
+        return super().readline(size)
+
+
+def test_multibyte_oversized_line_is_bounded_on_bytes_and_answered(monkeypatch):
+    """A line of 4-byte UTF-8 characters whose CHARACTER count is under the
+    cap but whose BYTE count is over it. Bounding decoded characters let this
+    buffer four times the documented limit. It must be dropped, every read
+    must stay within the byte bound, and the client must get `-32600` instead
+    of waiting for its own timeout (the HTTP transport answers 413 here)."""
+    char_count = MAX_LINE_BYTES // 4 + 10
+    assert char_count < MAX_LINE_BYTES  # under the cap if characters were counted
+    payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+    data = ("\U0001f600" * char_count + "\n" + payload + "\n").encode("utf-8")
+    assert len(data) > MAX_LINE_BYTES
+
+    byte_stream = _RecordingBytes(data)
+    monkeypatch.setattr(sys, "stdin", types_module.SimpleNamespace(buffer=byte_stream))
+    out = io.StringIO()
+
+    lines = list(_drain(capped_stdin(out_stream=out)))
+
+    assert len(lines) == 1
+    assert json.loads(lines[0])["method"] == "ping"
+    assert all(0 < size <= MAX_LINE_BYTES + 1 for size in byte_stream.sizes), byte_stream.sizes
+    response = json.loads(out.getvalue().strip())
+    assert response["id"] is None
+    assert response["error"]["code"] == -32600
+    assert str(MAX_LINE_BYTES) in response["error"]["message"]
+
+
+def test_oversized_line_answer_never_quotes_the_offending_frame(monkeypatch):
+    byte_stream = io.BytesIO(b"s3cret-marker" * (MAX_LINE_BYTES // 10) + b"\n")
+    monkeypatch.setattr(sys, "stdin", types_module.SimpleNamespace(buffer=byte_stream))
+    out = io.StringIO()
+    list(_drain(capped_stdin(out_stream=out)))
+    assert "s3cret-marker" not in out.getvalue()
 
 
 def _text_stream(text: str) -> io.StringIO:

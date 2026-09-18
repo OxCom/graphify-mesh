@@ -17,15 +17,78 @@ TimeoutStartSec=1800
 MemoryMax=2G
 
 # --- sandboxing/hardening ----------------------------------------------------
+# READ THIS FIRST: the MOUNT-namespace directives below (ProtectHome=,
+# ProtectSystem=, PrivateTmp=) take effect in a SYSTEM unit
+# (/etc/systemd/system/, with a dedicated User=). Measured on systemd 259, a
+# `systemctl --user` unit ignores ProtectHome= entirely: the user's real home,
+# ~/.ssh included, stays visible to the service and to every child it spawns.
+# The install shown at the top of this file is a user unit, so it gets none of
+# this filesystem isolation. For real isolation, install as a system unit with
+# User=<dedicated account> (see the commented block at the end of this file).
+# For a user unit, use the engine's own opt-in child sandbox instead
+# (GRAPHIFY_MESH_CHILD_SANDBOX=1, needs the bubblewrap OS package), which does
+# work unprivileged.
+#
+# A user unit still gets NoNewPrivileges=, MemoryMax=, TimeoutStartSec= and
+# RestrictAddressFamilies=. That last one is a seccomp filter, not a mount
+# namespace, which is why it works where ProtectHome= does not (measured:
+# `systemd-run --user -p RestrictAddressFamilies=AF_UNIX` makes socket(AF_INET)
+# fail with EAFNOSUPPORT).
+#
+# What none of this hides is the EnvironmentFile= above. It is an ordinary file
+# owned by the service UID, the graphify children run as that UID, and the
+# engine's child sandbox keeps the filesystem readable — so a child that runs
+# code can read GRAPHIFY_MESH_OLLAMA_API_KEY and GRAPHIFY_MESH_HTTP_TOKEN out of
+# it directly, whatever the child env allowlist withholds. The sandbox masks the
+# mesh bin/ directory, which helps only while the file lives there. The way out
+# is a systemd credential (LoadCredential=/SetCredential=), which is readable
+# only by the service's own process, or an environment file owned by a UID the
+# child cannot open.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ProtectHome=read-only
+# tmpfs, not read-only: the sync engine spawns the graphify child on untrusted
+# repository source, and read-only still hands that child ~/.aws/credentials,
+# ~/.ssh and ~/.config. An empty tmpfs home is the OS-level half of the
+# in-process HOME isolation in sync/graphify_cli.py. System unit only, per the
+# note above.
+ProtectHome=tmpfs
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # Edit: with ProtectSystem=strict the whole filesystem is read-only for the
 # service, so you MUST list your mesh root (the directory the sync engine
 # writes graphs into) here or the service will fail on the first write.
 #ReadWritePaths=/path/to/your/workspace/graph-mesh
+# Edit: with ProtectHome=tmpfs the home directory is replaced by an empty
+# tmpfs, so a pipx/venv install under ~/.local (the layout docs/setup.md uses)
+# disappears and the service fails to start with "ExecStart not found" or
+# "ModuleNotFoundError: graphify_mesh". Bind the two directories back in
+# read-only: the one holding the console script, and the one holding its
+# site-packages. Both are needed — the first makes ExecStart resolvable, the
+# second makes the package importable once it runs. Drop these lines if the
+# install lives outside the home directory (e.g. /opt or a system venv).
+#BindReadOnlyPaths=/home/youruser/.local/bin
+#BindReadOnlyPaths=/home/youruser/.local/lib/python3.12/site-packages
 
 [Install]
+# User unit (the install at the top of this file).
 WantedBy=default.target
+
+# --- system-unit variant -----------------------------------------------------
+# The isolation notes above only pay off in a system unit. To install as one:
+# copy this file to /etc/systemd/system/, then apply the changes below and run
+# `systemctl daemon-reload && systemctl enable --now graphify-mesh-sync.timer`.
+#
+# In [Service] add a dedicated, non-login account that owns the mesh tree:
+#   User=graphify-mesh
+#   Group=graphify-mesh
+#   # And keep ExecStart= pointing at an install that account can execute,
+#   # e.g. /opt/graphify-mesh/venv/bin/graphify-mesh-sync — a pipx install under
+#   # another user's home is unreachable once ProtectHome= applies.
+#   LoadCredential=sync-env:/etc/graphify-mesh/sync.env
+#   # ...and read the secret from $CREDENTIALS_DIRECTORY in a wrapper instead of
+#   # EnvironmentFile=, so no child of the service can open it.
+#
+# In [Install] replace WantedBy=default.target with:
+#   WantedBy=multi-user.target
+#
+# The timer unit needs the same treatment: WantedBy=timers.target.

@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 from graphify_mesh.sync.pipeline import run
+from graphify_mesh.sync.state import is_worktree_dirty
 
 
 def _read_json(path: Path) -> dict:
@@ -85,3 +86,27 @@ def test_dirty_worktree_recorded_read_only(env):
         ["git", "status", "--porcelain"], cwd=str(root), capture_output=True, text=True, check=True
     )
     assert status.stdout.strip()
+
+
+def test_status_disables_scanned_repo_config_hooks(tmp_path, monkeypatch):
+    # The scanned repo's own config must not be able to run commands here:
+    # core.fsmonitor and core.hooksPath both execute programs it names.
+    root = tmp_path / "repo"
+    (root / ".git").mkdir(parents=True)
+    seen: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert is_worktree_dirty(root) is False
+    assert seen[0][:6] == [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "status",
+    ]
+    assert seen[0][-1] == "--porcelain"

@@ -132,6 +132,28 @@ class Env:
         )
 
 
+@pytest.fixture(autouse=True)
+def _reset_child_log_once():
+    """Several child-env diagnostics fire once per PROCESS, so without this the
+    second test to trigger one would see no log line at all."""
+    from graphify_mesh.sync import graphify_cli
+
+    graphify_cli.reset_log_once()
+    yield
+    graphify_cli.reset_log_once()
+
+
+@pytest.fixture(autouse=True)
+def _fake_graphify_env_passthrough(monkeypatch):
+    """The child env allowlist in graphify_cli drops everything it does not
+    recognise, including the two variables the fake graphify binary is driven
+    by. Declare them through the documented extension point so the fake still
+    sees its control file and writes its call log."""
+    monkeypatch.setenv(
+        "GRAPHIFY_MESH_CHILD_ENV_EXTRA", "FAKE_GRAPHIFY_CONTROL,FAKE_GRAPHIFY_CALL_LOG"
+    )
+
+
 @pytest.fixture()
 def env(tmp_path, monkeypatch) -> Env:
     e = Env(tmp_path)

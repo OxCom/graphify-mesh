@@ -20,6 +20,13 @@ from graphify_mesh.sync.vectors import RepoVectors
 
 EmbedQueryFn = Callable[[str], list[float] | None]
 
+# Score carried by exact-alias bypass hits. It must dominate every fused
+# score (RRF sums stay below 1.0 even with all three retrievers agreeing)
+# while remaining a finite float: the score is serialized with `json.dumps`,
+# and `float("inf")` would emit the bare token `Infinity`, which strict JSON
+# parsers reject.
+EXACT_MATCH_SCORE = 1_000_000.0
+
 
 @dataclass
 class Hit:
@@ -148,7 +155,7 @@ def vector_candidates(
         n_rows = scores.shape[0]
         if depth >= n_rows:
             top_idx = np.arange(n_rows)
-        if depth < n_rows:
+        else:
             partition = np.argpartition(scores, -depth)
             threshold = scores[partition[-depth]]
             top_idx = np.nonzero(scores >= threshold)[0]
@@ -229,9 +236,14 @@ def rank(
 
     exact_keys = exact_alias_hits(query, generation.lexical, repo_filter)
     exact_hits = [
-        h for h in (_hit_from_key(k_, generation, float("inf"), "exact") for k_ in exact_keys) if h
+        h
+        for h in (_hit_from_key(k_, generation, EXACT_MATCH_SCORE, "exact") for k_ in exact_keys)
+        if h
     ]
     exact_hits.sort(key=lambda h: h.key)
+    # An alias shared by many nodes must not blow past the caller's `k`;
+    # truncating after the sort keeps which hits survive deterministic.
+    del exact_hits[k:]
     selected_keys = {h.key for h in exact_hits}
     remaining_slots = max(0, k - len(exact_hits))
 

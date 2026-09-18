@@ -127,6 +127,7 @@ class TestGuardedApplyAction:
             tmp_path,
             ACTION_EXTRACT,
             None,
+            tmp_path,
             settings=settings,
         )
         assert outcome.status == STATUS_INFRA_SKIPPED
@@ -149,6 +150,7 @@ class TestGuardedApplyAction:
             tmp_path,
             ACTION_EXTRACT,
             None,
+            tmp_path,
             settings=settings,
         )
         assert outcome.status == STATUS_INFRA_FAILED
@@ -167,6 +169,7 @@ class TestGuardedApplyAction:
             tmp_path,
             ACTION_EXTRACT,
             None,
+            tmp_path,
             settings=settings,
         )
         assert outcome.status == STATUS_FAILED
@@ -196,6 +199,7 @@ class TestGuardedApplyAction:
             tmp_path,
             ACTION_EXTRACT,
             None,
+            tmp_path,
             settings=settings,
         )
         # Fail open: the child spawned normally, the failure stays plain
@@ -221,6 +225,7 @@ class TestGuardedApplyAction:
             tmp_path,
             ACTION_EXTRACT,
             None,
+            tmp_path,
             settings=settings,
         )
         assert outcome.status == STATUS_INFRA_SKIPPED
@@ -246,7 +251,14 @@ class TestGuardedApplyAction:
             extract_health_check=_sequenced_check([True, False], calls),
         )
         outcome = _guarded_apply_action(
-            "example-org.aaa", "graphify", tmp_path, tmp_path, action, None, settings=settings
+            "example-org.aaa",
+            "graphify",
+            tmp_path,
+            tmp_path,
+            action,
+            None,
+            tmp_path,
+            settings=settings,
         )
         assert outcome.status == status
         assert len(calls) == 1  # preflight only, no post-failure probe
@@ -266,6 +278,7 @@ class TestGuardedApplyAction:
             tmp_path,
             ACTION_UPDATE,
             None,
+            tmp_path,
             settings=settings,
         )
         assert outcome.status == "updated"
@@ -292,6 +305,7 @@ class TestGuardedApplyAction:
                 tmp_path,
                 ACTION_EXTRACT,
                 None,
+                tmp_path,
                 settings=settings,
             )
             assert outcome.status == STATUS_FAILED  # never infra_*

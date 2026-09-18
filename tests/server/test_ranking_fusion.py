@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
+import json
+
 import pytest
 from conftest import build_generation, fake_embed_query_fn, key_for, make_link, make_node
 
-from graphify_mesh.server import ranking
+from graphify_mesh.server import ranking, retrieval
 from graphify_mesh.server.retrieval import rank
 
 
@@ -38,7 +41,7 @@ def test_exact_alias_bypass_ranked_first_and_skips_penalties():
     assert top.match_type == "exact"
     assert top.key == key_for("repo.a", hub_node)
     # Exact bypass hits carry the sentinel score and are never penalized.
-    assert top.score == float("inf")
+    assert top.score == retrieval.EXACT_MATCH_SCORE
 
 
 def test_apply_penalties_hub_degree_and_deprecated_are_multiplicative():
@@ -161,6 +164,35 @@ def test_mmr_reduces_near_duplicate_flooding_from_same_source_file():
     assert "src/elsewhere.py" in files, (
         "MMR should diversify in at least one distinct-file candidate"
     )
+
+
+def test_exact_hit_score_survives_a_strict_json_round_trip():
+    """`float("inf")` serializes as the bare token `Infinity`, which strict
+    parsers reject — `allow_nan=False` is what makes this test see that."""
+    node = make_node("repo.a", "TimeService", "src/TimeService.php", node_id="n1")
+    gen = build_generation([node])
+
+    result = rank("TimeService", gen, None, k=5, embed_query_fn=fake_embed_query_fn())
+    assert result.hits[0].match_type == "exact"
+
+    payload = [dataclasses.asdict(h) for h in result.hits]
+    decoded = json.loads(json.dumps(payload, allow_nan=False))
+    assert decoded[0]["score"] == retrieval.EXACT_MATCH_SCORE
+
+
+def test_exact_alias_hits_are_capped_at_k():
+    """One alias shared by many nodes must still respect `k`."""
+    nodes = [
+        make_node("repo.a", "Widget", f"src/pkg{i}/widget.py", node_id=f"n{i}") for i in range(5)
+    ]
+    gen = build_generation(nodes)
+
+    unbounded = rank("Widget", gen, None, k=10, embed_query_fn=fake_embed_query_fn())
+    assert len([h for h in unbounded.hits if h.match_type == "exact"]) == 5
+
+    result = rank("Widget", gen, None, k=1, embed_query_fn=fake_embed_query_fn())
+    assert len(result.hits) == 1
+    assert result.hits[0].match_type == "exact"
 
 
 def test_k_cap_never_exceeds_max_k():

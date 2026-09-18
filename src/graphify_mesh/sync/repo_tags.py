@@ -40,11 +40,155 @@ every downstream stage and the published artifact carry the real repo_id.
 
 from __future__ import annotations
 
+import logging
+import re
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from pathlib import Path
+
+from packaging.version import InvalidVersion, Version
+
+from graphify_mesh.sync.graphify_cli import _run, resolve_bin_argv
+
+log = logging.getLogger("graphify_mesh.sync")
+
+# A `--version` probe starts an interpreter and prints one line. Anything
+# slower than this is a broken binary, and the merge-time default of 900 s
+# would stall the whole pipeline waiting for it.
+VERSION_PROBE_TIMEOUT_SECONDS = 30
+
+# Matches the numeric part of a version banner such as "graphify 0.9.56".
+_VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
+
+# A banner may print an interpreter or framework version before the package
+# version ("Python 3.11.2, graphify 0.9.56"), and the first numeric match would
+# then be the wrong one. Prefer a number that follows the word "graphify".
+_NAMED_VERSION_RE = re.compile(r"graphify[^0-9\n]{0,24}(\d+(?:\.\d+)+)", re.IGNORECASE)
+
+# The PyPI project name; the import name is `graphify`, and the package
+# exposes no `__version__` attribute, so installed metadata is the only way
+# to learn the in-process version.
+GRAPHIFY_DISTRIBUTION = "graphifyy"
+
+
+def _in_process_graphify_version() -> str | None:
+    """Version of the `graphify` package this interpreter imports, or None
+    when it carries no installed metadata (a source checkout on PYTHONPATH)."""
+    try:
+        return package_version(GRAPHIFY_DISTRIBUTION)
+    except PackageNotFoundError:
+        return None
+
+
+def _binary_graphify_version(graphify_bin: str) -> str | None:
+    """Version reported by `<graphify_bin> --version`, or None when the
+    binary rejects the flag, fails, or prints nothing version-shaped."""
+    argv = resolve_bin_argv(graphify_bin)
+    if not argv:
+        return None
+    result = _run(argv + ["--version"], cwd=None, env=None, timeout=VERSION_PROBE_TIMEOUT_SECONDS)
+    if not result.ok:
+        return None
+    banner = f"{result.stdout}\n{result.stderr}"
+    named = _NAMED_VERSION_RE.search(banner)
+    if named:
+        return named.group(1)
+    match = _VERSION_RE.search(banner)
+    return match.group(0) if match else None
+
+
+def _release(raw: str) -> str | None:
+    """Release part of a version string ("0.9.64.dev0" -> "0.9.64"), or None
+    when it is not a version this parser understands."""
+    try:
+        return Version(raw).base_version
+    except InvalidVersion:
+        return None
+
+
+# Binaries already compared in this process. The check is meant to run before
+# `graphify merge-graphs` is paid for, while the tag map is built after it, so
+# without this memo the same binary would be probed twice per sync run.
+_parity_checked: set[str] = set()
+
+
+def reset_version_parity_cache() -> None:
+    """Forget which binaries were already probed. Test hook — a long-lived
+    process never changes which binary a given path points at mid-run."""
+    _parity_checked.clear()
+
+
+def check_graphify_version_parity(graphify_bin: str | None) -> None:
+    """Raises ValueError when the in-process `graphify` and the configured
+    binary report different release versions. Every other outcome logs and
+    returns.
+
+    Call this BEFORE `run_merge_graphs`: a mismatch invalidates the merge that
+    the check guards, so paying the merge timeout first wastes up to 900 s.
+    `compute_tag_to_repo_id` calls it again, and the second call is a no-op for
+    a binary already compared in this process.
+
+    Only the release parts are compared (`packaging.version.Version.base_version`),
+    so a dev install, a local build tag or a post-release of the same release
+    ("0.9.64.dev0", "0.9.64+g1a2b3c", "0.9.64.post1") is not a mismatch. Those
+    suffixes never change how `distinct_repo_tags` derives auto tags; different
+    releases can.
+    """
+    if graphify_bin is not None and graphify_bin in _parity_checked:
+        return
+    if graphify_bin is None:
+        log.warning(
+            "graphify version parity check skipped: no graphify binary path was passed, so "
+            "the repo-tag algorithm used here cannot be compared against the one the merge ran"
+        )
+        return
+    in_process = _in_process_graphify_version()
+    if in_process is None:
+        log.warning(
+            "graphify version parity check skipped: the imported graphify package carries no "
+            "installed metadata for distribution %r",
+            GRAPHIFY_DISTRIBUTION,
+        )
+        return
+    from_binary = _binary_graphify_version(graphify_bin)
+    if from_binary is None:
+        log.warning(
+            "graphify version parity check skipped: %r did not report a usable version "
+            "(no --version support, or unparseable output); in-process graphify is %s",
+            graphify_bin,
+            in_process,
+        )
+        _parity_checked.add(graphify_bin)
+        return
+    in_process_release = _release(in_process)
+    binary_release = _release(from_binary)
+    if in_process_release is None or binary_release is None:
+        log.warning(
+            "graphify version parity check skipped: version strings are not comparable "
+            "(in-process %r, binary %r reported by %r)",
+            in_process,
+            from_binary,
+            graphify_bin,
+        )
+        _parity_checked.add(graphify_bin)
+        return
+    if binary_release != in_process_release:
+        raise ValueError(
+            f"graphify version mismatch: this interpreter imports graphify {in_process}, "
+            f"but the merge binary {graphify_bin!r} reports graphify {from_binary}. "
+            "The repo-tag map is computed from the imported package while the merge is run "
+            "by the binary, so two versions can derive auto tags differently and the map "
+            "would silently fail to match the merged graph. Point GRAPHIFY_BIN at the same "
+            "environment this process imports graphify from, or align the two versions."
+        )
+    _parity_checked.add(graphify_bin)
 
 
 def compute_tag_to_repo_id(
-    sorted_graph_paths: list[Path], sorted_repo_ids: list[str]
+    sorted_graph_paths: list[Path],
+    sorted_repo_ids: list[str],
+    *,
+    graphify_bin: str | None = None,
 ) -> dict[str, str]:
     """`sorted_graph_paths`/`sorted_repo_ids` must be the SAME order-aligned
     lists passed to `graphify_cli.run_merge_graphs` (pipeline.py already
@@ -55,8 +199,25 @@ def compute_tag_to_repo_id(
     The `graphify` import is deferred to call time (not module top) so that
     importing this package — and running `--help` on the console scripts —
     never requires the upstream `graphify` package to be installed; it is only
-    needed when a merge actually runs."""
+    needed when a merge actually runs.
+
+    `graphify_bin` is the same GRAPHIFY_BIN value the merge ran with. The tag
+    map is derived from the graphify this interpreter imports, while the merge
+    itself runs that binary, which may live in a different environment. Two
+    versions can derive auto tags differently, and the count check below does
+    not catch a same-count divergence, so the versions are compared first and a
+    mismatch raises ValueError naming both. `graphify_bin=None` skips the
+    check and logs that it was skipped, and a binary with no usable `--version`
+    output degrades to a logged warning rather than blocking the pipeline.
+
+    The check belongs before the merge, not here: call
+    `check_graphify_version_parity` ahead of `run_merge_graphs` so a mismatch
+    is not discovered after the merge timeout has been spent. Calling it here
+    as well costs nothing, because the same binary is probed once per
+    process."""
     from graphify.build import distinct_repo_tags
+
+    check_graphify_version_parity(graphify_bin)
 
     tags = distinct_repo_tags(sorted_graph_paths)
     if len(tags) != len(sorted_repo_ids):

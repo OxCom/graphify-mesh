@@ -12,9 +12,15 @@ dir as `global-graph.json` (see publish.write_overlay /
 publish.write_lexical_index) so all three flip atomically on publish, but
 each is a wholly separate file that is NEVER merged into the structural
 graph (C5). The WS3 embedding index (id-map + per-repo shards under
-`settings.embeddings_dir`) is likewise only durably persisted (and GC'd to
-the last N generations) once publish actually happens — see
-`embedding.persist_generation`, called from `_finalize` below.
+`settings.embeddings_dir`) is likewise only durably persisted once publish
+actually happens (`embedding.persist_generation`), and older embedding
+generations are collected only after `publish.flip_current` has succeeded
+(`embedding.gc_embedding_generations`).
+
+`graphify merge-graphs` emits cross-repo edges of its own, so the merged graph
+is stripped of them right after the repo-tag remap — see
+`strip_cross_repo_edges`. Invariant 1 is held by construction there;
+`validate.validate_forbidden_edges` is the backstop.
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ import json
 import logging
 import os
 import shutil
+import string
 import tempfile
 import threading
 import time
@@ -269,6 +276,55 @@ class _MisconfigLogOnce:
         )
 
 
+# Characters kept verbatim in a per-repo staging-home directory name.
+_SAFE_SEGMENT_CHARS = frozenset(string.ascii_letters + string.digits + "-_")
+
+
+def project_staging_home(staging_root: Path, repo_id: str) -> Path:
+    """Private HOME directory for one repo's update/extract child.
+
+    Per repo, not per run: extract children run concurrently on a thread pool
+    and upstream writes caches under HOME, so a shared directory would let two
+    workers race. The name is the repo_id with everything outside
+    [A-Za-z0-9-_] replaced, plus a hash of the raw repo_id — the replacement
+    alone maps `a.b` and `a-b` onto the same directory, and the hash is what
+    keeps two distinct repo_ids from ever colliding on one home.
+    """
+    sanitized = "".join(c if c in _SAFE_SEGMENT_CHARS else "_" for c in repo_id)[:60]
+    digest = hashlib.sha256(repo_id.encode("utf-8")).hexdigest()[:16]
+    return staging_root / "project-homes" / f"{sanitized}-{digest}"
+
+
+def child_sandbox_policy(settings: Settings, staging_root: Path) -> graphify_cli.SandboxPolicy:
+    """Where a `graphify update|extract` child may write, and what is masked.
+
+    Containment is the approved roots, the mesh root, and this run's staging
+    root: a repository lives under the first, its collection directory under the
+    second, and the per-repo staging HOME under the third. Nothing else may
+    receive a writable bind. This is the same rule `assert_registry_containment`
+    applies to the registry, re-checked at launch because the registry is read
+    once per run and a bind is established per child.
+
+    `staging_root` is a fresh `mkdtemp` under TMPDIR, so it is under none of the
+    configured roots and has to be named here. It is engine-owned: nothing in a
+    scanned repository influences where it lands.
+
+    The mesh `bin/` directory is masked. It holds `registry.json` and, in the
+    layout docs/setup.md describes, the systemd EnvironmentFile carrying
+    `GRAPHIFY_MESH_OLLAMA_API_KEY` and `GRAPHIFY_MESH_HTTP_TOKEN` — exactly the
+    names the child env allowlist withholds, sitting in a file `--ro-bind / /`
+    hands straight to the child. The child reads nothing in there.
+    """
+    return graphify_cli.SandboxPolicy(
+        containment_roots=(
+            *(Path(root).resolve() for root in settings.approved_roots),
+            settings.mesh_root.resolve(),
+            staging_root.resolve(),
+        ),
+        masked_paths=(settings.mesh_root / "bin",),
+    )
+
+
 def _guarded_apply_action(
     repo_id: str,
     graphify_bin: str,
@@ -276,11 +332,13 @@ def _guarded_apply_action(
     collection_path: Path,
     action: str,
     current_manifest,
+    staging_home: Path,
     *,
     settings: Settings,
     allow_shrink: bool = False,
     shrink_tolerance: float = 0.0,
     misconfig_once: _MisconfigLogOnce | None = None,
+    sandbox_policy: graphify_cli.SandboxPolicy | None = None,
 ) -> ProjectOutcome:
     """apply_action wrapped in the extract-backend infra guard.
 
@@ -315,8 +373,10 @@ def _guarded_apply_action(
         collection_path,
         action,
         current_manifest,
+        staging_home,
         allow_shrink=allow_shrink,
         shrink_tolerance=shrink_tolerance,
+        sandbox_policy=sandbox_policy,
     )
     if not guarded:
         return outcome
@@ -381,6 +441,60 @@ def config_hash() -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
+# `graphify merge-graphs` writes cross-repo edges into the merged structural
+# graph itself: right after composing the prefixed per-repo graphs it calls
+# `cross_repo_types.link_shared_type_declarations`, which adds
+# `relation="same_type_as"` / `context="cross_repo"` links between type
+# declarations sharing a namespace and name across two repos, and
+# `cross_repo_calls.link_cross_repo_member_calls`, which adds cross-repo
+# `calls` edges (verified against graphify 0.9.63, `graphify/cli.py:2719-2727`).
+# Invariant 1 forbids every one of them in the structural graph, so the
+# pipeline removes them by construction. Leaving that to validate would turn
+# the first type shared between two repos into a permanent publish outage with
+# no operator override.
+CROSS_REPO_EDGE_CONTEXT = "cross_repo"
+
+
+def _is_cross_repo_edge(link: dict) -> bool:
+    if link.get("context") == CROSS_REPO_EDGE_CONTEXT:
+        return True
+    src_repo = validate.repo_prefix(link.get("source"))
+    dst_repo = validate.repo_prefix(link.get("target"))
+    return src_repo is not None and dst_repo is not None and src_repo != dst_repo
+
+
+def strip_cross_repo_edges(graph_data: dict) -> int:
+    """Drops every cross-repo edge from the merged graph in place and returns
+    how many it dropped.
+
+    An edge is cross-repo when its endpoints carry different `<repo_id>::`
+    prefixes, or when it is marked `context == "cross_repo"` — the two shapes
+    upstream's merge emits. An endpoint with no prefix at all belongs to no
+    repo, so a pair containing one is left alone.
+
+    An edge flagged `cross_repo: true` between two endpoints of the same repo
+    is deliberately NOT stripped: nothing upstream produces that shape, so it
+    means a stage inside this pipeline wrote a marked edge into the structural
+    graph, and `validate.validate_forbidden_edges` should refuse the publish
+    rather than have the strip quietly repair it.
+
+    Call this after the repo-tag remap: the prefixes then are the registry
+    `repo_id`s that `validate.validate_forbidden_edges` compares later, so
+    both stages judge the same edges by the same rule. It must also run before
+    reclustering, so community detection never sees a link crossing a repo
+    boundary.
+    """
+    key = "links" if isinstance(graph_data.get("links"), list) else "edges"
+    links = graph_data.get(key)
+    if not isinstance(links, list):
+        return 0
+    kept = [link for link in links if not (isinstance(link, dict) and _is_cross_repo_edge(link))]
+    removed = len(links) - len(kept)
+    if removed:
+        graph_data[key] = kept
+    return removed
+
+
 @dataclass
 class RunReport:
     dry_run: bool
@@ -400,6 +514,10 @@ class RunReport:
     dirty_repos: list[str] = field(default_factory=list)
     merge_ok: bool = False
     merge_error: str = ""
+    # Cross-repo edges `graphify merge-graphs` emitted and the pipeline
+    # removed this run (invariant 1). Reported so the strip is observable
+    # rather than silent.
+    stripped_cross_repo_edges: int = 0
     validation_ok: bool = False
     validation_errors: list[str] = field(default_factory=list)
     published: bool = False
@@ -413,6 +531,10 @@ class RunReport:
     overlay_manual_relation_count: int = 0
     embedding_status: str = ""
     embedding_stats: dict = field(default_factory=dict)
+    # Repos that published no vectors this generation because their last
+    # shard came from a different embedding recipe and carrying it forward
+    # would have mixed two vector spaces under one manifest.
+    embedding_vectors_dropped_repos: list[str] = field(default_factory=list)
     lexical_index_stats: dict = field(default_factory=dict)
     stage_rss: dict = field(default_factory=dict)
 
@@ -491,6 +613,20 @@ def _record_stage_rss(tracker: rss.StageRssTracker, report: RunReport) -> None:
     )
 
 
+def _duplicate_collection_path_errors(entries: list[RepoEntry]) -> list[str]:
+    """Registry entries whose collection_path resolves to a directory another
+    entry also claims. One message per shared path, naming every colliding
+    repo_id, sorted so the run fails identically on every machine."""
+    by_resolved: dict[Path, list[str]] = {}
+    for entry in entries:
+        by_resolved.setdefault(Path(entry.collection_path).resolve(), []).append(entry.repo_id)
+    return [
+        f"duplicate collection_path {str(path)!r} claimed by repo_ids {', '.join(sorted(repo_ids))}"
+        for path, repo_ids in sorted(by_resolved.items())
+        if len(repo_ids) > 1
+    ]
+
+
 def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # Staleness baseline for the eventual manifest: captured BEFORE any
     # pipeline stage runs, so files edited DURING a long sync (mtime after
@@ -503,8 +639,13 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         ", ".join(map(str, settings.scan_roots)),
         settings.scan_depth,
     )
+    # Error sink filled by the scan and read by reconcile: a scan that could
+    # not read part of the filesystem must not let a missing link look like a
+    # removed repo, because `removed` auto-authorizes shrinking the published
+    # graph below.
+    scan_errors: list[str] = []
     discovered = discover_filesystem(
-        settings.scan_roots, settings.approved_roots, settings.scan_depth
+        settings.scan_roots, settings.approved_roots, settings.scan_depth, scan_errors=scan_errors
     )
     registry = load_registry(settings.registry_path)
     # Hard error (never a degrade) if any enabled registry entry's
@@ -512,7 +653,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # discovery symlink guard enforces, applied at the point where
     # approved_roots is known.
     assert_registry_containment(registry, settings.approved_roots)
-    reconciliation = reconcile(discovered, registry, settings.mesh_root)
+    reconciliation = reconcile(discovered, registry, settings.mesh_root, scan_errors=scan_errors)
     report = RunReport(dry_run=settings.dry_run, reconciliation=reconciliation.to_dict())
     log.info(
         "discovery: %d registered, %d discovered, %d broken, %d removed, %d renamed",
@@ -522,12 +663,32 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         len(reconciliation.removed),
         len(reconciliation.renamed),
     )
+    if reconciliation.scan_incomplete:
+        log.warning(
+            "discovery: scan incomplete, %d filesystem error(s) swallowed — shrink is not "
+            "auto-authorized this run (pass --allow-shrink to publish a smaller graph anyway)",
+            len(reconciliation.scan_errors),
+        )
 
     state = load_state(settings.state_path)
     broken_ids = set(reconciliation.broken)
     active_repos = [
         e for e in _repos_for_run(registry, reconciliation.to_dict()) if e.repo_id not in broken_ids
     ]
+
+    # Two registry entries reaching the same collection_path would give two
+    # workers the same graph.json to snapshot, rewrite and restore
+    # concurrently, so one repo's rollback can overwrite another repo's
+    # successful output. reconcile() reports this as a duplicate row but does
+    # not stop the run, and it compares the declared strings; resolve first so
+    # a symlink or a `..` segment cannot smuggle a collision past the check.
+    collisions = _duplicate_collection_path_errors(active_repos)
+    if collisions:
+        report.publish_blocked_reason = "registry integrity: " + "; ".join(collisions)
+        log.error("%s", report.publish_blocked_reason)
+        _record_stage_rss(tracker, report)
+        _finalize(settings, staging_root, report, state, published_data=None, generation_id="")
+        return report
 
     # Broken-symlink projects (WS1 item 1: "reported as broken, not crashed")
     # are handled separately: their source root is unreachable this cycle so
@@ -583,6 +744,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     actionable: list[tuple[int, RepoEntry, Path, str, SourceDigest]] = []
     outcomes: dict[str, ProjectOutcome] = {}
     misconfig_once = _MisconfigLogOnce()
+    sandbox_policy = child_sandbox_policy(settings, staging_root)
     with ThreadPoolExecutor(max_workers=settings.extract_concurrency) as pool:
         # Per-repo source-manifest computation (a full stat-walk of every
         # repo tree) is pure read-only work, independent per repo — submit it
@@ -637,6 +799,10 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 entry.collection_path,
                 action,
                 current_manifest,
+                # Per-repo, because these children run concurrently and
+                # upstream writes caches under HOME. Lives inside
+                # staging_root, so the run's existing rmtree removes it.
+                project_staging_home(staging_root, entry.repo_id),
                 # The infra guard probes inside the worker thread, right
                 # before (and, on failure, right after) each child — a
                 # per-launch re-probe, not one snapshot for the whole run.
@@ -650,6 +816,9 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 # Shared across workers: a misconfigured probe endpoint is
                 # logged once per run, not once per launch.
                 misconfig_once=misconfig_once,
+                # Built once per run from the same roots the registry guard
+                # used, so a writable bind can never land outside them.
+                sandbox_policy=sandbox_policy,
             )
             for (i, entry, root, action, current_manifest) in actionable
         }
@@ -794,6 +963,11 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             "merge: merging %d per-repo graphs (from empty, sorted order) ...",
             len(sorted_graph_paths),
         )
+        # Probed BEFORE the merge, not only inside compute_tag_to_repo_id
+        # below: a version mismatch invalidates the very merge this check
+        # guards, and the merge can burn its whole 900 s timeout first. The
+        # probe memoizes per binary, so the later call costs nothing.
+        repo_tags.check_graphify_version_parity(settings.graphify_bin)
         merge_result = graphify_cli.run_merge_graphs(
             settings.graphify_bin, sorted_graph_paths, merged_out_path, staging_home
         )
@@ -815,8 +989,27 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # true repo_id, BEFORE naming/embedding/overlay/lexical-index so every
     # downstream stage and the published artifact carry real repo
     # attribution (baseline systemic failure #1).
-    tag_to_repo_id = repo_tags.compute_tag_to_repo_id(sorted_graph_paths, sorted_repo_ids)
+    # Same GRAPHIFY_BIN the merge above ran with: the tag map comes from the
+    # graphify this interpreter imports, the merge from that binary, and two
+    # versions can derive auto tags differently. Passing it makes a genuine
+    # version mismatch raise instead of producing a tag map that silently does
+    # not match the merged graph.
+    tag_to_repo_id = repo_tags.compute_tag_to_repo_id(
+        sorted_graph_paths, sorted_repo_ids, graphify_bin=settings.graphify_bin
+    )
     graph_data = repo_tags.rewrite_repo_tags(graph_data, tag_to_repo_id)
+    # Invariant 1, enforced by construction rather than by refusing to publish:
+    # upstream's merge writes cross-repo edges of its own (see
+    # strip_cross_repo_edges above). Runs after the remap so the prefixes
+    # compared are true repo_ids, and before reclustering so no community is
+    # formed across a repo boundary.
+    report.stripped_cross_repo_edges = strip_cross_repo_edges(graph_data)
+    if report.stripped_cross_repo_edges:
+        log.info(
+            "merge: stripped %d cross-repo edge(s) emitted by graphify merge-graphs — "
+            "the structural graph carries no cross-repo edge (invariant 1)",
+            report.stripped_cross_repo_edges,
+        )
     previous_manifest = publish.read_current_manifest(settings.global_dir)
     previous_counts: tuple[int, int] | None = None
     if previous_manifest is not None:
@@ -894,6 +1087,31 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         unchanged_repo_ids = {
             a["repo_id"] for a in report.project_actions if a.get("status") == "unchanged"
         }
+        # An unchanged repo reuses its whole published shard. That shard was
+        # produced by whatever embedding recipe was configured back then, so
+        # after the model changes it would carry the old model's vectors into
+        # a generation whose manifest advertises the new one — a mixed vector
+        # space nothing else can detect. Repos whose published stamp no longer
+        # matches (or is missing) lose their unchanged status for the embed
+        # stage ONLY: decide_action's ACTION_SKIP still stands, so no graphify
+        # CLI work is added. Their graphs are already in `graphs_by_repo`,
+        # which loads every repo in the merge regardless of action, so a run
+        # whose recipe did not change reads nothing extra.
+        stale_recipe_repos = embedding.stale_recipe_repo_ids(
+            settings.embeddings_current_symlink
+            if settings.embeddings_current_symlink.exists()
+            else None,
+            unchanged_repo_ids,
+            settings.ollama_embed_model,
+        )
+        if stale_recipe_repos:
+            log.info(
+                "embedding: %d unchanged repo(s) re-embedded — published shard recipe differs "
+                "from the configured one: %s",
+                len(stale_recipe_repos),
+                ", ".join(sorted(stale_recipe_repos)),
+            )
+            unchanged_repo_ids -= stale_recipe_repos
         # Provisional id used only for this run's staged id-map bookkeeping
         # (tombstoned_at/generation_id) — the real, durable generation_id is
         # not known until after validate/publish below (see
@@ -911,6 +1129,14 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         )
         report.embedding_status = embed_result.status
         report.embedding_stats = embed_result.stats.to_dict()
+        report.embedding_vectors_dropped_repos = embed_result.vectors_dropped_repos
+        if embed_result.vectors_dropped_repos:
+            log.warning(
+                "embedding: %d repo(s) publish no vectors this generation — their last shard "
+                "came from a different recipe and was not carried forward: %s",
+                len(embed_result.vectors_dropped_repos),
+                ", ".join(embed_result.vectors_dropped_repos),
+            )
         embedding_vectors_by_repo = embed_result.vectors_by_repo
         embedding_model_for_overlay = settings.ollama_embed_model
         if embed_result.recipe is not None:
@@ -962,7 +1188,13 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # the shrink-guard exists to catch (C21) — a smaller merged graph this
     # run is expected when repos were removed, so auto-authorize the shrink
     # in that case instead of requiring the operator to pass --allow-shrink.
-    effective_allow_shrink = settings.allow_shrink or bool(reconciliation.removed)
+    # An incomplete scan removes that justification: `removed` is only trusted
+    # when the scan that produced it read the whole filesystem, so a transient
+    # unreadable scan root cannot wave a shrink through. Only the explicit
+    # operator flag can, then.
+    effective_allow_shrink = settings.allow_shrink or (
+        bool(reconciliation.removed) and not reconciliation.scan_incomplete
+    )
     validation = validate.run_all(
         graph_data,
         previous_counts,
@@ -1100,7 +1332,37 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # LAST so it can cover the other artifacts' bytes.
     manifest["artifact_sha256"] = artifact_sha256
     publish.write_manifest(settings.generations_dir, gen_dir, manifest)
+
+    # WS3: the embedding index becomes durable BEFORE `current` flips, never
+    # after. A server that loads a generation whose vectors are not published
+    # yet sees an embeddings generation mismatch and drops the whole vector
+    # channel, so the graph must never become current ahead of its own
+    # vectors. The cost of this order is bounded: a failure between the two
+    # steps strands one extra embeddings generation that nothing references,
+    # and the next run's gc_old_generations collects it (it pins only whatever
+    # `current` points at). Nothing persists at all unless the run reaches
+    # here — the dry-run, validation-failed and stale-blocked paths returned
+    # earlier. Nothing to persist if the embed stage was skipped or degraded
+    # with nothing new.
+    if embeddings_staged_dir is not None:
+        embedding.persist_generation(settings.embeddings_dir, generation_id, embeddings_staged_dir)
+
     publish.flip_current(settings.global_dir, gen_dir)
+
+    # Embedding GC runs only now, never inside persist_generation: between
+    # persisting the vectors and this flip, the graph `current` points at is
+    # still the previous generation, and with keep=1 a GC in that window
+    # deletes exactly the vectors it is being served with.
+    if embeddings_staged_dir is not None:
+        collected = embedding.gc_embedding_generations(
+            settings.embeddings_dir, settings.keep_embedding_generations
+        )
+        if collected:
+            log.info(
+                "publish: collected %d old embedding generation(s): %s",
+                len(collected),
+                ", ".join(collected),
+            )
 
     # Structural generations (global-graph.json + overlay + lexical-index,
     # tens to 100+ MB each) had no GC at all before this — runs only AFTER
@@ -1112,18 +1374,6 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     if pruned:
         log.info(
             "publish: pruned %d old/incomplete generation(s): %s", len(pruned), ", ".join(pruned)
-        )
-
-    # WS3: only now (a successful publish) does the embedding index become
-    # durable — mirrors the rest of the pipeline's "nothing persists unless
-    # publish happens" rule. Nothing to persist if the embed stage was
-    # skipped/degraded-with-nothing-new this run.
-    if embeddings_staged_dir is not None:
-        embedding.persist_generation(
-            settings.embeddings_dir,
-            generation_id,
-            embeddings_staged_dir,
-            settings.keep_embedding_generations,
         )
 
     report.published = True
@@ -1151,6 +1401,11 @@ def _finalize(
             "run_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "dry_run": False,
             "reconciliation": report.reconciliation,
+            # Hoisted out of `reconciliation` so an operator watching
+            # status.json sees at a glance that this run's view of the
+            # filesystem was partial.
+            "scan_incomplete": report.reconciliation.get("scan_incomplete", False),
+            "scan_errors": report.reconciliation.get("scan_errors", []),
             "stale_repos": report.stale_repos,
             # Operator visibility: WHICH repos held a publish back (or would
             # have), and which infra repos the grace window is currently
@@ -1163,14 +1418,19 @@ def _finalize(
             "dirty_repos": report.dirty_repos,
             "merge_ok": report.merge_ok,
             "merge_error": report.merge_error,
+            "stripped_cross_repo_edges": report.stripped_cross_repo_edges,
             "validation_ok": report.validation_ok,
             "validation_errors": report.validation_errors,
             "published": report.published,
             "publish_blocked_reason": report.publish_blocked_reason,
             "generation_id": generation_id,
+            "embedding_status": report.embedding_status,
+            "embedding_vectors_dropped_repos": report.embedding_vectors_dropped_repos,
         }
         settings.status_path.parent.mkdir(parents=True, exist_ok=True)
-        settings.status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
+        # tmp-file + rename: an operator or a monitoring script polling this
+        # file must never read it half-written.
+        publish._write_json_atomic(settings.status_path, status, indent=2)
     else:
         status_path = staging_root / "status.json"
-        status_path.write_text(json.dumps(asdict(report), indent=2, default=str), encoding="utf-8")
+        publish._write_json_atomic(status_path, asdict(report), indent=2, default=str)

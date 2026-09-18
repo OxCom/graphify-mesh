@@ -14,13 +14,12 @@ constant in config.py and hard-fails (raises) on any disagreement.
 from __future__ import annotations
 
 import shutil
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from graphify_mesh.sync.config import PINNED_CLUSTERING_BACKEND
-from graphify_mesh.sync.graphify_cli import resolve_bin_argv
+from graphify_mesh.sync.graphify_cli import resolve_bin_argv, run_probe
 
 LEIDEN_BACKEND = "leiden"
 LOUVAIN_BACKEND = "louvain"
@@ -82,18 +81,28 @@ def _resolve_interpreter(graphify_bin: str) -> str:
 def detect_actual_backend(graphify_bin: str, timeout: int = 15) -> str:
     """Runs the probe in the resolved interpreter and returns
     LEIDEN_BACKEND or LOUVAIN_BACKEND — never raises for a "louvain" result,
-    only for a probe/exec failure."""
+    only for a probe/exec failure.
+
+    Routed through `graphify_cli.run_probe` so the probe gets the same
+    allowlisted environment as every other child. A bare `subprocess.run` here
+    handed an interpreter this package resolved from operator config the
+    parent's whole environment, `GRAPHIFY_MESH_HTTP_TOKEN` included.
+
+    `_PROBE_CODE` exits 0 or 1 and nothing else, so any other code is a
+    failure to run the probe at all (124 timeout, 127 exec error) and raises
+    instead of being read as "louvain".
+    """
     interpreter = _resolve_interpreter(graphify_bin)
     argv = resolve_bin_argv(interpreter) + ["-c", _PROBE_CODE]
-    try:
-        proc = subprocess.run(  # noqa: S603 - structured argv, no shell; binary from operator config
-            argv, capture_output=True, text=True, timeout=timeout
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise BackendMismatchError(
-            f"could not probe interpreter {interpreter!r} for graphify_bin={graphify_bin!r}: {exc}"
-        ) from exc
-    return LEIDEN_BACKEND if proc.returncode == 0 else LOUVAIN_BACKEND
+    result = run_probe(argv, timeout)
+    if result.returncode == 0:
+        return LEIDEN_BACKEND
+    if result.returncode == 1:
+        return LOUVAIN_BACKEND
+    raise BackendMismatchError(
+        f"could not probe interpreter {interpreter!r} for graphify_bin={graphify_bin!r}: "
+        f"exit={result.returncode}: {result.stderr.strip()[:300]}"
+    )
 
 
 def assert_pinned_backend(graphify_bin: str) -> BackendCheckResult:

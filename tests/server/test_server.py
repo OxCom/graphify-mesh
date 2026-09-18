@@ -94,6 +94,9 @@ def test_cross_project_tool_end_to_end(tmp_path, monkeypatch):
 
 
 def test_find_similar_tool_end_to_end(tmp_path, monkeypatch):
+    # find_similar serves registered, enabled repos only, seed node included,
+    # so the registry has to name the repo the synthetic generation carries.
+    write_registry(tmp_path / "bin" / "registry.json", [registry_repo("acme.repo", tmp_path)])
     seed = make_node("acme.repo", "Gateway", "src/gw.py", node_id="seed")
     neighbor = make_node("acme.repo", "GatewayHelper", "src/gwh.py", node_id="nb")
     generation = build_generation([seed, neighbor], links=[make_link("seed", "nb")])

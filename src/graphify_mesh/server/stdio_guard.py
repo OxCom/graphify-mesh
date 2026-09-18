@@ -33,37 +33,43 @@ An unparseable, non-object or unusably-identified frame is answered with
 carries a legal id (case 3) is answered with that id, so the client can
 correlate the error with its pending request instead of waiting.
 
-Both error responses and the SDK's own responses end up writing to the same
-underlying wire (the process's original fd 1) through two *independent*
-duplicates of it: `capped_stdin`'s default `out_stream` is a private `dup()`
-taken before `mcp.server.stdio.stdio_server()` claims fd 1 for its own use
-(see `_real_wire_stdout`), and the SDK makes its own separate duplicate at
-claim time. Since these are two different Python objects (not one shared
-`BufferedWriter` anymore, as an earlier `mcp` release let this module
-assume), the no-interleaving guarantee moves to POSIX: a `write()` no larger
-than `PIPE_BUF` is atomic, so two duplicates of the same pipe fd still never
-interleave *within* a line. This module deliberately does not add a lock of
-its own — instead the two things that guarantee is conditional on (POSIX
-`PIPE_BUF` atomicity for a line-sized write; `stdio_guard` and the SDK each
-holding their own duplicate of the one original fd 1) are each pinned by a
-test in `tests/server/test_stdio_transport.py`, so a future CPython or
-`mcp` release that breaks either one fails a test instead of silently
-corrupting stdout:
-`test_sdk_stdout_shares_our_buffer_or_frames_can_interleave` (the SDK still
-shares our buffer) and
-`test_error_write_and_sdk_style_write_do_not_interleave_on_shared_buffer`
-(concurrent writers on that shared buffer still never interleave). Read
-those two tests before touching this file's write path or `serve_stdio`'s
+Both error responses and the SDK's own responses reach the wire through ONE
+shared Python writer. `serve_stdio` builds it once with `wire_stdout()` and
+hands the same object to `capped_stdin(out_stream=...)` and to
+`stdio_server(stdout=...)`, so every frame from either writer goes through
+that object's buffer and its lock serializes concurrent writes — a response
+of any size can no longer have an error frame spliced into its middle. The
+earlier arrangement gave each side its own `os.dup()` of fd 1, which left
+atomicity resting on POSIX `PIPE_BUF` (4096 bytes on Linux) and so held only
+for frames smaller than that.
+
+`wire_stdout()` also keeps the stray-write protection the SDK gives up when
+it is handed an explicit `stdout`: it points fd 1 at stderr for the
+connection's duration, so a library that prints to the real stdout cannot
+corrupt the protocol stream, and restores fd 1 on exit.
+`test_serve_stdio_shares_one_writer_between_guard_and_sdk` and
+`test_error_write_and_sdk_write_do_not_interleave_on_the_shared_writer` in
+`tests/server/test_stdio_transport.py` pin both halves, so an `mcp` release
+that drops the `stdout` argument fails a test instead of silently corrupting
+stdout. Read them before touching this file's write path or `serve_stdio`'s
 call to `stdio_server`.
+
+Line size is capped on BYTES, not decoded characters. On the real stdin path
+the reader reads `sys.stdin.buffer` and decodes after the bound, so a line of
+4-byte UTF-8 characters can never buffer four times the cap. A caller-supplied
+text `stream` (what the unit tests inject) has no byte view, so the cap there
+counts characters — the bound that stream can actually enforce.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import sys
-from typing import IO, cast
+from collections.abc import Iterator
+from typing import IO, Final, cast
 
 import anyio
 
@@ -83,6 +89,14 @@ log = logging.getLogger("graphify_mesh.server.stdio_guard")
 # transport states the same one.
 MAX_LINE_BYTES = MAX_MESSAGE_BYTES
 
+# Answer for a line over the cap. Silently dropping it left the client waiting
+# for its own timeout while the HTTP transport answered 413 for the same input.
+# The message states the limit and never quotes the offending frame.
+LINE_TOO_LARGE: Final = (
+    -32600,
+    f"invalid request: message exceeds the {MAX_LINE_BYTES} byte limit",
+)
+
 
 def _error_frame(code: int, message: str, request_id: str | int | None = None) -> str:
     return error_frame_text(code, message, request_id)
@@ -96,16 +110,38 @@ class _CappedLineReader:
     JSON-RPC error written directly to `out_stream` and is not returned —
     only complete, valid single-object candidate frames reach the SDK."""
 
-    def __init__(self, stream: IO[str], out_stream: IO[str]) -> None:
+    def __init__(
+        self,
+        stream: IO[str] | None = None,
+        out_stream: IO[str] | None = None,
+        byte_stream: IO[bytes] | None = None,
+    ) -> None:
+        if (stream is None) == (byte_stream is None):
+            raise ValueError("exactly one of stream= / byte_stream= must be given")
         self._stream = stream
-        self._out_stream = out_stream
+        self._byte_stream = byte_stream
+        self._out_stream = out_stream if out_stream is not None else sys.stdout
+
+    def _read_bounded(self) -> tuple[str, int]:
+        """Next line plus its size in the unit the cap is counted in. The
+        byte path reads `MAX_LINE_BYTES + 1` BYTES and decodes afterwards, so
+        a multibyte line cannot buffer more than the cap; a decode error can
+        only come from a line that is already over the bound and about to be
+        dropped, hence `errors="replace"`. The text path (an injected
+        in-memory stream) has no byte view and counts characters."""
+        if self._byte_stream is not None:
+            raw = self._byte_stream.readline(MAX_LINE_BYTES + 1)
+            return raw.decode("utf-8", errors="replace"), len(raw)
+        text_stream = cast("IO[str]", self._stream)
+        raw_text = text_stream.readline(MAX_LINE_BYTES + 1)
+        return raw_text, len(raw_text)
 
     def _drain_rest(self) -> None:
         """Consume (and discard) the remainder of an oversized line in
         bounded chunks, stopping at the next newline or EOF. Never
         accumulates the data."""
         while True:
-            chunk = self._stream.readline(MAX_LINE_BYTES + 1)
+            chunk, _size = self._read_bounded()
             if not chunk:
                 return
             if chunk.endswith("\n"):
@@ -117,11 +153,12 @@ class _CappedLineReader:
 
     def readline(self, size: int = -1) -> str:  # noqa: ARG002 - AsyncFile calls with no args
         while True:
-            raw_line = self._stream.readline(MAX_LINE_BYTES + 1)
+            raw_line, size = self._read_bounded()
             if not raw_line:
                 return ""  # EOF: clean stop, matches the old serve()'s WS6 contract
-            if len(raw_line) > MAX_LINE_BYTES and not raw_line.endswith("\n"):
+            if size > MAX_LINE_BYTES and not raw_line.endswith("\n"):
                 self._drain_rest()
+                self._write_error(*LINE_TOO_LARGE)
                 log.warning("dropped oversized stdin line (> %d bytes)", MAX_LINE_BYTES)
                 continue
             if not raw_line.strip():
@@ -149,23 +186,18 @@ class _CappedLineReader:
             return raw_line
 
 
-def _real_wire_stdout() -> IO[str]:
+def _private_wire_stdout() -> IO[str]:
     """A private duplicate of the real stdout descriptor, taken now — before
     `mcp.server.stdio.stdio_server()` claims fd 1 for its own writes and
     `dup2()`s it to stderr for the connection's duration (its stray-write
     guard: PR #3117; confirmed by reading `_claim_fd`/`_open_stdout_diversion`
     in the installed `mcp.server.stdio`) — so a coded error frame written to
     `sys.stdout` at that later point would land on stderr, never the wire.
-    `os.dup()` here, before the claim, gives a descriptor that keeps
-    pointing at the original open file description regardless of what fd 1
-    itself gets pointed at afterward; POSIX guarantees a `write()` no larger
-    than `PIPE_BUF` lands whole, so this descriptor and the SDK's own
-    (a later, separate duplicate of the same original fd 1) still never
-    interleave a line, without sharing one Python object's lock the way the
-    pre-mcp-2.x same-`sys.stdout.buffer` version of this function did.
-    Falls back to `sys.stdout` itself when it has no real OS descriptor to
-    duplicate (e.g. a test's in-memory stand-in), which is this function's
-    only caller's exact pre-existing default in that case.
+    Only the standalone default for a `capped_stdin()` call that supplies no
+    `out_stream`: `serve_stdio` passes the shared writer from `wire_stdout()`
+    instead, which is what makes the guard's frames and the SDK's share one
+    buffer. Falls back to `sys.stdout` itself when it has no real OS
+    descriptor to duplicate (e.g. a test's in-memory stand-in).
     """
     try:
         fd = os.dup(sys.stdout.fileno())
@@ -174,20 +206,80 @@ def _real_wire_stdout() -> IO[str]:
     return os.fdopen(fd, "w", buffering=1)
 
 
+@contextlib.contextmanager
+def wire_stdout() -> Iterator[IO[str]]:
+    """The one writer for the whole stdio connection: both this module's
+    error frames and the SDK's responses write through it, so its buffer
+    lock — not POSIX `PIPE_BUF`, which only covers 4096 bytes — is what
+    keeps a large response and an error frame from interleaving.
+
+    Handing `stdio_server` an explicit `stdout` also skips the SDK's own
+    fd-1 claim, so this does that claim's job instead: fd 1 points at stderr
+    while the connection is up, which keeps a stray `print` from any library
+    off the protocol stream, and is restored on exit. The diversion only
+    holds for bytes that reach fd 1 while it is in place, so `sys.stdout` is
+    flushed on both edges: on entry, and again in the `finally` before fd 1
+    is restored. Skipping the exit flush would leave a buffered `print` from
+    the connection sitting in `sys.stdout` until the restored fd 1 drains it
+    onto the wire. Yields `sys.stdout` unchanged when there is no real
+    descriptor to duplicate (an in-memory stand-in in tests), since there is
+    nothing to divert there either.
+    """
+    try:
+        wire_fd = os.dup(sys.stdout.fileno())
+    except (AttributeError, OSError, ValueError):
+        yield sys.stdout
+        return
+
+    writer = os.fdopen(wire_fd, "w", buffering=1)
+    diverted = False
+    try:
+        try:
+            sys.stdout.flush()
+            os.dup2(sys.stderr.fileno(), 1)
+            diverted = True
+        except (AttributeError, OSError, ValueError):
+            log.warning("could not divert fd 1 to stderr; stray stdout writes reach the wire")
+        yield writer
+    finally:
+        try:
+            writer.flush()
+        except (OSError, ValueError):
+            pass
+        if diverted:
+            # sys.stderr writes to fd 2 and is unaffected by the restore below.
+            with contextlib.suppress(AttributeError, OSError, ValueError):
+                sys.stdout.flush()
+            with contextlib.suppress(OSError):
+                os.dup2(wire_fd, 1)
+        writer.close()
+
+
 def capped_stdin(
     stream: IO[str] | None = None, out_stream: IO[str] | None = None
 ) -> anyio.AsyncFile[str]:
     """Async-iterable text stream for `stdio_server(stdin=...)`: yields
-    complete, valid-shaped lines; drains and drops any line over
-    `MAX_LINE_BYTES` with a stderr warning instead of buffering it; answers
-    an unparseable or non-object/batch line with the matching JSON-RPC error
-    on `out_stream` (default: a private duplicate of the real stdout
-    descriptor, taken now — see `_real_wire_stdout`) instead of forwarding
-    it; skips blank lines; stops at EOF."""
-    reader = _CappedLineReader(
-        stream if stream is not None else sys.stdin,
-        out_stream if out_stream is not None else _real_wire_stdout(),
-    )
+    complete, valid-shaped lines; drains any line over `MAX_LINE_BYTES` and
+    answers it with `-32600` instead of buffering it; answers an unparseable
+    or non-object/batch line with the matching JSON-RPC error on `out_stream`
+    instead of forwarding it; skips blank lines; stops at EOF.
+
+    With no `stream`, lines come from `sys.stdin.buffer` and the cap is
+    counted on bytes; an injected text `stream` is read as text and its cap
+    counts characters. `out_stream` defaults to a private duplicate of the
+    real stdout descriptor (`_private_wire_stdout`); `serve_stdio` passes the
+    connection's shared writer instead."""
+    out = out_stream if out_stream is not None else _private_wire_stdout()
+    if stream is not None:
+        reader = _CappedLineReader(stream=stream, out_stream=out)
+    else:
+        binary = getattr(sys.stdin, "buffer", None)
+        if binary is not None:
+            reader = _CappedLineReader(byte_stream=binary, out_stream=out)
+        else:
+            # No byte view (a text stand-in installed as sys.stdin): the cap
+            # falls back to characters, which is all such a stream can bound.
+            reader = _CappedLineReader(stream=sys.stdin, out_stream=out)
     # `_CappedLineReader` only implements the one method `anyio.AsyncFile`
     # actually calls (`readline()`) — not the full `IO[str]` surface — so the
     # cast documents an intentional, narrower structural fit rather than a

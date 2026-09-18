@@ -4,6 +4,8 @@ import pytest
 
 from graphify_mesh.server.server import main
 
+TOKEN = "s3cret-long-enough-token-for-the-tests-0001"  # noqa: S105
+
 
 def test_no_arguments_runs_stdio(monkeypatch, tmp_path):
     monkeypatch.setenv("GRAPHIFY_MESH_ROOT", str(tmp_path))
@@ -18,7 +20,7 @@ def test_no_arguments_runs_stdio(monkeypatch, tmp_path):
 
 def test_transport_http_starts_the_daemon(monkeypatch, tmp_path):
     monkeypatch.setenv("GRAPHIFY_MESH_ROOT", str(tmp_path))
-    monkeypatch.setenv("GRAPHIFY_MESH_HTTP_TOKEN", "s3cret")
+    monkeypatch.setenv("GRAPHIFY_MESH_HTTP_TOKEN", TOKEN)
     seen: list[tuple[str, int, str]] = []
 
     def fake_serve_http(mesh, config):
@@ -42,7 +44,7 @@ def test_http_without_token_exits_2_and_says_why(monkeypatch, tmp_path, capsys):
 
 def test_public_bind_without_opt_in_exits_2(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("GRAPHIFY_MESH_ROOT", str(tmp_path))
-    monkeypatch.setenv("GRAPHIFY_MESH_HTTP_TOKEN", "s3cret")
+    monkeypatch.setenv("GRAPHIFY_MESH_HTTP_TOKEN", TOKEN)
     assert main(["--transport", "http", "--host", "0.0.0.0"]) == 2  # noqa: S104
     assert "allow-public-bind" in capsys.readouterr().err
 

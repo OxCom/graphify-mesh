@@ -26,6 +26,7 @@ from graphify_mesh.sync.config import (
     Settings,
 )
 from graphify_mesh.sync.locking import LockHeldError
+from graphify_mesh.sync.perms import audit_config_permissions
 from graphify_mesh.sync.pipeline import run
 
 
@@ -149,6 +150,10 @@ def main(argv: list[str] | None = None) -> int:
         registry_path=args.registry,
         **overrides,
     )
+
+    # Before the run, so it also fires under --dry-run: a dry run is then a
+    # way to check the configuration's permissions without publishing.
+    audit_config_permissions(settings.registry_path, settings.manual_relations_path)
 
     try:
         report = run(settings)

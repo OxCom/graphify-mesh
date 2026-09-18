@@ -108,6 +108,47 @@ Edit every `/path/to/...` placeholder in the service file:
 - `ReadWritePaths=` — **uncomment it** and point it at your mesh root. The
   example units use `ProtectSystem=strict`, which makes the whole filesystem
   read-only for the service; without this line the first write fails.
+- `BindReadOnlyPaths=` — **system unit only.** Uncomment both lines if `graphify-mesh-sync` is
+  installed under your home directory, and point them at the directory holding
+  the console script and the directory holding its `site-packages`. The unit
+  sets `ProtectHome=tmpfs`, which replaces the home directory with an empty
+  tmpfs so the sync engine and the `graphify` children it spawns on untrusted
+  repository source cannot read `~/.aws/credentials`, `~/.ssh` or `~/.config`.
+  A pipx or venv install under `~/.local` disappears along with the rest:
+  without the binary bind the service fails to start with status `203/EXEC`
+  (`ExecStart` not found), and without the `site-packages` bind it starts and
+  dies with `ModuleNotFoundError: graphify_mesh`. An install outside the home
+  directory (`/opt`, a system venv) needs neither line. A mesh root inside the
+  home directory needs its own bind as well, so prefer one outside it.
+
+> **What a user unit actually protects.** Measured on systemd 259, a
+> `systemctl --user` unit ignores `ProtectHome=`: the home directory, `~/.ssh`
+> and `~/.aws/credentials` included, stays fully visible to the service and to
+> every `graphify` child it spawns. `ProtectSystem=` and the other namespace
+> directives in the example are in the same category. A user unit still gets
+> the scheduling, journal logging, `MemoryMax=`, `TimeoutStartSec=`,
+> `NoNewPrivileges=` and `RestrictAddressFamilies=` — that last one is a seccomp
+> filter rather than a mount namespace, so it does apply in a user unit
+> (measured: `systemd-run --user -p RestrictAddressFamilies=AF_UNIX` makes
+> `socket(AF_INET)` fail with `EAFNOSUPPORT`). What a user unit does not get is
+> filesystem isolation. Two ways to get it:
+> install the unit as a **system** unit under `/etc/systemd/system/` with a
+> dedicated `User=` (then the directives above apply and the
+> `BindReadOnlyPaths=` lines matter), or keep the user unit and switch on the
+> engine's own child sandbox with `GRAPHIFY_MESH_CHILD_SANDBOX=1`, which uses
+> bubblewrap and works unprivileged. The sandbox covers the `graphify` children
+> only, not the sync engine process itself.
+>
+> Neither route hides the unit's `EnvironmentFile=` from a `graphify` child: it
+> is an ordinary file owned by the service UID, and the child runs as that UID.
+> See [`configuration.md`](configuration.md) for what to do about it
+> (`LoadCredential=`, or a file the child's UID cannot open).
+
+Both `graphify` children that parse repository source (`update` and `extract`)
+additionally run under a per-run, per-repo staging `HOME` inside the sync
+engine's temporary directory. A custom `~/.graphify/providers.json` is
+deliberately invisible to them; see
+[`configuration.md`](configuration.md#child-process-home-isolation).
 
 ### Step 3 — choose the cadence
 

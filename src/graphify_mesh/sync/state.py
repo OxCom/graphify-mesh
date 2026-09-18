@@ -190,7 +190,17 @@ def is_worktree_dirty(root: Path) -> bool:
         return False
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain"],  # noqa: S607 - system git from PATH, read-only status
+            # -c flags first: the scanned repo's own config is untrusted input, and
+            # core.fsmonitor/hooksPath would run its commands in this process's context.
+            [  # noqa: S607 - system git from PATH, read-only status
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "status",
+                "--porcelain",
+            ],
             cwd=str(root),
             capture_output=True,
             text=True,

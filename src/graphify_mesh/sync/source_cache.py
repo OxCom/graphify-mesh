@@ -8,11 +8,17 @@ opened ~100 times per sync run. This module reads a file's lines ONCE (up to
 the caller's line cap, mirroring `SNIPPET_READ_LINE_CAP`) and lets every
 snippet window slice out of the cached tuple instead.
 
-Memory bounds (both are hard caps, so a pathological repo can't blow RSS):
+Memory bounds (all four are hard caps, so a pathological repo can't blow RSS):
 
   * per file: at most ``line_cap`` lines are ever read or stored — the same
     cap the old streaming reader enforced, so cached content is exactly the
     prefix the per-call scan used to see;
+  * per line: at most ``SOURCE_CACHE_MAX_LINE_CHARS`` characters are kept;
+    a longer line is truncated to that prefix rather than dropping the file,
+    since snippet windows only ever show a small slice of a line anyway;
+  * per file total: reading stops once ``SOURCE_CACHE_MAX_FILE_CHARS``
+    characters have been kept, so a newline-free blob costs a bounded amount
+    even below the line cap;
   * total: at most ``SOURCE_CACHE_MAX_FILES`` files are resident at once
     (``functools.lru_cache`` eviction).
 
@@ -33,6 +39,21 @@ from pathlib import Path
 # how many nodes or repos a run touches.
 SOURCE_CACHE_MAX_FILES = 256
 
+# Upper bound on the characters kept for a single line. Snippet windows show a
+# short slice of a line, so a minified bundle or a generated blob on one line
+# is truncated to this prefix instead of being cached whole.
+SOURCE_CACHE_MAX_LINE_CHARS = 4096
+
+# Upper bound on the characters kept for one file. Reading stops as soon as it
+# is reached, so a newline-free file costs a bounded amount even when it stays
+# under the line cap.
+SOURCE_CACHE_MAX_FILE_CHARS = 1_000_000
+
+# Size of one read from disk. Bounds the transient buffer, which is why the
+# reader chunks instead of iterating lines: line iteration would materialize a
+# 10 MB line in full before any cap could apply.
+SOURCE_CACHE_READ_CHUNK_CHARS = 65536
+
 
 @lru_cache(maxsize=SOURCE_CACHE_MAX_FILES)
 def _read_capped_lines(
@@ -44,18 +65,63 @@ def _read_capped_lines(
     caller's ``os.stat``) so a long-lived process (the MCP server) never
     serves pre-edit lines after the file changes on disk.
 
+    A line longer than ``SOURCE_CACHE_MAX_LINE_CHARS`` is stored truncated to
+    that prefix and its tail is discarded; reading stops once
+    ``SOURCE_CACHE_MAX_FILE_CHARS`` characters have been kept.
+
     Encoding/error handling is byte-for-byte the old per-call reader's:
-    ``utf-8`` with ``errors="replace"``, each line ``rstrip("\\n")``-ed.
-    Returns ``None`` (cached, like any other result) when the file cannot be
-    read — callers treat that exactly like the old reader's OSError path
-    (empty snippet, never an exception)."""
+    ``utf-8`` with ``errors="replace"``, each line stripped of its trailing
+    newline. Returns ``None`` (cached, like any other result) when the file
+    cannot be read — callers treat that exactly like the old reader's OSError
+    path (empty snippet, never an exception)."""
     lines: list[str] = []
+    total_chars = 0
+    buf = ""
+    # True while the tail of an over-long line is being discarded up to its
+    # newline, so the discarded part never accumulates in `buf`.
+    dropping = False
+
+    def _room() -> bool:
+        return len(lines) < line_cap and total_chars < SOURCE_CACHE_MAX_FILE_CHARS
+
+    def _keep() -> int:
+        """Characters the next appended line may keep. The file allowance is
+        the binding one near the end of the budget, so clamping to it is what
+        keeps the retained total at or below SOURCE_CACHE_MAX_FILE_CHARS."""
+        return min(SOURCE_CACHE_MAX_LINE_CHARS, SOURCE_CACHE_MAX_FILE_CHARS - total_chars)
+
     try:
         with open(path_str, encoding="utf-8", errors="replace") as fh:
-            for idx, raw_line in enumerate(fh):
-                if idx >= line_cap:
+            while _room():
+                chunk = fh.read(SOURCE_CACHE_READ_CHUNK_CHARS)
+                if not chunk:
                     break
-                lines.append(raw_line.rstrip("\n"))
+                buf += chunk
+                while _room():
+                    newline_at = buf.find("\n")
+                    if dropping:
+                        if newline_at < 0:
+                            buf = ""
+                            break
+                        buf = buf[newline_at + 1 :]
+                        dropping = False
+                        continue
+                    if newline_at < 0:
+                        if len(buf) > SOURCE_CACHE_MAX_LINE_CHARS:
+                            kept = buf[: _keep()]
+                            lines.append(kept)
+                            total_chars += len(kept)
+                            buf = ""
+                            dropping = True
+                            continue
+                        break
+                    line = buf[:newline_at][: _keep()]
+                    lines.append(line)
+                    total_chars += len(line)
+                    buf = buf[newline_at + 1 :]
+            # A final line without a trailing newline is kept, as before.
+            if buf and not dropping and _room():
+                lines.append(buf[: _keep()])
     except OSError:
         return None
     return tuple(lines)

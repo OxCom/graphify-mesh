@@ -8,8 +8,9 @@ publish under `embeddings/current/`, flipped atomically alongside the main
 generation — see `graphify_mesh.sync.embedding.persist_generation`).
 
 Hot reload is all-or-nothing (C28): before ANY tool call, `ensure_fresh()`
-cheaply stats the `current` symlink's target and the manifest's mtime; if
-either changed since the last successful load, a reload is attempted. If
+cheaply stats the `current` symlink's target, the manifest's mtime, and the
+`embeddings/current` symlink's target; if any of the three changed since the
+last successful load, a reload is attempted. If
 the new generation fails `validate_manifest_consistency` (schema, hash,
 count, or tokenizer-version mismatch), the reload is REJECTED and the
 previously-loaded generation keeps serving, with `degraded` populated with
@@ -123,16 +124,25 @@ def _artifact_hash_errors(expected_by_name: dict, generation_dir: Path) -> list[
     """Verify `artifact_sha256` entries against the raw bytes of each artifact
     file in `generation_dir`. Once the manifest carries the map at all, every
     hashed artifact PRESENT on disk must have an entry — a partial (or empty)
-    map is a consistency error, never a silent verification skip. Artifacts
-    absent on disk are skipped here (absence has its own dedicated handling —
-    missing graph is a hard reject, missing lexical is the documented
-    degraded mode)."""
+    map is a consistency error, never a silent verification skip. An artifact
+    the map DOES list but that is absent on disk is also an error: the map is
+    the manifest's own claim about what this generation published, so a
+    missing listed file means the directory is incomplete, exactly as
+    `graphify_mesh.sync.publish._is_incomplete` judges it. An artifact absent
+    from both the map and the disk is left alone — that is the documented
+    never-published case (a lexical index that was never built stays the
+    degraded mode; a missing graph is rejected by the caller)."""
     errors: list[str] = []
     for name in _HASHED_ARTIFACT_NAMES:
         path = generation_dir / name
-        if not path.is_file():
-            continue
         expected = expected_by_name.get(name)
+        if not path.is_file():
+            if isinstance(expected, str):
+                errors.append(
+                    f"{name}: listed in the manifest's artifact_sha256 map but missing "
+                    "on disk — incomplete generation"
+                )
+            continue
         if not isinstance(expected, str):
             errors.append(
                 f"{name}: present on disk but has no artifact_sha256 entry in the "
@@ -438,30 +448,53 @@ class GenerationStore:
         self._generation: Generation | None = None
         self._manifest_mtime: float | None = None
         self._current_target: str | None = None
+        self._embeddings_target: str | None = None
         self.degraded: list[str] = []
         self._lock = ReadWriteLock()
 
-    def _stat_signature(self) -> tuple[str | None, float | None]:
+    def _stat_signature(self) -> tuple[str | None, float | None, str | None]:
+        """Cheap change-detection signature for the published state this store
+        serves. The manifest mtime is stat'd through the PINNED realpath, not
+        the live `current` symlink: a publish flipping `current` between the
+        two calls would otherwise pair the old target with the new
+        generation's manifest mtime and hide the flip.
+
+        The embeddings symlink is part of the signature because embeddings are
+        published on their own flip (`sync.embedding.persist_generation`).
+        Without it, a vector channel dropped by
+        `embeddings_generation_mismatch` would stay dropped until the next
+        graph publish, even after the matching embeddings landed."""
         current = self.config.current_symlink
         if not current.exists():
-            return None, None
+            return None, None, None
         try:
             target = os.path.realpath(current)
-            manifest_path = current / "generation-manifest.json"
+            manifest_path = Path(target) / "generation-manifest.json"
             mtime = manifest_path.stat().st_mtime if manifest_path.is_file() else None
         except OSError:
-            return None, None
-        return target, mtime
+            return None, None, None
+        embeddings_link = self.config.embeddings_current_symlink
+        try:
+            embeddings_target = (
+                os.path.realpath(embeddings_link) if embeddings_link.exists() else None
+            )
+        except OSError:
+            embeddings_target = None
+        return target, mtime, embeddings_target
 
     def ensure_fresh(self) -> None:
-        target, mtime = self._stat_signature()
+        target, mtime, embeddings_target = self._stat_signature()
         if target is None:
             with self._lock.write():
                 if self._generation is None:
                     self.degraded = ["no_generation_published"]
             return
         with self._lock.read():
-            if target == self._current_target and mtime == self._manifest_mtime:
+            if (
+                target == self._current_target
+                and mtime == self._manifest_mtime
+                and embeddings_target == self._embeddings_target
+            ):
                 return  # unchanged, nothing to do
         with self._lock.write():
             # Re-check under the write lock, from a FRESH stat — never from
@@ -478,7 +511,7 @@ class GenerationStore:
             # Which generation to load is therefore decided here; `_try_reload`
             # still reads every artifact from the one realpath it is handed,
             # so a publish landing mid-load cannot mix two generations.
-            fresh_target, fresh_mtime = self._stat_signature()
+            fresh_target, fresh_mtime, fresh_embeddings = self._stat_signature()
             if fresh_target is None:
                 # `current` disappeared while this thread waited. Keep
                 # serving what is loaded rather than reloading a path that
@@ -486,11 +519,15 @@ class GenerationStore:
                 if self._generation is None:
                     self.degraded = ["no_generation_published"]
                 return
-            if fresh_target == self._current_target and fresh_mtime == self._manifest_mtime:
+            if (
+                fresh_target == self._current_target
+                and fresh_mtime == self._manifest_mtime
+                and fresh_embeddings == self._embeddings_target
+            ):
                 return
-            self._try_reload(fresh_target, fresh_mtime)
+            self._try_reload(fresh_target, fresh_mtime, fresh_embeddings)
 
-    def _try_reload(self, target: str, mtime: float | None) -> None:
+    def _try_reload(self, target: str, mtime: float | None, embeddings_target: str | None) -> None:
         # Only ever called under `self._lock.write()` — see `ensure_fresh`.
         # Every artifact read goes through the CAPTURED realpath (`target`),
         # never the live `current` symlink: a sync publish flipping `current`
@@ -525,9 +562,16 @@ class GenerationStore:
             )
         lexical = lexical_raw if isinstance(lexical_raw, dict) else {}
 
-        if manifest is None or graph is None:
+        # Not merely `is None`: a parseable artifact of the wrong TYPE (a
+        # `global-graph.json` holding `[]`, a manifest holding a list or a
+        # string) would otherwise pass this gate and blow up inside
+        # `validate_manifest_consistency` or `build_indexes`, under the write
+        # lock, leaving every later tool call to fail on the poisoned store.
+        if not isinstance(manifest, dict) or not isinstance(graph, dict):
             log.warning(
-                "graphify-mesh: reload skipped — manifest or graph unreadable at %s", gen_dir
+                "graphify-mesh: reload skipped — manifest or graph unreadable, or parsed "
+                "to something other than a JSON object, at %s",
+                gen_dir,
             )
             # Always surface the rejection in `degraded`, even when a
             # previously-loaded generation keeps serving (see module
@@ -537,52 +581,75 @@ class GenerationStore:
             self.degraded = ["reload_failed_unreadable_artifacts"]
             return
 
-        errors = validate_manifest_consistency(manifest, graph, lexical, gen_dir)
-        if lexical_error is not None:
-            errors.append(lexical_error)
-        # Generation-id cross-check: the overlay artifact stamps the
-        # generation_id it was built for (`sync.overlay.overlay_artifact`).
-        # A mismatch means the directory holds artifacts from two different
-        # generations — reject, exactly like any other consistency failure.
-        # Overlays without the stamp (older/synthetic generations) pass.
-        overlay_generation = overlay.get("generation_id")
-        manifest_generation = manifest.get("generation_id")
-        if overlay_generation is not None and overlay_generation != manifest_generation:
-            errors.append(
-                f"cross-project-overlay: generation_id={overlay_generation!r} does not "
-                f"match manifest generation_id={manifest_generation!r} — "
-                "mixed-generation artifacts"
+        # Everything from the consistency gate on runs inside this guard. The
+        # type checks above cover the shapes we know about; an artifact that
+        # breaks in some way nobody anticipated must still cost only this one
+        # reload, because this method runs under the write lock and an escaping
+        # exception would leave every later tool call failing instead of the
+        # previous generation continuing to serve.
+        try:
+            errors = validate_manifest_consistency(manifest, graph, lexical, gen_dir)
+            if lexical_error is not None:
+                errors.append(lexical_error)
+            # Generation-id cross-check: the overlay artifact stamps the
+            # generation_id it was built for (`sync.overlay.overlay_artifact`).
+            # A mismatch means the directory holds artifacts from two different
+            # generations — reject, exactly like any other consistency failure.
+            # Overlays without the stamp (older/synthetic generations) pass.
+            overlay_generation = overlay.get("generation_id")
+            manifest_generation = manifest.get("generation_id")
+            if overlay_generation is not None and overlay_generation != manifest_generation:
+                errors.append(
+                    f"cross-project-overlay: generation_id={overlay_generation!r} does not "
+                    f"match manifest generation_id={manifest_generation!r} — "
+                    "mixed-generation artifacts"
+                )
+            if errors:
+                log.warning(
+                    "graphify-mesh: rejecting inconsistent generation %s (%d errors): %s",
+                    manifest.get("generation_id", "?"),
+                    len(errors),
+                    "; ".join(errors[:3]),
+                )
+                reason = (
+                    "no_consistent_generation_available"
+                    if self._generation is None
+                    else "reload_rejected_previous_generation_still_serving"
+                )
+                self.degraded = [reason] + errors[:3]
+                # All-or-nothing: keep serving whatever was already loaded (if
+                # anything), never swap in the inconsistent one.
+                return
+
+            embeddings, embedding_markers = self._load_embeddings_checked(str(manifest_generation))
+            generation = Generation(
+                generation_id=manifest["generation_id"],
+                manifest=manifest,
+                graph=graph,
+                overlay=overlay,
+                lexical=lexical,
+                embeddings=embeddings,
             )
-        if errors:
-            log.warning(
-                "graphify-mesh: rejecting inconsistent generation %s (%d errors): %s",
-                manifest.get("generation_id", "?"),
-                len(errors),
-                "; ".join(errors[:3]),
+            generation.build_indexes()
+        except Exception:
+            log.exception(
+                "graphify-mesh: reload of %s failed while validating or indexing — "
+                "keeping the previously loaded generation",
+                gen_dir,
             )
-            reason = (
-                "no_consistent_generation_available"
+            self.degraded = [
+                "reload_failed_unreadable_artifacts"
                 if self._generation is None
                 else "reload_rejected_previous_generation_still_serving"
-            )
-            self.degraded = [reason] + errors[:3]
-            # All-or-nothing: keep serving whatever was already loaded (if
-            # anything), never swap in the inconsistent one.
+            ]
             return
 
-        embeddings, embedding_markers = self._load_embeddings_checked(str(manifest_generation))
-        generation = Generation(
-            generation_id=manifest["generation_id"],
-            manifest=manifest,
-            graph=graph,
-            overlay=overlay,
-            lexical=lexical,
-            embeddings=embeddings,
-        )
-        generation.build_indexes()
+        # Only the fully successful path swaps state, so a rejected or failed
+        # reload leaves the previous generation and its signature untouched.
         self._generation = generation
         self._current_target = target
         self._manifest_mtime = mtime
+        self._embeddings_target = embeddings_target
         degraded: list[str] = []
         if not embeddings:
             degraded.append("embeddings_unavailable")
@@ -635,6 +702,16 @@ class GenerationStore:
 
     @property
     def generation(self) -> Generation:
+        """The currently served generation.
+
+        The read lock is released before this returns, so a tool call is NOT
+        held against a concurrent reload: a reload may swap `self._generation`
+        while the caller is still reading the object it got. That is safe
+        because a `Generation` is never mutated after `build_indexes()` — a
+        reload builds a new object and publishes it once it is complete, so
+        an in-flight call keeps reading a consistent, if by then superseded,
+        generation. The rwlock only protects the store's own fields, not the
+        duration of a tool call."""
         self.ensure_fresh()
         with self._lock.read():
             if self._generation is None:

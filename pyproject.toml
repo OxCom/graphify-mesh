@@ -27,6 +27,11 @@ dependencies = [
     # jsonschema: validates the human-authored manual-relations.json against
     #   manual-relations.schema.json (graphify_mesh.sync.overlay_depends).
     "jsonschema>=4.26,<5",
+    # packaging: PEP 440 parsing for the graphify version parity check
+    #   (graphify_mesh.sync.repo_tags compares release parts, so a dev or
+    #   post-release suffix is not a mismatch). Present transitively in most
+    #   environments, declared here because the code imports it directly.
+    "packaging>=23.2",
     # graphifyy: the upstream graphify CLI/library (PyPI project name
     #   "graphifyy", import name "graphify"; github.com/Graphify-Labs/graphify).
     #   The sync pipeline shells out to the `graphify` binary (resolved via
@@ -65,8 +70,11 @@ test = ["pytest>=9.1,<10", "pytest-cov>=7.1,<8", "httpx>=0.28,<1"]
 lint = [
     "ruff>=0.16,<1.0",
     "mypy>=2.3,<3",
-    "types-PyYAML",
-    "types-jsonschema",
+    # Stub packages version-track their runtime package (6.0.x for PyYAML,
+    #   4.26.x for jsonschema) with a date suffix, so the ceiling is the next
+    #   runtime major, matching the floors on PyYAML and jsonschema above.
+    "types-PyYAML>=6.0.12.20260906,<7",
+    "types-jsonschema>=4.26.0.20260518,<5",
     # NumPy 2.5 stubs use a `type` statement (Python 3.12+ syntax), while
     # mypy intentionally checks the project's minimum supported Python
     # version (3.11) — still true under mypy 2.3.1, checked by removing this
@@ -92,6 +100,13 @@ graphify-mesh-reap = "graphify_mesh.sync.reaper_cli:main"
 # to bump the static string before tagging).
 source = "vcs"
 
+[tool.hatch.version.raw-options]
+# A clone with no reachable v* tag (shallow clone, tarball export, CI that
+# fetches without tags) otherwise builds as "0+unknown". Falling back to the
+# last released tag keeps the wheel's version orderable and recognizable;
+# a real tagged build always overrides this.
+fallback-version = "0.0.10"
+
 [tool.hatch.build.hooks.vcs]
 version-file = "src/graphify_mesh/_version.py"
 
@@ -111,7 +126,7 @@ select = ["E", "F", "W", "I", "UP", "B", "S"]
 [tool.ruff.lint.per-file-ignores]
 # Tests legitimately use bare asserts (S101) and fixed test values that
 # bandit misreads as secrets/pickles/subprocess risks (noise in tests).
-"tests/**" = ["S101", "S105", "S106", "S108", "S311", "S603", "S607"]
+"tests/**" = ["S101", "S104", "S105", "S106", "S108", "S311", "S603", "S607"]
 
 [tool.mypy]
 # No strict mode: the codebase is untyped in places — pragmatic first pass.

@@ -493,3 +493,225 @@ def test_load_embeddings_v2_canonical_shard_keeps_mmap(tmp_path):
     rv = out["ok.repo"]
     assert rv.keys == ["a", "z"]
     assert isinstance(rv.matrix, np.memmap)
+
+
+# --- reload robustness: wrong-typed artifacts, incomplete generations --------
+
+
+def _publish_raw_generation(global_dir: Path, generation_id: str, graph_text: str) -> Path:
+    """Publishes a generation whose `global-graph.json` holds arbitrary text —
+    the manifest itself is well-formed, so the graph's shape is the only thing
+    under test."""
+    gen_dir = global_dir / "generations" / generation_id
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    (gen_dir / "global-graph.json").write_text(graph_text, encoding="utf-8")
+    (gen_dir / "generation-manifest.json").write_text(
+        json.dumps(
+            {
+                "generation_id": generation_id,
+                "created_at": "2026-07-20T00:00:00Z",
+                "repo_input_hashes": {},
+                "registry_hash": "test",
+                "config_hash": "test",
+                "output_node_count": 0,
+                "output_edge_count": 0,
+                "clustering_backend": "louvain",
+                "embedding_model": "test-model",
+                "labeling": "skipped",
+                "stale_repos": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (gen_dir / "cross-project-overlay.json").write_text(json.dumps({"edges": []}), encoding="utf-8")
+    (gen_dir / "lexical-index.json").write_text(json.dumps({}), encoding="utf-8")
+    current = global_dir / "current"
+    if current.exists() or current.is_symlink():
+        current.unlink()
+    current.symlink_to(gen_dir, target_is_directory=True)
+    return gen_dir
+
+
+def test_graph_parsing_to_a_list_keeps_previous_generation_serving(tmp_path):
+    """A `global-graph.json` holding `[]` parses fine, so the old
+    `graph is None` gate let it through and the crash landed inside the
+    consistency gate — under the write lock, poisoning every later tool call.
+    It must be rejected like any other unreadable artifact."""
+    config = _config(tmp_path)
+    _write_generation(
+        config.global_dir,
+        "gen-1",
+        [{"id": "n1", "repo": "repo.a", "label": "Alpha", "source_file": "a.py"}],
+    )
+    store = GenerationStore(config)
+    assert store.generation.generation_id == "gen-1"
+
+    _publish_raw_generation(config.global_dir, "gen-2", json.dumps([]))
+
+    assert store.generation.generation_id == "gen-1"  # previous generation still serves
+    assert store.degraded == ["reload_failed_unreadable_artifacts"]
+    # A second call must still work — the store is not poisoned.
+    assert store.generation.generation_id == "gen-1"
+
+
+def test_manifest_parsing_to_a_string_keeps_previous_generation_serving(tmp_path):
+    config = _config(tmp_path)
+    _write_generation(
+        config.global_dir,
+        "gen-1",
+        [{"id": "n1", "repo": "repo.a", "label": "Alpha", "source_file": "a.py"}],
+    )
+    store = GenerationStore(config)
+    assert store.generation.generation_id == "gen-1"
+
+    gen2_dir = _publish_raw_generation(
+        config.global_dir, "gen-2", json.dumps({"nodes": [], "links": []})
+    )
+    (gen2_dir / "generation-manifest.json").write_text(json.dumps("not-a-manifest"), "utf-8")
+
+    assert store.generation.generation_id == "gen-1"
+    assert store.degraded == ["reload_failed_unreadable_artifacts"]
+
+
+def test_unexpected_exception_during_reload_keeps_previous_generation(tmp_path, monkeypatch):
+    """Backstop for artifact shapes nobody anticipated: anything raising from
+    the validation step onward must cost one reload, not the whole store."""
+    from graphify_mesh.server import store as store_mod
+
+    config = _config(tmp_path)
+    _write_generation(
+        config.global_dir,
+        "gen-1",
+        [{"id": "n1", "repo": "repo.a", "label": "Alpha", "source_file": "a.py"}],
+    )
+    store = GenerationStore(config)
+    assert store.generation.generation_id == "gen-1"
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("artifact shape nobody anticipated")
+
+    monkeypatch.setattr(store_mod, "validate_manifest_consistency", boom)
+    _write_generation(
+        config.global_dir,
+        "gen-2",
+        [{"id": "n2", "repo": "repo.a", "label": "Beta", "source_file": "b.py"}],
+    )
+
+    assert store.generation.generation_id == "gen-1"
+    assert store.degraded == ["reload_rejected_previous_generation_still_serving"]
+
+
+def test_manifest_listed_but_missing_lexical_index_is_rejected(tmp_path):
+    """`artifact_sha256` is the manifest's own claim about what it published.
+    A listed artifact that is absent on disk means the generation directory is
+    incomplete — the same judgement `sync.publish._is_incomplete` makes — so it
+    must be rejected, not loaded with an empty lexical index."""
+    import hashlib
+
+    config = _config(tmp_path)
+    _write_generation(
+        config.global_dir,
+        "gen-1",
+        [{"id": "n1", "repo": "repo.a", "label": "Alpha", "source_file": "a.py"}],
+    )
+    store = GenerationStore(config)
+    assert store.generation.generation_id == "gen-1"
+
+    _write_generation(
+        config.global_dir,
+        "gen-2",
+        [{"id": "n2", "repo": "repo.a", "label": "Beta", "source_file": "b.py"}],
+    )
+    gen2_dir = config.global_dir / "generations" / "gen-2"
+    manifest = json.loads((gen2_dir / "generation-manifest.json").read_text(encoding="utf-8"))
+    manifest["artifact_sha256"] = {
+        name: hashlib.sha256((gen2_dir / name).read_bytes()).hexdigest()
+        for name in ("global-graph.json", "cross-project-overlay.json", "lexical-index.json")
+    }
+    (gen2_dir / "generation-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (gen2_dir / "lexical-index.json").unlink()
+
+    assert store.generation.generation_id == "gen-1"
+    assert "reload_rejected_previous_generation_still_serving" in store.degraded
+    assert any("lexical-index.json" in reason for reason in store.degraded)
+
+
+def test_lexical_index_absent_from_hash_map_and_disk_still_loads_degraded(tmp_path):
+    """The never-published case stays as it was: no entry in the map and no
+    file on disk is the documented degraded mode, not an error."""
+    import hashlib
+
+    config = _config(tmp_path)
+    _write_generation(
+        config.global_dir,
+        "gen-1",
+        [{"id": "n1", "repo": "repo.a", "label": "Alpha", "source_file": "a.py"}],
+    )
+    gen_dir = config.global_dir / "generations" / "gen-1"
+    manifest = json.loads((gen_dir / "generation-manifest.json").read_text(encoding="utf-8"))
+    manifest["artifact_sha256"] = {
+        name: hashlib.sha256((gen_dir / name).read_bytes()).hexdigest()
+        for name in ("global-graph.json", "cross-project-overlay.json")
+    }
+    (gen_dir / "generation-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (gen_dir / "lexical-index.json").unlink()
+
+    store = GenerationStore(config)
+    assert store.generation.lexical == {}
+    assert not any("lexical-index" in reason for reason in store.degraded)
+
+
+# --- reload trigger: embeddings symlink flip --------------------------------
+
+
+def _publish_embeddings_generation(global_dir: Path, generation_id: str) -> Path:
+    """Writes one v2 shard under `embeddings/generations/<id>/` and flips
+    `embeddings/current` to it — the sibling publish
+    `sync.embedding.persist_generation` performs."""
+    emb_dir = global_dir / "embeddings" / "generations" / generation_id
+    emb_dir.mkdir(parents=True, exist_ok=True)
+    (emb_dir / "repo.a.meta.json").write_text(
+        json.dumps(
+            {
+                "repo_id": "repo.a",
+                "shard_format": 2,
+                "dim": 2,
+                "entries": {"k": {"content_hash": None, "row": 0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    np.save(emb_dir / "repo.a.npy", np.array([[1.0, 0.0]], dtype=np.float32))
+
+    link = global_dir / "embeddings" / "current"
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    link.symlink_to(emb_dir, target_is_directory=True)
+    return emb_dir
+
+
+def test_embeddings_symlink_flip_alone_triggers_a_reload(tmp_path):
+    """Embeddings are published on their own symlink flip. A stamp mismatch
+    drops the vector channel, and nothing else about the graph generation
+    changes when the matching embeddings land — so the freshness signature has
+    to watch `embeddings/current` too, or vector search stays dead until the
+    next graph publish."""
+    config = _config(tmp_path)
+    _write_generation(
+        config.global_dir,
+        "gen-1",
+        [{"id": "n1", "repo": "repo.a", "label": "Alpha", "source_file": "a.py"}],
+    )
+    _publish_embeddings_generation(config.global_dir, "gen-0")  # stale stamp
+
+    store = GenerationStore(config)
+    assert store.generation.embeddings == {}
+    assert "embeddings_generation_mismatch" in store.degraded
+
+    # Only the embeddings symlink moves — the graph generation is untouched.
+    _publish_embeddings_generation(config.global_dir, "gen-1")
+
+    generation = store.generation
+    assert generation.generation_id == "gen-1"
+    assert "repo.a" in generation.embeddings
+    assert "embeddings_generation_mismatch" not in store.degraded

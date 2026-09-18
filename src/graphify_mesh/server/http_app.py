@@ -17,6 +17,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable
 
 import anyio
+from anyio import to_thread
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
@@ -24,7 +25,7 @@ from starlette.middleware import Middleware
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from graphify_mesh.server.config import ServerConfig
+from graphify_mesh.server.config import ServerConfig, is_loopback_bind
 from graphify_mesh.server.frames import (
     MAX_MESSAGE_BYTES,
     PARSE_ERROR,
@@ -47,14 +48,23 @@ log = logging.getLogger("graphify_mesh.server.http_app")
 # 33rd client with nothing in flight at all.
 BODY_BUFFER_SLOTS = 8
 
+# Bodies above this size are parsed in a worker thread: a multi-megabyte
+# `json.loads` on the event loop stalls every other client of this shared
+# daemon for its whole duration. Below it the thread hop costs more than the
+# parse, so small frames stay inline.
+INLINE_PARSE_MAX_BYTES = 64 * 1024
+
 
 def _security_settings(config: ServerConfig) -> TransportSecuritySettings:
-    """DNS-rebinding protection. A public bind (already gated by
-    `ConfigError` in `ServerConfig.from_env`) accepts any Host, matching the
-    upstream `graphify` server (`serve.py:_build_http_app`); a loopback or
-    specific bind restricts Host to that address plus the localhost
-    aliases, each with and without the port."""
-    if config.http_host in ("0.0.0.0", "::", ""):  # noqa: S104
+    """DNS-rebinding protection, decided by the same rule
+    `config.is_loopback_bind` applies to the bind permission. A non-loopback
+    bind, a wildcard or a concrete interface address alike, both of which
+    require `--allow-public-bind`, is reachable under many names, so it
+    accepts any Host and leaves the bearer token as the gate, like the upstream
+    `graphify` server (`serve.py:_build_http_app`). A loopback bind restricts
+    Host to that address plus the localhost aliases, each with and without
+    the port."""
+    if not is_loopback_bind(config.http_host):
         return TransportSecuritySettings(enable_dns_rebinding_protection=False)
     allowed = {config.http_host, "localhost", "127.0.0.1"}
     allowed |= {f"{host}:{config.http_port}" for host in list(allowed)}
@@ -91,11 +101,19 @@ class _TokenAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        headers = dict(scope.get("headers") or [])
+        # The raw list, not a dict: dict() keeps only the last value of a
+        # repeated header, so a request carrying both a wrong and a right
+        # `authorization` would be accepted or rejected on header order
+        # alone. More than one of them is ambiguous, so it is rejected
+        # before any comparison runs.
+        supplied = [
+            value for name, value in (scope.get("headers") or []) if name == b"authorization"
+        ]
         provided: bytes | None = None
-        scheme, _, candidate = headers.get(b"authorization", b"").partition(b" ")
-        if scheme.lower() == b"bearer" and candidate:
-            provided = candidate.strip()
+        if len(supplied) == 1:
+            scheme, _, candidate = supplied[0].partition(b" ")
+            if scheme.lower() == b"bearer" and candidate:
+                provided = candidate.strip()
 
         if provided is None or not hmac.compare_digest(provided, self._expected):
             client = scope.get("client")
@@ -211,7 +229,12 @@ class _FrameGuardMiddleware:
                 break
 
         try:
-            parsed = json.loads(body)
+            if len(body) > INLINE_PARSE_MAX_BYTES:
+                # `json.loads` accepts the bytearray directly, so the thread
+                # gets the same single buffer, not a copy of it.
+                parsed = await to_thread.run_sync(json.loads, body)
+            else:
+                parsed = json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             log.warning("rejected unparseable request body from %s: %s", _remote(scope), exc)
             await _send_json(send, 400, error_frame_text(*PARSE_ERROR).encode("utf-8"))

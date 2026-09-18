@@ -58,9 +58,9 @@ def test_reload_happens_once_under_concurrent_readers(store_with_two_generations
     reload_calls: list[str] = []
     original = store._try_reload
 
-    def counting_reload(target, mtime):
+    def counting_reload(target, mtime, embeddings_target):
         reload_calls.append(target)
-        return original(target, mtime)
+        return original(target, mtime, embeddings_target)
 
     store._try_reload = counting_reload  # type: ignore[method-assign]
 
@@ -135,9 +135,9 @@ def test_a_stale_capture_never_reloads_over_a_newer_generation(store_with_two_ge
     reloads: list[str] = []
     original_reload = store._try_reload
 
-    def recording_reload(target, mtime):
+    def recording_reload(target, mtime, embeddings_target):
         reloads.append(target)
-        return original_reload(target, mtime)
+        return original_reload(target, mtime, embeddings_target)
 
     store._try_reload = recording_reload  # type: ignore[method-assign]
 

@@ -42,11 +42,11 @@ from graphify_mesh.server.scope import (
 )
 from graphify_mesh.server.store import Generation, GenerationStore, GenerationUnavailableError
 from graphify_mesh.sync.embedding import node_line
+from graphify_mesh.sync.perms import audit_config_permissions
 
 log = logging.getLogger("graphify_mesh.server.server")
 
 SERVER_NAME = "graphify-mesh"
-SERVER_VERSION = "0.1.0"
 
 DEFAULT_TOKEN_BUDGET = 2000
 
@@ -175,11 +175,29 @@ class GraphifyMeshServer:
     def cwd(self) -> Path:
         return self._cwd_override if self._cwd_override is not None else Path.cwd()
 
-    def _scope_cwd(self, arguments: dict) -> Path:
+    def _scope_cwd(self, arguments: dict, scope: str | None) -> Path:
         """The client's directory for `scope='current'`: the per-call `cwd`
-        argument when the caller sent one, otherwise this process's."""
+        argument when the caller sent one, otherwise this process's.
+
+        The fallback holds for the stdio transport only, where one process
+        serves one client session and the process directory therefore is the
+        caller's. Under the shared HTTP daemon it is the daemon's own
+        directory, which may itself sit inside some registered project and
+        would then answer an implicit-scope call with THAT project's results
+        instead of the caller's. So an HTTP call that leaves `cwd` out while
+        the scope is implicit (absent, "" or "current") is refused, naming
+        the argument it must send."""
         call_cwd = _validate_cwd(arguments)
-        return call_cwd if call_cwd is not None else self.cwd
+        if call_cwd is not None:
+            return call_cwd
+        if self.config.transport == "http" and (scope is None or scope in ("", "current")):
+            raise ToolError(
+                "'cwd' is required on this call: the shared HTTP daemon cannot infer the "
+                "caller's project directory, so scope='current' has nothing to resolve "
+                "against. Pass 'cwd' (an absolute client directory) or an explicit scope "
+                "('all' or 'repo:<id>')."
+            )
+        return self.cwd
 
     def _registry_entries(self):
         return load_registry_entries(self.config.registry_path)
@@ -190,7 +208,7 @@ class GraphifyMeshServer:
         query = _validate_str(arguments, "q")
         k = _validate_k(arguments)
         scope = _validate_scope(arguments)
-        scope_cwd = self._scope_cwd(arguments)
+        scope_cwd = self._scope_cwd(arguments, scope)
         entries = self._registry_entries()
         try:
             decision = resolve_scope(scope, scope_cwd, entries)
@@ -227,21 +245,31 @@ class GraphifyMeshServer:
         if not isinstance(cross_repo_only, bool):
             raise ToolError("'cross_repo_only' must be a boolean")
         generation = self._generation()
-        result = similar_mod.find_similar(node, generation, k, cross_repo_only)
+        # `similar.py` works purely off the published generation and never
+        # reads the registry, so the enabled-repo set is handed down from
+        # here. It has to reach candidate SELECTION, not the returned hits: a
+        # post-filter can only shrink an already-truncated list, so k=1 with a
+        # disabled top neighbor returned nothing instead of the enabled
+        # runner-up.
+        enabled = frozenset(entry.repo_id for entry in self._registry_entries() if entry.enabled)
+        result = similar_mod.find_similar(
+            node, generation, k, cross_repo_only, enabled_repos=enabled
+        )
         return {
             "resolved": result.resolved,
             "hits": [_hit_to_dict(h, generation) for h in result.hits],
-            "degraded": result.degraded,
+            "degraded": list(result.degraded),
         }
 
     def tool_project_map(self, arguments: dict) -> dict:
         repo = arguments.get("repo")
         if not isinstance(repo, str) or not repo:
             raise ToolError("'repo' must be a non-empty string (a registered repo_id)")
-        # Contract: project_map serves REGISTERED repo_ids only. A repo that
-        # is present in the current generation but has since been removed
-        # from the registry fails closed like an unknown one.
-        registered = {entry.repo_id for entry in self._registry_entries()}
+        # Contract: project_map serves REGISTERED, ENABLED repo_ids only. A
+        # repo that is present in the current generation but has since been
+        # removed from the registry, or disabled in it, fails closed like an
+        # unknown one.
+        registered = {entry.repo_id for entry in self._registry_entries() if entry.enabled}
         if repo not in registered:
             return {
                 "resolved": False,
@@ -266,7 +294,7 @@ class GraphifyMeshServer:
         goal = _validate_str(arguments, "goal")
         token_budget = _validate_token_budget(arguments)
         scope = _validate_scope(arguments)
-        scope_cwd = self._scope_cwd(arguments)
+        scope_cwd = self._scope_cwd(arguments, scope)
         entries = self._registry_entries()
         try:
             decision = resolve_scope(scope, scope_cwd, entries)
@@ -466,13 +494,24 @@ def serve_stdio(mesh: GraphifyMeshServer) -> None:
     from mcp.server.stdio import stdio_server
 
     from graphify_mesh.server.sdk_app import build_sdk_server
-    from graphify_mesh.server.stdio_guard import capped_stdin
+    from graphify_mesh.server.stdio_guard import capped_stdin, wire_stdout
 
     sdk = build_sdk_server(mesh)
 
     async def _run() -> None:
-        async with stdio_server(stdin=capped_stdin()) as (read_stream, write_stream):
-            await sdk.run(read_stream, write_stream, sdk.create_initialization_options())
+        # ONE writer for both frame sources. `stdio_guard`'s error frames and
+        # the SDK's responses go through the same Python object, so its
+        # buffer lock serializes them; two separate `dup()`s of fd 1 left
+        # that resting on POSIX PIPE_BUF and a response over 4096 bytes could
+        # have an error frame spliced into it. `wire_stdout` also takes over
+        # the fd-1-to-stderr diversion the SDK skips once `stdout` is passed
+        # explicitly.
+        with wire_stdout() as writer:
+            async with stdio_server(
+                stdin=capped_stdin(out_stream=writer),
+                stdout=anyio.wrap_file(writer),
+            ) as (read_stream, write_stream):
+                await sdk.run(read_stream, write_stream, sdk.create_initialization_options())
 
     anyio.run(_run)
 
@@ -515,6 +554,12 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"graphify-mesh-server: {exc}", file=sys.stderr)
         return 2
+
+    # The server trusts the registry for scope authorization, so a
+    # group-writable registry is as much its problem as the sync engine's.
+    # The env-file half is deliberately skipped: the daemon's own secret
+    # lives in a file this package cannot locate.
+    audit_config_permissions(config.registry_path, check_env_files=False)
 
     mesh = GraphifyMeshServer(config)
     if config.transport == "http":

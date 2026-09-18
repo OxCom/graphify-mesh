@@ -38,6 +38,25 @@ class DiscoveredLink:
     rejected_traversal: bool = False
 
 
+class ScanError(str):
+    """One swallowed OS error, carrying the path that failed as an attribute.
+
+    The entries of the `scan_errors` sink have to stay plain strings: callers
+    log them, copy them into the reconciliation report and serialize them into
+    status JSON. They also have to be usable as evidence about *which* part of
+    the tree went unread, and recovering that by parsing the formatted message
+    back apart is how such a guard rots. A str subclass satisfies both: the
+    message is the string, `path` is structured data beside it.
+    """
+
+    path: Path
+
+    def __new__(cls, message: str, path: Path) -> ScanError:
+        error = super().__new__(cls, message)
+        error.path = path
+        return error
+
+
 @dataclass
 class ReconciliationReport:
     registered: list[str] = field(default_factory=list)
@@ -49,6 +68,10 @@ class ReconciliationReport:
     unregistered_discovered: list[str] = field(default_factory=list)
     auto_add: list[str] = field(default_factory=list)
     rejected_traversal: list[str] = field(default_factory=list)
+    # True when the filesystem scan that produced `discovered` hit at least
+    # one swallowed OS error, so absence of a discovered link proves nothing.
+    scan_incomplete: bool = False
+    scan_errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -61,6 +84,8 @@ class ReconciliationReport:
             "unregistered_discovered": self.unregistered_discovered,
             "auto_add": self.auto_add,
             "rejected_traversal": self.rejected_traversal,
+            "scan_incomplete": self.scan_incomplete,
+            "scan_errors": self.scan_errors,
         }
 
 
@@ -77,13 +102,18 @@ def assert_registry_containment(registry: Registry, approved_roots: Sequence[Pat
 
     Discovered graphify-out symlink targets are already resolved and
     prefix-checked against the approved roots (see `discover_filesystem`), but
-    `collection_path` values coming straight from the registry were used by
-    the pipeline unchecked — a registry entry could route the pipeline outside
-    the approved trees without ever passing the discovery guard. This applies
-    the exact same resolve-then-`_is_under` comparison so the two guards can
-    never disagree: every *enabled* entry's resolved collection_path must land
-    under one of approved_roots or one of the registry's external_roots, else
-    hard error naming the repo_id.
+    paths coming straight from the registry were used by the pipeline
+    unchecked — a registry entry could route the pipeline outside the approved
+    trees without ever passing the discovery guard. This applies the exact
+    same resolve-then-`_is_under` comparison so the two guards can never
+    disagree: for every *enabled* entry, BOTH the resolved `root` and the
+    resolved `collection_path` must land under one of approved_roots or one of
+    the registry's external_roots, else hard error naming the repo_id.
+
+    `root` is contained as well as `collection_path` because the pipeline
+    stat-walks it (`compute_source_manifest`) and hands it to
+    `graphify update|extract <root>`: an entry with `root: "/"` would
+    otherwise walk and extract the whole filesystem.
     """
     resolved_approved = [root.resolve() for root in approved_roots]
     allowed_roots = resolved_approved + [Path(root).resolve() for root in registry.external_roots]
@@ -92,17 +122,24 @@ def assert_registry_containment(registry: Registry, approved_roots: Sequence[Pat
             continue
         if entry.repo_id in registry.disabled:
             continue
-        resolved = entry.collection_path.resolve()
-        if any(_is_under(resolved, root) for root in allowed_roots):
-            continue
-        raise ValueError(
-            f"registry repo {entry.repo_id!r}: collection_path {str(entry.collection_path)!r} "
-            f"resolves to {str(resolved)!r}, outside approved roots "
-            f"[{', '.join(str(root) for root in resolved_approved)}] and registry external_roots"
-        )
+        for field_name, declared in (
+            ("root", entry.root),
+            ("collection_path", entry.collection_path),
+        ):
+            resolved = Path(declared).resolve()
+            if any(_is_under(resolved, root) for root in allowed_roots):
+                continue
+            raise ValueError(
+                f"registry repo {entry.repo_id!r}: {field_name} {str(declared)!r} "
+                f"resolves to {str(resolved)!r}, outside approved roots "
+                f"[{', '.join(str(root) for root in resolved_approved)}] and registry "
+                f"external_roots"
+            )
 
 
-def _iter_candidate_dirs(root: Path, depth: int, visited: dict[Path, int]) -> Iterator[Path]:
+def _iter_candidate_dirs(
+    root: Path, depth: int, visited: dict[Path, int], errors: list[str] | None = None
+) -> Iterator[Path]:
     """DFS preorder over candidate project dirs below `root`, up to `depth`
     levels of nesting: same ordering as the old fixed depth-2 scan (child,
     then that child's own matching grandchildren, then the next child), but
@@ -130,6 +167,9 @@ def _iter_candidate_dirs(root: Path, depth: int, visited: dict[Path, int]) -> It
     OSError around scandir or any per-child is_dir/resolve call is caught,
     that entry (or the whole listing) is skipped, and a single aggregated
     warning is logged per directory rather than one line per bad child.
+    Every such swallowed error is also appended to `errors` when a sink list
+    is passed, so callers can tell "this subtree holds no projects" apart
+    from "this subtree could not be read" — see `discover_filesystem`.
     """
     if depth <= 0:
         return
@@ -137,6 +177,8 @@ def _iter_candidate_dirs(root: Path, depth: int, visited: dict[Path, int]) -> It
         entries = sorted(os.scandir(root), key=lambda entry: entry.name)
     except OSError as exc:
         log.warning("cannot list %s (%s); skipping", root, exc)
+        if errors is not None:
+            errors.append(ScanError(f"cannot list {root}: {exc}", root))
         return
 
     skipped = 0
@@ -168,7 +210,7 @@ def _iter_candidate_dirs(root: Path, depth: int, visited: dict[Path, int]) -> It
         if prior_budget is not None and prior_budget >= remaining:
             continue
         visited[resolved_child] = remaining
-        yield from _iter_candidate_dirs(child, remaining, visited)
+        yield from _iter_candidate_dirs(child, remaining, visited, errors)
 
     if skipped:
         log.warning(
@@ -177,12 +219,17 @@ def _iter_candidate_dirs(root: Path, depth: int, visited: dict[Path, int]) -> It
             "y" if skipped == 1 else "ies",
             root,
         )
+        if errors is not None:
+            errors.append(
+                ScanError(f"skipped {skipped} entries under {root}: is_dir/resolve OS error", root)
+            )
 
 
 def discover_filesystem(
     scan_roots: Sequence[Path],
     approved_roots: Sequence[Path],
     depth: int = SCAN_DEFAULT_DEPTH,
+    scan_errors: list[str] | None = None,
 ) -> list[DiscoveredLink]:
     """Scan for `graphify-out` symlinks/dirs under each of `scan_roots`, up to
     `depth` levels of nesting below the root (depth = max nesting of the
@@ -195,6 +242,15 @@ def discover_filesystem(
     depth, is logged at warning level and skipped — other roots still run.
     Results are returned in roots-order, preorder-within-root — the combined
     list is never re-sorted.
+
+    Pass a list as `scan_errors` to collect every OS error this scan swallows
+    (unreadable directory, unreadable child, unusable scan root, unreadable
+    candidate). Entries are `ScanError` instances: ordinary strings that also
+    carry the failing path, which is what lets `reconcile` decide per repo
+    whether a missing link proves removal or only proves an unread subtree. A
+    non-empty list means the returned results are an incomplete view of the
+    filesystem. The return value and its ordering are unchanged; the sink is
+    append-only and never read here.
     """
     resolved_approved_roots = [Path(r).resolve() for r in approved_roots]
     results: list[DiscoveredLink] = []
@@ -236,9 +292,15 @@ def discover_filesystem(
             root_is_dir = root.is_dir()
         except OSError as exc:
             log.warning("cannot stat scan root %s (%s); skipping", raw_root, exc)
+            if scan_errors is not None:
+                scan_errors.append(
+                    ScanError(f"cannot stat scan root {raw_root}: {exc}", Path(raw_root))
+                )
             continue
         if not root_is_dir:
             log.warning("scan root %s is not a directory; skipping", root)
+            if scan_errors is not None:
+                scan_errors.append(ScanError(f"scan root {root} is not a directory", root))
             continue
         prior_budget = visited.get(root)
         if prior_budget is not None and prior_budget >= depth:
@@ -259,7 +321,7 @@ def discover_filesystem(
         # whose links are all identical-path repeats of a prior root would
         # misreport link_count == 0 and fire a spurious warning.
         dedup_suppressed = 0
-        for project_dir in _iter_candidate_dirs(root, depth, visited):
+        for project_dir in _iter_candidate_dirs(root, depth, visited, scan_errors):
             candidate_count += 1
             link_path = project_dir / "graphify-out"
 
@@ -272,6 +334,10 @@ def discover_filesystem(
                 resolved_project_dir = project_dir.resolve()
             except OSError as exc:
                 log.warning("cannot resolve candidate dir %s (%s); skipping", project_dir, exc)
+                if scan_errors is not None:
+                    scan_errors.append(
+                        ScanError(f"cannot resolve candidate dir {project_dir}: {exc}", project_dir)
+                    )
                 continue
 
             if not any(_is_under(resolved_project_dir, r) for r in resolved_approved_roots):
@@ -311,6 +377,12 @@ def discover_filesystem(
                     exc.errno,
                     exc,
                 )
+                if scan_errors is not None:
+                    scan_errors.append(
+                        ScanError(
+                            f"cannot lstat graphify-out under {project_dir}: {exc}", project_dir
+                        )
+                    )
                 continue
 
             is_symlink_entry = stat.S_ISLNK(link_lstat.st_mode)
@@ -342,6 +414,13 @@ def discover_filesystem(
                         exc.errno,
                         exc,
                     )
+                    if scan_errors is not None:
+                        scan_errors.append(
+                            ScanError(
+                                f"cannot stat graphify-out target under {project_dir}: {exc}",
+                                project_dir,
+                            )
+                        )
                     continue
 
             try:
@@ -354,6 +433,13 @@ def discover_filesystem(
                     exc.errno,
                     exc,
                 )
+                if scan_errors is not None:
+                    scan_errors.append(
+                        ScanError(
+                            f"cannot resolve graphify-out target under {project_dir}: {exc}",
+                            project_dir,
+                        )
+                    )
                 continue
 
             if not any(_is_under(target, r) for r in resolved_approved_roots):
@@ -404,12 +490,83 @@ def discover_filesystem(
     return results
 
 
+def _failed_scan_paths(scan_errors: Sequence[str]) -> list[Path] | None:
+    """Resolved paths of the subtrees this scan could not read.
+
+    Returns None when the damage cannot be localized: an error entry that is a
+    plain string carries no path, and a path that will not resolve tells us
+    nothing either. In both cases the caller must fall back to suppressing
+    `removed` for every repo, since it has no way to know which ones the
+    failure could have hidden.
+    """
+    paths: list[Path] = []
+    for error in scan_errors:
+        raw = getattr(error, "path", None)
+        if raw is None:
+            return None
+        try:
+            paths.append(Path(raw).resolve())
+        except OSError:
+            return None
+    return paths
+
+
+def _scan_could_hide(root: Path, failed_paths: list[Path] | None) -> bool:
+    """True when a failed part of the scan could have hidden `root`'s link.
+
+    `failed_paths` of None means the failures could not be localized, so every
+    root is treated as possibly hidden. Otherwise the link at
+    `<root>/graphify-out` is only invisible if the failure was at `root`
+    itself or at one of its ancestors: an error deeper in the tree cannot hide
+    an entry that sits directly in `root`. Resolve-then-`_is_under`, the same
+    comparison every other containment check in this module uses.
+    """
+    if failed_paths is None:
+        return True
+    try:
+        resolved_root = root.resolve()
+    except OSError:
+        return True
+    return any(_is_under(resolved_root, failed) for failed in failed_paths)
+
+
 def reconcile(
     discovered: list[DiscoveredLink],
     registry: Registry,
     mesh_root: Path,
+    scan_errors: Sequence[str] | None = None,
 ) -> ReconciliationReport:
+    """Reconcile the discovered links against the registry.
+
+    Pass the error sink `discover_filesystem` filled as `scan_errors`. A
+    non-empty sink sets `report.scan_incomplete` and copies the reasons into
+    `report.scan_errors`, which is what operators and the pipeline read.
+
+    Removal must be a confirmed fact: either the collection_path is gone, or a
+    part of the filesystem that would have shown the link was read successfully
+    and showed nothing. It is never an inference from a scan that failed to
+    read the relevant subtree. Downstream, `removed` auto-authorizes shrinking
+    the published graph.
+
+    The suppression is therefore per repo, not global. A repo keeps its normal
+    `removed` classification unless one of the recorded failing paths (see
+    `ScanError.path`) is the repo's own `root` or an ancestor of it — only such
+    a failure can have hidden `<root>/graphify-out`. An unreadable directory in
+    an unrelated part of the tree must not protect a repo from being
+    classified, or the guard turns into a permanent veto that every shrink has
+    to be forced past. A repo the scan could have hidden stays in
+    `report.registered` when its collection_path still exists; a genuinely
+    absent collection_path is still reported as `missing`.
+
+    Errors that carry no path at all cannot be localized, so they fall back to
+    suppressing `removed` for every repo.
+    """
     report = ReconciliationReport()
+    failed_scan_paths: list[Path] | None = None
+    if scan_errors:
+        report.scan_incomplete = True
+        report.scan_errors = list(scan_errors)
+        failed_scan_paths = _failed_scan_paths(scan_errors)
     mesh_root = mesh_root.resolve()
 
     # Guard: a discovered target must resolve under the mesh tree (that's the
@@ -471,6 +628,12 @@ def reconcile(
                 report.broken.append(entry.repo_id)
             elif not entry.collection_path.exists():
                 report.missing.append(entry.repo_id)
+            elif report.scan_incomplete and _scan_could_hide(entry.root, failed_scan_paths):
+                # The scan could not read the part of the filesystem this
+                # repo's link lives in, so "no link discovered" is not
+                # evidence the project is gone. Keep the repo registered;
+                # report.scan_errors carries the reason.
+                report.registered.append(entry.repo_id)
             else:
                 report.removed.append(entry.repo_id)
         else:

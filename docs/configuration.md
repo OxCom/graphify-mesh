@@ -49,8 +49,77 @@ keep their upstream names: `GRAPHIFY_BIN` and `GRAPHIFY_NO_BACKUP`.
 | `GRAPHIFY_MESH_HTTP_HOST` | server | `127.0.0.1` | Bind address for `--transport http`. |
 | `GRAPHIFY_MESH_HTTP_PORT` | server | `19744` | Bind port for `--transport http`. |
 | `GRAPHIFY_MESH_HTTP_PATH` | server | `/mcp` | Mount path for `--transport http`. |
-| `GRAPHIFY_MESH_HTTP_TOKEN` | server | none | Bearer token required for `--transport http`. Blank or whitespace-only counts as absent: the daemon exits `2` with the reason on stderr rather than starting unauthenticated. stdio mode ignores this variable. |
-| `GRAPHIFY_MESH_ALLOW_PUBLIC_BIND` | server | off (`0`/`false`/`no`) | Opt-in to bind a non-loopback host (`0.0.0.0`, `::`, or empty) with `--transport http`. Without it, `ServerConfig.from_env` raises `ConfigError` before the daemon starts. |
+| `GRAPHIFY_MESH_HTTP_TOKEN` | server | none | Bearer token required for `--transport http`. Blank or whitespace-only counts as absent, and a token shorter than 32 characters is refused: the daemon exits `2` with the reason on stderr rather than starting unauthenticated or with a guessable token. The error never echoes the token. stdio mode ignores this variable. |
+| `GRAPHIFY_MESH_ALLOW_PUBLIC_BIND` | server | off (`0`/`false`/`no`) | Opt-in required to bind **any** non-loopback host with `--transport http`, not only the wildcards. Loopback means `127.0.0.0/8`, `::1`, the IPv4-mapped loopback forms and the `localhost` names; a concrete interface address such as `192.168.1.10`, and any hostname that neither is `localhost` nor parses as an IP, count as public. The guard never resolves DNS. Without the opt-in, `ServerConfig.from_env` raises `ConfigError` before the daemon starts. |
+| `GRAPHIFY_MESH_CHILD_ENV_EXTRA` | sync | none | Comma-separated list of extra variable **names** to pass through to the `graphify` subprocesses. The child environment is an allowlist (`PATH`, `HOME`, `LANG`/`LC_*`, `NO_COLOR`, the proxy and CA variables, `PYTHONPATH`, the `OLLAMA_*` family, and `GRAPHIFY_*` minus `GRAPHIFY_MESH_*` — which covers `GRAPHIFY_OLLAMA_*`), so an operator-specific variable the upstream binary needs is declared here rather than by weakening the allowlist. The allowlist is narrow on purpose: the extraction backend is pinned to `ollama` by a literal at both call sites (`sync/graphify_cli.py`'s `run_extract` and `sync/naming.py`'s `run_label`), so no environment can select another backend and forwarding another vendor's credentials only widens what the child could leak. To run a non-Ollama backend you must therefore both make the backend selectable in the package and declare its variables here by name: the `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `DEEPSEEK_*`, `AZURE_OPENAI_*` and `AWS_*` families, plus `GOOGLE_API_KEY`, `KIMI_BASE_URL`, `MOONSHOT_API_KEY`, `CLAUDE_CONFIG_DIR`, `CLAUDE_PROJECT_DIR`, `FALKORDB_PASSWORD` and `LOCALAPPDATA`, no longer pass by default. When one of those names is set in the parent environment and dropped, it is logged by name at info level **once per process**, with this variable named as the fix. Every dropped parent variable is logged by name (never by value) at debug level, also once per process: the dropped set is a property of the engine's environment, identical for every child a run spawns. A `GRAPHIFY_MESH_*` name listed here is rejected with a warning: this package's own config, tokens included, is never the child's business. |
+| `GRAPHIFY_MESH_CHILD_SANDBOX` | sync | off | Set to `1`/`on`/`true`/`yes` to run every `graphify` child under [bubblewrap](https://github.com/containers/bubblewrap). `0`/`off`/`false`/`no` and an unset variable leave it off; **any other value warns and turns the sandbox ON**, because a value nobody recognises still means somebody asked for the sandbox, and the old parse silently produced an unsandboxed run for `enabled`, `Y` or `2`. The child keeps the filesystem readable and keeps network access (the extract backend is an HTTP service). What it loses: the operator's home directory and the session runtime directory (`XDG_RUNTIME_DIR`, else `/run/user/<uid>`) are each replaced by an empty tmpfs, so `~/.ssh`, `~/.aws/credentials` and `~/.config` are gone **and** the ssh-agent and D-Bus sockets underneath the runtime directory cannot be connected to — a read-only bind does not stop `connect()`, and a live agent signs with keys whose files the child never reads. It also gets its own PID namespace (`--unshare-pid`, so it cannot signal the sync engine or the mesh HTTP daemon), its own session (`--new-session`), a private minimal `/dev` (`--dev`, so `/dev/shm` is not shared with every process of that UID), and dies with its monitor (`--die-with-parent`, so a `GRAPHIFY_MESH_CLI_TIMEOUT` expiry ends the real work rather than only the wrapper). Writable: the repo `root`, the **registry-declared** `collection_path`, and the staging HOME — every one of them checked at launch to resolve under an approved root or the mesh root, and a path that does not raises rather than being bound. The `graphify-out` symlink inside the scanned repository is never resolved for this, so the repository cannot choose where a writable bind lands. Read-only: the interpreter's `site-packages`, the `graphify` binary's directory (both the literal path in `argv` and its resolved target, which differ for a pipx shim) and, when the binary sits in a virtualenv, the venv root holding `pyvenv.cfg` and `lib/` — a `pipx install graphifyy` or `pip install --user` copy lives under the home directory the tmpfs empties. `bwrap` is an OS package and is not installed by this project: with the sandbox on and `bwrap` missing from `PATH`, the first child launch raises `ChildSandboxUnavailable` rather than running unsandboxed. Off by default, so an existing deployment is unaffected. This is the only filesystem isolation available to a `systemctl --user` install, which ignores systemd's `ProtectHome=` (measured on systemd 259). |
+| `GRAPHIFY_MESH_CHILD_MASK_PATHS` | sync | none | Comma-separated **absolute** directories to replace with an empty tmpfs inside the child sandbox, on top of the ones the engine derives (the home directory, the session runtime directory, and the mesh `bin/` directory). Use it for operator state the child has no business reading that does not sit under any of those. Relative entries are refused with a warning. Ignored when the sandbox is off. |
+
+## Child-process HOME isolation
+
+Every `graphify` subprocess the sync engine spawns to do work — `update`,
+`extract`, `merge-graphs`, `cluster-only`, `label` — runs with `HOME` pointed at
+a directory inside the run's own temporary staging tree, never at the operator's
+home. The `merge-graphs`, `cluster-only` and `label` calls share one staging
+home per run; `update` and `extract` get one **per repo**, because they run
+concurrently (`GRAPHIFY_MESH_EXTRACT_CONCURRENCY`) and upstream writes caches
+under `HOME`. The whole tree is deleted when the run ends.
+
+One child is not in that set. The clustering-backend probe (`sync/backend.py`)
+runs the interpreter behind `GRAPHIFY_BIN` with a one-line
+`importlib.util.find_spec` expression, keeps the real `HOME`, and is not
+sandboxed. It parses no repository content. It does get the same environment
+allowlist as every other child, so `GRAPHIFY_MESH_HTTP_TOKEN` and the rest of
+this package's config never reach it.
+
+Consequences an operator should expect:
+
+- A custom `~/.graphify/providers.json` is not visible to any of these children.
+  This is deliberate: upstream resolves custom LLM providers from that file, and
+  a provider's `base_url` decides where a parsed repository and the API key are
+  sent. Configure the backend through the environment instead.
+- Upstream's query log and hook caches land in the staging tree and vanish with
+  it, rather than accumulating under `~/.cache`.
+- `PYTHONPATH` is set explicitly for these children so a `pip install --user`
+  copy of `graphifyy` stays importable under the substituted `HOME`.
+
+Set `GRAPHIFY_MESH_CHILD_SANDBOX=1` to back this up at the OS level with
+bubblewrap; see the table above.
+
+The substitution only redirects code that goes through `Path.home()` or
+`expanduser`. The child still runs as the same UID and can open any absolute
+path the operator can, so the OS-level half of this control is the example
+unit's `ProtectHome=tmpfs` in a **system** unit, or
+`GRAPHIFY_MESH_CHILD_SANDBOX=1` in a user unit, where `ProtectHome=` has no
+effect (see [`keeping-sync-up-to-date.md`](keeping-sync-up-to-date.md)).
+
+### What the sandbox does not solve: a readable `EnvironmentFile`
+
+`systemd`'s `EnvironmentFile=` is an ordinary file owned by the service UID. The
+sync engine's children run as that same UID and `--ro-bind / /` keeps the whole
+filesystem readable, so a child that can run code can read that file directly
+and recover `GRAPHIFY_MESH_OLLAMA_API_KEY` and `GRAPHIFY_MESH_HTTP_TOKEN` — the
+exact names the child environment allowlist withholds. Network access is shared,
+so reading and exfiltrating is one step. This is not only a sandbox problem: the
+file is readable by that UID whether the sandbox is on or off, and the allowlist
+was never a control against a process that can open files.
+
+What the sandbox does do is mask the mesh `bin/` directory, which is where the
+layout in [`setup.md`](setup.md) puts `registry.json` and the environment file.
+The child reads nothing in there. `GRAPHIFY_MESH_CHILD_MASK_PATHS` extends the
+masked set for a deployment that keeps the file elsewhere.
+
+That is a mitigation, not a fix. The fix is to stop the file being openable by
+the child's UID at all:
+
+- a systemd credential (`LoadCredential=` / `SetCredential=`), which puts the
+  secret in a file readable only by the service's own process, or
+- an environment file owned by a different UID, with the engine started by a
+  wrapper that reads it and drops privileges.
+
+Neither is something this package can arrange for an operator. Until one of
+them is in place, treat every secret in that file as reachable by every
+`graphify` child the engine spawns.
 
 ## CLI flags (`graphify-mesh-sync`)
 
@@ -214,8 +283,8 @@ Source of truth for which repos are in the mesh. See
 | Field | Meaning |
 |-------|---------|
 | `repos[].repo_id` | Stable logical id; becomes the node-id prefix / `repo` attribute in the merged graph. Must match `^[A-Za-z0-9][A-Za-z0-9._-]*$` (it is used as a filename, e.g. embedding shards) and be unique — duplicates are a load-time error. |
-| `repos[].root` | The repo's checkout directory. |
-| `repos[].collection_path` | Directory holding that repo's `graph.json`. |
+| `repos[].root` | The repo's checkout directory. Resolved and required to land under an approved root (a scan root or an `external_roots` entry), same as `collection_path`: the pipeline stat-walks this path and hands it to `graphify update`/`extract`. |
+| `repos[].collection_path` | Directory holding that repo's `graph.json`. Two enabled entries whose paths RESOLVE to the same directory (symlinks and `..` segments included) block the run: concurrent per-repo workers would otherwise snapshot, rewrite and roll back the same `graph.json`. |
 | `repos[].enabled` | If `false`, the repo is skipped. |
 | `disabled` | List of `repo_id`s to force-disable. |
 | `external_roots` | Additional approved roots for symlink resolution. |
@@ -226,6 +295,34 @@ the discovery guard's approved roots and defaults to the scan roots.
 registry-declared `collection_path` values that legitimately live elsewhere;
 use the environment variable for discovered project/link locations and this
 registry field for additional registered collection locations.
+
+### File permissions in the mesh `bin/` directory
+
+The engine audits the modes of its own configuration files once at startup,
+under `graphify-mesh-sync` (including `--dry-run`, so a dry run is a way to
+check permissions without publishing) and under `graphify-mesh-server`. It
+warns and nothing else: these files belong to the operator, so the engine
+never changes a mode and never blocks a run over one.
+
+| File | Expected mode | Warns when |
+|-------|---------------|------------|
+| Any `*.env` beside `registry.json` | `0600`, owned by the service user | group or other hold any permission bit |
+| `registry.json` | not group- or other-writable, e.g. `0644` | group or other can write |
+| `manual-relations.json` | not group- or other-writable, e.g. `0644` | group or other can write |
+
+The env file holds `GRAPHIFY_MESH_OLLAMA_API_KEY` and
+`GRAPHIFY_MESH_HTTP_TOKEN`, so anyone who can read it has those credentials.
+systemd does not tell the process which file it parsed as `EnvironmentFile=`,
+so the audit checks every `*.env` in the directory that holds `registry.json`
+instead. It only stats those files; it never opens one.
+
+`registry.json` carries more authority than a list of paths suggests. Its
+`repos[].root`, `repos[].collection_path`, `disabled` and `external_roots`
+decide which directories get stat-walked and handed to `graphify extract`,
+and they also supply the child sandbox's containment roots and its writable
+bind targets. Anyone who can write the registry can redirect extraction and
+steer a writable bind, which is why group- or other-writable is a finding
+while world-readable is not: the file holds paths, not secrets.
 
 ## `manual-relations.json`
 

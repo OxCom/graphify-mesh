@@ -114,7 +114,7 @@ def validate_dangling_ids(data: dict) -> ValidationResult:
     return _capped_result(errors, total)
 
 
-def _repo_prefix(node_id: object) -> str | None:
+def repo_prefix(node_id: object) -> str | None:
     """Extract the `<repo_id>` half of a merged `<repo_id>::<local_id>` node
     id, or None if the id doesn't follow that convention (external/bare node)."""
     if not isinstance(node_id, str) or "::" not in node_id:
@@ -124,21 +124,31 @@ def _repo_prefix(node_id: object) -> str | None:
 
 
 def validate_forbidden_edges(data: dict) -> ValidationResult:
-    """The structural merged output must never contain CROSS-REPO overlay-only
-    edges (cross_repo:true, or a cross-repo overlay relation type like
-    semantically_similar_to) — those belong exclusively in the WS4 overlay
-    artifact (C5).
+    """The structural merged output must never contain cross-repo edges (C5);
+    they belong exclusively in the WS4 overlay artifact.
+
+    Three rules, in order:
+
+    1. `cross_repo:true` is an error.
+    2. Two endpoints whose `<repo_id>::` prefixes differ is an error for EVERY
+       relation type, not only the overlay relation types. A structural
+       relation such as `calls` spanning two repos is still a cross-repo edge.
+    3. An overlay relation type (semantically_similar_to and friends) is an
+       error when either endpoint carries no repo prefix, since a bare endpoint
+       can only originate from the overlay's external-node handling.
 
     Same-repo edges sharing one of the overlay's relation-type strings are NOT
     forbidden: upstream `graphify`'s own semantic extraction can legitimately
     emit a same-repo `depends_on` edge (e.g. a Helm `Chart.yaml` subchart
     dependency, a package.json same-repo reference) as normal EXTRACTED data.
-    The invariant this guards against is a cross-repo relation leaking into
-    structural truth, not the relation-type string appearing at all — so the
-    check is scoped to edges whose endpoints resolve to two DIFFERENT repo
-    prefixes (or where either endpoint has no repo prefix at all, since that
-    can only originate from the overlay's external-node handling, never from
-    a same-repo per-project graph).
+
+    This check is defense in depth, not the primary mechanism. `graphify
+    merge-graphs` emits cross-repo `same_type_as` and `calls` edges itself, and
+    `pipeline.strip_cross_repo_edges` removes them from the merged graph right
+    after the repo-tag remap, long before validation runs. A cross-repo edge
+    that still reaches this function is therefore a genuine bug — a stage that
+    added one after the strip, or a strip that missed a shape — and blocking
+    the publish is the right answer.
     """
     errors: list[str] = []
     total = 0
@@ -153,10 +163,18 @@ def validate_forbidden_edges(data: dict) -> ValidationResult:
             )
             continue
         rel = link.get("relation") or link.get("type")
+        src_repo = repo_prefix(link.get("source"))
+        dst_repo = repo_prefix(link.get("target"))
+        if src_repo is not None and dst_repo is not None and src_repo != dst_repo:
+            total = _record_error(
+                errors,
+                total,
+                f"forbidden-edge: cross-repo edge {src_repo!r}->{dst_repo!r} "
+                f"with relation {rel!r} on {link.get('source')}->{link.get('target')}",
+            )
+            continue
         if rel not in FORBIDDEN_OVERLAY_RELATION_TYPES:
             continue
-        src_repo = _repo_prefix(link.get("source"))
-        dst_repo = _repo_prefix(link.get("target"))
         if src_repo is not None and src_repo == dst_repo:
             continue  # same-repo edge, legitimate upstream-extracted data
         total = _record_error(

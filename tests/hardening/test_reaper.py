@@ -165,6 +165,32 @@ def test_every_pipeline_graphify_subcommand_is_watched():
         assert candidates[0].pid == 400
 
 
+def test_parent_sync_console_script_is_live():
+    """A graphify child of a running sync pipeline is active pipeline work,
+    not a leak: reaping it aborts the run."""
+    rows = [
+        ProcRow(pid=700, ppid=1, args="/usr/bin/python3 /usr/local/bin/graphify-mesh-sync --once"),
+        ProcRow(
+            pid=701,
+            ppid=700,
+            args="/opt/pipx/venvs/graphifyy/bin/python -m graphify extract /some/repo",
+        ),
+    ]
+    assert find_orphan_candidates(rows) == []
+
+
+def test_parent_sync_module_invocation_is_live():
+    rows = [
+        ProcRow(pid=710, ppid=1, args="/usr/bin/python3 -m graphify_mesh.sync.cli --once"),
+        ProcRow(
+            pid=711,
+            ppid=710,
+            args="/opt/pipx/venvs/graphifyy/bin/python -m graphify extract /some/repo",
+        ),
+    ]
+    assert find_orphan_candidates(rows) == []
+
+
 def test_unrelated_processes_never_flagged():
     rows = [
         ProcRow(pid=1, ppid=0, args="/sbin/init"),

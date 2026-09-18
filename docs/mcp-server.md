@@ -22,8 +22,8 @@ The advertised server name is **`graphify-mesh`**.
 | `--host HOST` | `GRAPHIFY_MESH_HTTP_HOST` | `127.0.0.1` | HTTP bind address. |
 | `--port PORT` | `GRAPHIFY_MESH_HTTP_PORT` | `19744` | HTTP bind port. |
 | `--path PATH` | `GRAPHIFY_MESH_HTTP_PATH` | `/mcp` | HTTP mount path. |
-| `--allow-public-bind` | `GRAPHIFY_MESH_ALLOW_PUBLIC_BIND` | off | Required to bind a non-loopback host (`0.0.0.0`, `::`, empty). |
-| — | `GRAPHIFY_MESH_HTTP_TOKEN` | none | Bearer token; required when `transport=http`. |
+| `--allow-public-bind` | `GRAPHIFY_MESH_ALLOW_PUBLIC_BIND` | off | Required to bind any non-loopback host, wildcards and concrete interface addresses alike. See `configuration.md` for what counts as loopback. |
+| — | `GRAPHIFY_MESH_HTTP_TOKEN` | none | Bearer token; required when `transport=http`, minimum 32 characters. |
 
 A flag beats its environment variable, which beats the default. stdio mode
 ignores the HTTP variables and the token entirely.
@@ -61,7 +61,10 @@ Minimal handshake:
 needs `Authorization: Bearer <token>`; a missing or wrong token gets `401`
 with body exactly `{"error": "unauthorized"}`. The token is never logged.
 `Host`/`Origin` are validated against the bind address and the localhost
-aliases (MCP's DNS-rebinding protection) unless `--allow-public-bind` is set.
+aliases (MCP's DNS-rebinding protection) when the bind is a loopback one; a
+non-loopback bind accepts any `Host`, since it is reachable under many names
+and the bearer token is the real gate. Both the bind permission and this
+branch decide on the same `is_loopback_bind` rule, so they cannot disagree.
 
 Past the token gate, `http_app.py`'s frame guard applies the same two rules
 stdio applies, so a client sees one protocol whichever transport it speaks: a
@@ -124,7 +127,7 @@ to the current project and only widens when asked. Fails closed if
 | Arg | Type | Default | Notes |
 |-----|------|---------|-------|
 | `q` | string | — (required) | Query text. |
-| `scope` | string | `current` | `current`, `all`, or `repo:<id>`. |
+| `scope` | string | `current` | `current`, `all`, or `repo:<id>`. `all` means every **enabled** repo in `registry.json`, not "no filter": a repo disabled since the generation was published is not served. With no enabled repo at all, `all` raises rather than searching everything. |
 | `k` | integer | ranking default | Max results. |
 | `cwd` | string | — | "Absolute path of the project directory this call is about, used to resolve scope='current'. Pass it on every call — one session can move between projects. Omit it only with an explicit scope ('all' or 'repo:<id>'); a directory outside registry.json is refused." |
 
@@ -134,7 +137,7 @@ Explicit cross-repo hybrid search, optionally restricted to a list of repos.
 | Arg | Type | Default | Notes |
 |-----|------|---------|-------|
 | `q` | string | — (required) | Query text. |
-| `repos` | string[] | all repos | Restrict to these `repo_id`s. |
+| `repos` | string[] | all enabled repos | Restrict to these `repo_id`s. Omitted means every enabled repo, never an unfiltered search; an unknown or disabled id is a hard error, and a registry with no enabled repo at all is an error too rather than an empty result. |
 | `k` | integer | ranking default | Max results. |
 
 ### `find_similar`

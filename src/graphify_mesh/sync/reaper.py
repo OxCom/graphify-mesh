@@ -82,9 +82,17 @@ WATCHED_PATTERNS = (
 #             path COMPONENT, because the real Claude Code binary runs as
 #             ".../share/claude/versions/<ver> --session-id ..." where
 #             "claude" is a directory in the path, not the final token.
+#
+# The sync pipeline itself is a live parent too: a `graphify extract/update/
+# merge-graphs/cluster-only/label` child of a running `graphify-mesh-sync`
+# (console script or `python -m graphify_mesh.sync.cli`) is legitimate,
+# in-progress pipeline work. Reaping it fails that repo's sync or aborts the
+# merge mid-run.
 LIVE_PARENT_PATTERNS = (
     re.compile(r"(^|/)(bash|zsh|sh|dash|fish)(\s|$)"),
     re.compile(r"(^|/)claude(/|\s|$)"),
+    re.compile(r"(^|/)graphify-mesh-sync(\s|$)"),
+    re.compile(r"(^|[\s/])graphify_mesh\.sync(\s|$|\.)"),
 )
 
 

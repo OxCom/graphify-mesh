@@ -178,13 +178,26 @@ def test_resolve_ref_uses_shared_index_cache(monkeypatch):
 
 
 def test_manual_relations_schema_rejects_bad_shape(tmp_path):
-    import jsonschema
-
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     bad_path = tmp_path / "manual-relations.json"
     _write_json(bad_path, {"relations": [{"type": "not_a_real_type", "source": {}, "target": {}}]})
-    with pytest.raises(jsonschema.ValidationError):
+    with pytest.raises(ValueError) as excinfo:
         overlay_depends.load_manual_relations(bad_path, schema)
+    message = str(excinfo.value)
+    assert str(bad_path) in message
+    # The failing location is named, the instance content is not: jsonschema's
+    # own message quotes the offending value, and this message reaches logs and
+    # status.json.
+    assert "not_a_real_type" not in message
+
+
+def test_manual_relations_invalid_json_raises_value_error(tmp_path):
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    bad_path = tmp_path / "manual-relations.json"
+    bad_path.write_text('{"relations": [', encoding="utf-8")
+    with pytest.raises(ValueError) as excinfo:
+        overlay_depends.load_manual_relations(bad_path, schema)
+    assert str(bad_path) in str(excinfo.value)
 
 
 def test_manual_relations_missing_file_returns_empty(tmp_path):

@@ -7,6 +7,7 @@ a placeholder — override via GRAPHIFY_MESH_ROOT for your environment.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,11 +16,41 @@ DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 19744
 DEFAULT_HTTP_PATH = "/mcp"
 
-_PUBLIC_BIND_HOSTS = frozenset({"0.0.0.0", "::", ""})  # noqa: S104
+# Hostnames that mean loopback without being parseable as an IP address. Any
+# other name is treated as public: the bind guard never resolves DNS, so a name
+# it cannot decide is a name it refuses.
+_LOOPBACK_HOST_NAMES = frozenset(
+    {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"}
+)
+
+# The bearer token is the only gate on a TCP port every local process can reach.
+MIN_HTTP_TOKEN_CHARS = 32
 
 
 class ConfigError(ValueError):
     """Invalid transport configuration. Raised at startup, never per request."""
+
+
+def is_loopback_bind(host: str) -> bool:
+    """True when binding to `host` reaches loopback only.
+
+    Everything else, wildcards and unresolvable names included, counts as a
+    public bind and needs the explicit opt-in.
+    """
+    candidate = host.strip()
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    # Drop an IPv6 zone index ("fe80::1%eth0"), which ip_address rejects.
+    candidate = candidate.split("%", 1)[0]
+    if not candidate:
+        return False
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return candidate.lower() in _LOOPBACK_HOST_NAMES
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped.is_loopback
+    return address.is_loopback
 
 
 @dataclass
@@ -126,9 +157,12 @@ class ServerConfig:
             resolved_allow_public_bind = env_val in ("1", "true", "yes")
 
         # Check for public bind without opt-in
-        if resolved_http_host in _PUBLIC_BIND_HOSTS and not resolved_allow_public_bind:
+        if not is_loopback_bind(resolved_http_host) and not resolved_allow_public_bind:
             raise ConfigError(
-                f"Cannot bind to {resolved_http_host} without --allow-public-bind flag"
+                f"Cannot bind to '{resolved_http_host}': any non-loopback bind requires "
+                "the --allow-public-bind flag (or GRAPHIFY_MESH_ALLOW_PUBLIC_BIND=1). "
+                "A hostname that is not localhost and does not parse as an IP address "
+                "counts as non-loopback."
             )
 
         # Resolve HTTP token (explicit argument > environment > default)
@@ -140,6 +174,12 @@ class ServerConfig:
                     "HTTP transport requires a bearer token: set GRAPHIFY_MESH_HTTP_TOKEN "
                     "(a loopback TCP port is reachable by every local process, unlike the "
                     "unix socket it replaces)"
+                )
+            if len(token) < MIN_HTTP_TOKEN_CHARS:
+                raise ConfigError(
+                    "GRAPHIFY_MESH_HTTP_TOKEN is too short: at least "
+                    f"{MIN_HTTP_TOKEN_CHARS} characters are required. Generate one with: "
+                    'python -c "import secrets; print(secrets.token_urlsafe(32))"'
                 )
             resolved_http_token = token
 

@@ -35,6 +35,11 @@ STRUCTURAL_NEIGHBOR_SCORE = 0.5
 FALLBACK_PROVENANCE = "PLACEHOLDER_STRUCTURAL_MATCH"
 STRUCTURAL_PROVENANCE = "STRUCTURAL_NEIGHBOR"
 
+# Degraded marker emitted when `enabled_repos` actually excluded a candidate.
+DISABLED_FILTERED_DEGRADED = "disabled_repo_hits_filtered"
+# Degraded marker for a query seed whose own repo is not in `enabled_repos`.
+SEED_REPO_DISABLED_DEGRADED = "node_repo_disabled"
+
 
 @dataclass
 class SimilarResult:
@@ -165,13 +170,20 @@ def same_repo_structural_neighbors(key: str, generation: Generation) -> list[str
 
 
 def fallback_exact_match(
-    key: str, generation: Generation, cross_repo_only: bool, top_k: int
+    key: str,
+    generation: Generation,
+    cross_repo_only: bool,
+    top_k: int,
+    allowed: Callable[[str], bool] | None = None,
 ) -> list[str]:
     """Documented fallback for trivial/unembedded nodes (deliverable 7):
     exact normalized-label + same-community_name match, mirroring
     `graphify_mesh.sync.overlay_similar`'s build-time placeholder scorer exactly
     (same normalization, same match rule), applied over the published
-    merged graph instead of per-repo raw graphs."""
+    merged graph instead of per-repo raw graphs.
+
+    `allowed` rejects a match before the `top_k` truncation, so an excluded
+    repo's match never consumes one of the returned slots."""
     node_id = generation.node_id_by_key.get(key)
     node = generation.node_by_id.get(node_id, {}) if node_id else {}
     label, community, repo = node.get("label"), node.get("community_name"), node.get("repo")
@@ -187,35 +199,81 @@ def fallback_exact_match(
             continue
         if cross_repo_only and other_repo == repo:
             continue
+        if allowed is not None and not allowed(other_key):
+            continue
         matches.append(other_key)
     return sorted(matches)[:top_k]
 
 
+def repo_of_key(key: str, generation: Generation) -> str | None:
+    node_id = generation.node_id_by_key.get(key)
+    if node_id is None:
+        return None
+    return generation.node_by_id.get(node_id, {}).get("repo")
+
+
 def find_similar(
-    query: str, generation: Generation, k: int, cross_repo_only: bool = False
+    query: str,
+    generation: Generation,
+    k: int,
+    cross_repo_only: bool = False,
+    *,
+    enabled_repos: frozenset[str] | None = None,
 ) -> SimilarResult:
+    """`enabled_repos` restricts both the query seed and every candidate to
+    that repo set. `None` means no restriction, which keeps this module usable
+    without a registry. The restriction is applied during candidate selection,
+    before the `k` truncation and before the trivial-node fallback: a candidate
+    from an excluded repo must never occupy one of the `k` slots, and must
+    never suppress the fallback either.
+
+    A seed node whose own repo is excluded fails closed with `resolved=False`,
+    matching `project_map`'s refusal of an unregistered or disabled repo_id.
+    Excluding candidates never changes `resolved`, which reports only whether
+    the QUERY node was found."""
     k = max(1, min(k, ranking.MAX_K))
     resolved_key = resolve_key(query, generation)
     if resolved_key is None:
         return SimilarResult(resolved=False, degraded=["node_not_found"])
 
+    if enabled_repos is not None and repo_of_key(resolved_key, generation) not in enabled_repos:
+        return SimilarResult(resolved=False, degraded=[SEED_REPO_DISABLED_DEGRADED])
+
+    filtered_any = False
+
+    def allowed(other_key: str) -> bool:
+        nonlocal filtered_any
+        if enabled_repos is None:
+            return True
+        if repo_of_key(other_key, generation) in enabled_repos:
+            return True
+        filtered_any = True
+        return False
+
     candidates: dict[str, tuple[float, str]] = {}
     for other_key, score, provenance in overlay_similar_pairs(resolved_key, generation):
+        if not allowed(other_key):
+            continue
         best = candidates.get(other_key)
         if best is None or score > best[0]:
             candidates[other_key] = (score, provenance)
 
     if not cross_repo_only:
         for other_key in same_repo_structural_neighbors(resolved_key, generation):
+            if not allowed(other_key):
+                continue
             candidates.setdefault(other_key, (STRUCTURAL_NEIGHBOR_SCORE, STRUCTURAL_PROVENANCE))
 
     degraded: list[str] = []
     if not candidates:
-        fallback_keys = fallback_exact_match(resolved_key, generation, cross_repo_only, k)
+        fallback_keys = fallback_exact_match(resolved_key, generation, cross_repo_only, k, allowed)
         if fallback_keys:
             degraded.append("similarity_fallback_exact_match")
         for other_key in fallback_keys:
             candidates.setdefault(other_key, (FALLBACK_SCORE, FALLBACK_PROVENANCE))
+
+    if filtered_any:
+        degraded.append(DISABLED_FILTERED_DEGRADED)
 
     ranked = sorted(candidates.items(), key=lambda kv: (-kv[1][0], kv[0]))[:k]
     hits = []

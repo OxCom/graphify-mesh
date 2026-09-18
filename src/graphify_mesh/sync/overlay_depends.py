@@ -255,13 +255,36 @@ def extract_depends_on_edges(
 def load_manual_relations(path: Path, schema: dict) -> list[dict]:
     """Load + jsonschema-validate `manual-relations.json`. Returns the raw
     `relations` list (empty if the file does not exist — manual relations are
-    optional)."""
+    optional).
+
+    Raises ValueError on malformed JSON or a schema violation. The raised
+    message names the file and the failing JSON pointer only: jsonschema's own
+    message embeds the offending instance, which reaches logs and `status.json`
+    through the pipeline, so the full detail stays at warning level in the
+    process log instead.
+    """
     import jsonschema
 
     if not path.is_file():
         return []
-    data = json.loads(path.read_text(encoding="utf-8"))
-    jsonschema.validate(instance=data, schema=schema)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        log.warning("manual relations %s is not valid JSON: %s", path, exc)
+        raise ValueError(
+            f"manual relations file {path} is not valid JSON "
+            f"(line {exc.lineno}, column {exc.colno})"
+        ) from exc
+    try:
+        jsonschema.validate(instance=data, schema=schema)
+    except jsonschema.ValidationError as exc:
+        log.warning("manual relations %s failed schema validation: %s", path, exc)
+        pointer = getattr(exc, "json_path", None) or "/".join(
+            str(part) for part in exc.absolute_path
+        )
+        raise ValueError(
+            f"manual relations file {path} failed schema validation at {pointer or '$'}"
+        ) from exc
     return data.get("relations", [])
 
 

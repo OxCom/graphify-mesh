@@ -27,6 +27,7 @@ override once real tuning data exists (see `overlay_similar.py` callers).
 
 from __future__ import annotations
 
+import heapq
 import logging
 import random
 from typing import TYPE_CHECKING
@@ -50,6 +51,13 @@ LSH_SEED = 1337
 # transient b x chunk float32 product (a hot 4096-row bucket would
 # otherwise allocate a 64MB b x b matrix in one shot).
 BUCKET_CHUNK_ROWS = 1024
+
+# Hard cap on how many rows of one LSH bucket take part in the pairwise
+# comparison. A degenerate bucket (thousands of near-identical vectors hashed
+# alike) costs O(rows^2) comparisons, so one such bucket can dominate an entire
+# run. Rows past the cap are skipped in the deterministic row order built
+# above, and the truncation is logged.
+MAX_BUCKET_COMPARE_ROWS = 4096
 
 
 def cosine_similarity(a: list[float] | np.ndarray, b: list[float] | np.ndarray) -> float:
@@ -172,10 +180,28 @@ def mutual_top_k_pairs(
     # Candidate generation: only within-bucket comparisons (ANN, not
     # all-pairs). Exact cosine + threshold filtering still applies to every
     # candidate pair actually compared, so scoring is never approximate.
-    candidates: dict[str, list[tuple[str, float]]] = {key: [] for key in keys}
-    for bucket_rows in buckets.values():
+    # Each key keeps at most `top_k` candidates in a min-heap ordered by
+    # (score, -generation_rank), so a candidate only displaces the current
+    # worst one when it scores strictly higher; on a tie the earlier-generated
+    # candidate stays. That is exactly what the previous
+    # `sort(key=score, reverse=True)[:top_k]` produced, since Python's sort is
+    # stable. No margin above `top_k` is needed: the mutual filter below asks
+    # only whether each key is inside the other's own top-k set, and a
+    # candidate outside a key's top-k could never pass that test anyway.
+    candidates: dict[str, list[tuple[float, int, str]]] = {key: [] for key in keys}
+    next_rank = 0
+    for sig, bucket_rows in buckets.items():
         if len(bucket_rows) < 2:
             continue
+        if len(bucket_rows) > MAX_BUCKET_COMPARE_ROWS:
+            log.warning(
+                "similar_approach: LSH bucket %s holds %d rows — comparing only the first %d; "
+                "candidate pairs among the remaining rows are skipped",
+                sig,
+                len(bucket_rows),
+                MAX_BUCKET_COMPARE_ROWS,
+            )
+            bucket_rows = bucket_rows[:MAX_BUCKET_COMPARE_ROWS]
         # Gather normalized rows for this bucket only, from each repo's
         # cached normalized() matrix — the only allocation is bucket-sized.
         sub = np.stack(
@@ -198,17 +224,34 @@ def mutual_top_k_pairs(
                     if score < threshold:
                         continue
                     key_b = keys[row_b]
-                    candidates[key_a].append((key_b, score))
-                    candidates[key_b].append((key_a, score))
+                    rank = next_rank
+                    next_rank += 1
+                    for owner_key, other_key in ((key_a, key_b), (key_b, key_a)):
+                        heap = candidates[owner_key]
+                        entry = (score, -rank, other_key)
+                        if len(heap) < top_k:
+                            heapq.heappush(heap, entry)
+                        elif heap and entry > heap[0]:
+                            heapq.heapreplace(heap, entry)
 
+    # Descending score inside each key's kept set, ties broken by generation
+    # order (ascending rank; the heap stores -rank). That is what the pre-heap
+    # implementation emitted, because its stable `sort(key=score, reverse=True)`
+    # ran on a generation-ordered list. Order matters downstream:
+    # overlay_similar.py caps each repo pair at MAX_EDGES_PER_REPO_PAIR, so the
+    # pairs that survive the cap must be the highest-scoring ones. For any
+    # bucket that stays under MAX_BUCKET_COMPARE_ROWS this produces exactly the
+    # pairs, scores and ordering the unbounded implementation produced.
+    kept: dict[str, list[tuple[str, float]]] = {}
     top_candidates: dict[str, set[str]] = {}
-    for key, scored in candidates.items():
-        scored.sort(key=lambda pair: pair[1], reverse=True)
-        top_candidates[key] = {other for other, _ in scored[:top_k]}
+    for key, heap in candidates.items():
+        ordered_entries = sorted(heap, key=lambda entry: (-entry[0], -entry[1]))
+        kept[key] = [(other, score) for score, _neg_rank, other in ordered_entries]
+        top_candidates[key] = {other for other, _ in kept[key]}
 
     seen: set[frozenset] = set()
     pairs: list[tuple[str, str, float]] = []
-    for key_a, scored in candidates.items():
+    for key_a, scored in kept.items():
         for key_b, score in scored:
             if key_b not in top_candidates[key_a] or key_a not in top_candidates[key_b]:
                 continue

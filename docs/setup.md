@@ -84,7 +84,10 @@ $EDITOR /path/to/your/workspace/graph-mesh/bin/registry.json
 ```
 
 Each entry needs a stable `repo_id`, the checkout `root`, and the
-`collection_path` where that repo's `graph.json` lives. See
+`collection_path` where that repo's `graph.json` lives. Keep `bin/registry.json`
+and any `*.env` file beside it out of group and other reach (`0644` for the
+registry, `0600` for the env file) — the engine warns at startup when they are
+looser, and never changes them for you. See
 [`configuration.md`](configuration.md#registryjson) for the full schema.
 
 ## 5. First dry run

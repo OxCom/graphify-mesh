@@ -39,7 +39,10 @@ class RegistryEntry:
 @dataclass(frozen=True)
 class ScopeDecision:
     mode: str  # "repo" | "all"
-    repo_ids: frozenset[str] | None  # None means "all" (no repo filter)
+    # Always a concrete set of enabled repo_ids, for mode "repo" and "all"
+    # alike: `None` (no filter at all) would serve repos the registry has
+    # since disabled but the published generation still carries.
+    repo_ids: frozenset[str]
 
 
 # Parsed-registry cache keyed per path on (st_mtime_ns, st_size, st_ino):
@@ -108,11 +111,16 @@ def _match_cwd(cwd: Path, entries: list[RegistryEntry]) -> str | None:
     return candidates[0].repo_id
 
 
+def _enabled_repo_ids(entries: list[RegistryEntry]) -> frozenset[str]:
+    return frozenset(e.repo_id for e in entries if e.enabled)
+
+
 def resolve_scope(scope: str | None, cwd: Path, entries: list[RegistryEntry]) -> ScopeDecision:
     """Fail-closed scope resolution. `scope` is the raw tool argument:
-    None/""/"current" -> resolve cwd; "all" -> no filter; "repo:<id>" ->
-    explicit single repo, validated against the registry. Any other shape
-    raises."""
+    None/""/"current" -> resolve cwd; "all" -> every enabled repo; "repo:<id>"
+    -> explicit single repo, validated against the registry. Any other shape
+    raises. "all" with no enabled repo raises rather than resolving to an
+    unfiltered search."""
     if scope is None or scope in ("", "current"):
         repo_id = _match_cwd(cwd, entries)
         if repo_id is None:
@@ -124,11 +132,17 @@ def resolve_scope(scope: str | None, cwd: Path, entries: list[RegistryEntry]) ->
         return ScopeDecision(mode="repo", repo_ids=frozenset({repo_id}))
 
     if scope == "all":
-        return ScopeDecision(mode="all", repo_ids=None)
+        enabled = _enabled_repo_ids(entries)
+        if not enabled:
+            raise ScopeResolutionError(
+                "scope='all' resolved to no repos: registry.json lists no enabled repo "
+                "(fail-closed: an empty registry never means 'search everything')"
+            )
+        return ScopeDecision(mode="all", repo_ids=enabled)
 
     if scope.startswith("repo:"):
         repo_id = scope[len("repo:") :]
-        known = {e.repo_id for e in entries if e.enabled}
+        known = _enabled_repo_ids(entries)
         if repo_id not in known:
             raise ScopeResolutionError(
                 f"unknown or disabled repo_id {repo_id!r} in scope={scope!r}"
@@ -140,17 +154,32 @@ def resolve_scope(scope: str | None, cwd: Path, entries: list[RegistryEntry]) ->
     )
 
 
-def resolve_repo_list(
-    repos: list[str] | None, entries: list[RegistryEntry]
-) -> frozenset[str] | None:
+def resolve_repo_list(repos: list[str] | None, entries: list[RegistryEntry]) -> frozenset[str]:
     """For `cross_project(repos=...)`: an explicit repo list is validated
     against the registry (unknown repo_id is a hard error, per fail-closed
-    convention); `None`/empty means "all registered, enabled repos" — this
-    is safe here (unlike the implicit-scope case above) because calling
-    `cross_project` at all is itself the explicit cross-repo opt-in."""
+    convention); `None`/empty means "all registered, enabled repos" — the
+    breadth is safe here (unlike the implicit-scope case above) because
+    calling `cross_project` at all is itself the explicit cross-repo opt-in.
+
+    "Enabled" is enforced by returning the enabled repo_id set rather than
+    `None`. `None` means "no filter at all" downstream, which served every
+    repo the published generation still carried, including one the registry
+    had since disabled.
+
+    A registry with nothing enabled raises `ScopeResolutionError`, the same
+    answer `resolve_scope('all')` gives to the same registry state. Returning
+    an empty set instead made `cross_project` answer "no hits" for a query
+    that was never run, hiding an empty or fully disabled registry behind a
+    result that reads like a search miss."""
     if not repos:
-        return None
-    known = {e.repo_id for e in entries if e.enabled}
+        enabled = _enabled_repo_ids(entries)
+        if not enabled:
+            raise ScopeResolutionError(
+                "cross_project resolved to no repos: registry.json lists no enabled repo "
+                "(fail-closed: an empty registry never means 'search everything')"
+            )
+        return enabled
+    known = _enabled_repo_ids(entries)
     unknown = set(repos) - known
     if unknown:
         raise ScopeResolutionError(

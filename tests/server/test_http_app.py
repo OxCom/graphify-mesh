@@ -7,7 +7,7 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
-from graphify_mesh.server.http_app import build_http_app
+from graphify_mesh.server.http_app import _security_settings, build_http_app
 
 HEADERS_OK = {
     "Accept": "application/json, text/event-stream",
@@ -33,6 +33,37 @@ def test_wrong_token_is_401(client, http_config):
         response = c.post(
             http_config.http_path,
             headers={**HEADERS_OK, "Authorization": "Bearer nope"},
+            json=_initialize(),
+        )
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize("valid_first", [True, False])
+def test_repeated_authorization_headers_are_401(client, http_config, valid_first):
+    """A dict of the headers keeps only the last value, which would decide
+    this request on header order. Two `authorization` headers are ambiguous
+    and get the same 401 in both orders."""
+    good = f"Bearer {http_config.http_token}"
+    pair = [good, "Bearer nope"] if valid_first else ["Bearer nope", good]
+    raw = [("Accept", HEADERS_OK["Accept"]), ("Content-Type", HEADERS_OK["Content-Type"])]
+    raw += [("Authorization", value) for value in pair]
+    with client as c:
+        response = c.post(
+            http_config.http_path,
+            headers=httpx.Headers(raw),
+            json=_initialize(),
+        )
+    assert response.status_code == 401
+    assert response.text == '{"error": "unauthorized"}'
+
+
+def test_non_bearer_scheme_is_401(client, http_config):
+    """Only the bearer scheme is accepted: the token must not be honoured
+    when it arrives under `Basic`."""
+    with client as c:
+        response = c.post(
+            http_config.http_path,
+            headers={**HEADERS_OK, "Authorization": f"Basic {http_config.http_token}"},
             json=_initialize(),
         )
     assert response.status_code == 401
@@ -236,6 +267,26 @@ def test_a_body_under_the_shared_cap_is_still_served(client, http_config, regist
     assert response.status_code == 200
 
 
+def test_a_body_over_the_inline_parse_threshold_round_trips(
+    client, http_config, registered_repo_root
+):
+    """Bodies past `INLINE_PARSE_MAX_BYTES` are parsed in a worker thread
+    rather than on the event loop; the frame must come back with the same
+    result it gets on the inline path."""
+    from graphify_mesh.server.http_app import INLINE_PARSE_MAX_BYTES
+
+    padding = "q" * (INLINE_PARSE_MAX_BYTES + 1024)
+    with client as c:
+        c.post(http_config.http_path, headers=_auth(http_config), json=_initialize())
+        response = c.post(
+            http_config.http_path,
+            headers=_auth(http_config),
+            json=_tools_call("search", {"q": padding, "cwd": str(registered_repo_root)}),
+        )
+    assert response.status_code == 200
+    assert _result(response)["isError"] is False
+
+
 # --- malformed frames get a generic error, never the SDK's detail ---
 
 
@@ -303,3 +354,24 @@ def test_explicit_null_params_reaches_the_sdk(client, http_config):
         )
     assert response.status_code == 200
     assert "tools" in _result(response)
+
+
+# --- DNS-rebinding branch follows the config module's loopback rule ---
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
+def test_loopback_bind_keeps_the_host_allowlist(http_config, host):
+    settings = _security_settings(replace(http_config, http_host=host))
+    assert settings.allowed_hosts is not None
+    assert host in settings.allowed_hosts
+    assert f"{host}:{http_config.http_port}" in settings.allowed_hosts
+    assert "evil.example.com" not in settings.allowed_hosts
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.10"])
+def test_non_loopback_bind_disables_rebinding_protection(http_config, host):
+    """A concrete interface address needs `--allow-public-bind` just like a
+    wildcard does, so it takes the same branch: reachable under many names,
+    with the bearer token as the gate."""
+    settings = _security_settings(replace(http_config, http_host=host))
+    assert settings.enable_dns_rebinding_protection is False

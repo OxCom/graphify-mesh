@@ -56,6 +56,12 @@ def env(tmp_path, monkeypatch) -> Env:
     monkeypatch.setenv("FAKE_GRAPHIFY_CONTROL", str(e.control_path))
     monkeypatch.setenv("FAKE_GRAPHIFY_CALL_LOG", str(e.call_log_path))
     monkeypatch.setenv("GRAPHIFY_BIN", str(FAKE_GRAPHIFY))
+    # The child env allowlist in graphify_cli drops every name it does not
+    # recognise, the two the fake binary is driven by included. Declare them
+    # through the documented extension point, as tests/sync/conftest.py does.
+    monkeypatch.setenv(
+        "GRAPHIFY_MESH_CHILD_ENV_EXTRA", "FAKE_GRAPHIFY_CONTROL,FAKE_GRAPHIFY_CALL_LOG"
+    )
     yield e
 
 
