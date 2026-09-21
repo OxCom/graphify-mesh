@@ -12,7 +12,7 @@ discovery
    -> merge                       (graphify merge-graphs, from empty, sorted)
    -> recluster + repo-tag remap  (re-cluster the merged graph; rewrite
                                     graphify's auto tags to true repo_ids)
-   -> name                        (label communities via the LLM backend)
+   -> name                        (cluster + label in process, no CLI child)
    -> embed-changed               (embed only nodes whose content changed)
    -> overlay-resolve             (build depends_on / provides_api /
                                     consumes_api / similar_approach edges +
@@ -50,9 +50,10 @@ discovery
   rewrites graphify's auto-derived node-id tags (which collide across repos
   under the same product directory) to the true registry `repo_id`, before any
   downstream stage runs.
-- **name** sends only communities whose membership fingerprint changed to the
-  LLM backend, reusing prior labels otherwise. Degrades to placeholder names if
-  the backend is unreachable.
+- **name** clusters the merged graph and labels its communities inside the sync
+  process, through graphify's Python API. Only communities that need a name
+  reach the LLM backend; an unreachable backend degrades to deterministic hub
+  names rather than failing. See [the naming stage](#the-naming-stage) below.
 - **embed-changed** embeds only nodes whose durable content key changed since
   the last generation; shards are persisted only once publish actually happens,
   and older embedding generations are collected only after `current` has
@@ -85,6 +86,73 @@ discovery
   embeddings directory if the run dies between the two steps, which the next
   run's GC collects. `status.json` is written through the same atomic
   tmp-file-and-rename path, and carries `scan_incomplete` / `scan_errors`.
+
+## The naming stage
+
+The naming stage runs entirely in the sync process. It stages no graph file and
+spawns no `graphify` child: `graphify cluster-only` and `graphify label` rebuild
+the graph through `graphify.build.build_from_json`, which merges nodes sharing
+`(source_file, label)` and, in a second pass, nodes sharing a label alone.
+Neither pass reads a node's `repo`, so on a graph spanning fourteen repositories
+both collapse nodes across repository boundaries and rewrite labels into full
+paths. The stage's three modules are `sync/naming.py` (policy),
+`sync/clustering.py` (every call into graphify's Python API) and
+`sync/naming_state.py` (the state file).
+
+In order, for each run:
+
+1. `backend.assert_pinned_backend()` resolves the clustering backend by
+   `importlib.util.find_spec` in this interpreter and raises unless it matches
+   `PINNED_CLUSTERING_BACKEND`. This is one of the two failures the stage lets
+   propagate.
+2. `clustering.graph_from_node_link` converts the merged dict to an `nx.Graph`
+   with `networkx.readwrite.json_graph.node_link_graph`, which applies no merge
+   heuristic, no label disambiguation and no hyperedge revalidation. It passes
+   `graph={}`: networkx does not copy that mapping, so without the substitution
+   anything upstream writes into `G.graph` would land in the mesh's own merged
+   dict, where the integrity guard — which covers nodes and links — would not
+   see it.
+3. `clustering.cluster_graph` runs `graphify.cluster.cluster`, then
+   `remap_communities_to_previous` against the previous run's assignments, so a
+   community keeps its id across runs instead of renumbering. The previous
+   assignments are used only when the stored clustering recipe (backend and
+   resolution) still matches; a labeling-model change does not discard id
+   history.
+4. `clustering.membership_sigs` hashes each community's sorted member ids. That
+   signature, not the community id, is the key names are carried by.
+5. Names are resolved against `naming-state.json`. A community whose signature
+   carries a non-provisional name keeps it. Everything else goes to
+   `clustering.llm_names` in a single `generate_community_labels` call, which
+   upstream batches internally, and only when the backend is usable: `openai` importable, a valid base URL, an
+   endpoint the TLS mode can actually reach, and a passing `/models` health
+   probe. A returned name matching `validate.PLACEHOLDER_RE` (`^Community \d+$`)
+   counts as no name.
+6. Whatever is still unnamed takes a hub name from
+   `graphify.cluster.label_communities_by_hub` — the label of the community's
+   highest-degree member, `UserRepository` rather than `Community 42` — and is
+   recorded `provisional: true`. The next healthy run relabels exactly those.
+7. `naming.assert_only_community_attrs_added` compares a per-node digest and a
+   per-edge digest taken before the stage against the graph it produced. A lost
+   node, a rewritten attribute or a changed edge raises `NamingIntegrityError`
+   and the run publishes nothing. The digests cost a few MB against a 42 MB
+   graph, so no second copy of the graph is held. The guard also runs on the
+   reuse path, which writes onto the graph too.
+8. `naming_state.save` writes the new state through a temp file and
+   `os.replace`, so a crash mid-write cannot leave a half-parsed state the next
+   run would trust.
+
+A run whose merged-graph fingerprint, recipes and assignments all match a fully
+non-provisional state skips steps 2 to 6 entirely and applies the stored
+assignments and names. Reuse needs all of it: the assignments must cover exactly
+the graph's node ids, every assigned community must carry a non-empty name, and
+no community may be provisional. A provisional community on the reuse path is
+what would otherwise freeze an outage's hub names permanently, because an
+unchanged graph would never get a second chance once the backend recovered.
+
+Measured on the live mesh (33310 nodes, 1097 communities): clustering is
+deterministic and takes about 4 s, the whole naming stage about 104 s. A full
+relabel is about 11 sequential batched LLM calls — batch size 100, and upstream
+forces ollama calls serial.
 
 ## The two MCP servers
 
@@ -168,6 +236,11 @@ pipeline, never in graphify's own process.
   depend on. Rebuilding from empty is what makes runs deterministic and
   repeatable and is the reason `graphify global add` is never invoked anywhere
   in this package.
+- **`graphify.build.build_from_json` is never called.** It merges nodes that
+  share `(source_file, label)`, and then nodes that share a label, without
+  regard to a node's `repo`, so on the merged graph it collapses nodes across
+  repositories and rewrites their labels into full paths. Graphs are loaded with
+  `networkx.node_link_graph`, which is what graphify's own read side does.
 - **Publish is atomic.** Readers only ever see a fully written, consistency-
   checked generation; a partially written generation is never pointed to by
   `current`.

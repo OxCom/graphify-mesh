@@ -38,7 +38,7 @@ from graphify_mesh.sync.pipeline import (
     _within_infra_grace,
     default_extract_backend_probe,
 )
-from graphify_mesh.sync.state import load_state, save_state
+from graphify_mesh.sync.state import CLOCK_STATE_KEY, load_state, save_state
 from graphify_mesh.sync.sync_project import (
     ACTION_BOOTSTRAP,
     ACTION_EXTRACT,
@@ -964,3 +964,116 @@ class TestDualGateReason:
         assert "suspect" in report.publish_blocked_reason
         assert "unrefreshed" in report.publish_blocked_reason
         assert "; " in report.publish_blocked_reason
+
+
+class TestFrozenClock:
+    """The operator suspends this VM with a host-side state save: the guest
+    never enters S3, so CLOCK_MONOTONIC and CLOCK_BOOTTIME both stop and only
+    CLOCK_REALTIME jumps on resume. Without a correction an infra outage can
+    cross out of its 24h grace purely because the VM was saved overnight, with
+    no retry ever having run."""
+
+    def _seed(self, settings, *, infra_age_hours, frozen_seconds, boot_id, stored_boot_id):
+        """Put `example-org.aaa` `infra_age_hours` into an outage and plant a
+        clock baseline whose (wall - mono) offset is `frozen_seconds` behind
+        the current one — exactly what a suspend leaves behind."""
+        state = load_state(settings.state_path)
+        state["example-org.aaa"]["infra_since"] = time.time() - infra_age_hours * 3600.0
+        wall = time.time()
+        mono = time.monotonic()
+        state[CLOCK_STATE_KEY] = {
+            "wall": wall - frozen_seconds,
+            "mono": mono,
+            "boot_id": stored_boot_id,
+        }
+        save_state(settings.state_path, state)
+        return boot_id
+
+    def test_frozen_interval_is_discounted_from_the_grace_window(self, env, monkeypatch):
+        _setup_extract_and_update_repos(env)
+        settings = env.settings(
+            extract_health_url=PROBE_URL, extract_health_check=_static_check(False)
+        )
+        monkeypatch.setattr(pipeline, "_boot_id", lambda: "boot-1")
+        # 20h of real outage plus 14h of suspended wall clock = 34h of
+        # wall-clock age against a 24h grace.
+        self._seed(
+            settings,
+            infra_age_hours=34.0,
+            frozen_seconds=14 * 3600.0,
+            boot_id="boot-1",
+            stored_boot_id="boot-1",
+        )
+
+        report = pipeline.run(settings)
+
+        assert _rows_by_repo(report)["example-org.aaa"]["status"] == STATUS_INFRA_SKIPPED
+        assert report.infra_repos_in_grace == ["example-org.aaa"]
+        assert report.infra_repos_past_grace == []
+        assert report.unrefreshed_repos == []
+        # The stored outage start moved forward by the frozen interval, so the
+        # discount is applied exactly once and not again next run.
+        moved = load_state(settings.state_path)["example-org.aaa"]["infra_since"]
+        assert time.time() - moved == pytest.approx(20 * 3600.0, abs=120.0)
+
+    def test_reboot_between_runs_shifts_nothing(self, env, monkeypatch):
+        _setup_extract_and_update_repos(env)
+        settings = env.settings(
+            extract_health_url=PROBE_URL, extract_health_check=_static_check(False)
+        )
+        monkeypatch.setattr(pipeline, "_boot_id", lambda: "boot-2")
+        self._seed(
+            settings,
+            infra_age_hours=34.0,
+            frozen_seconds=14 * 3600.0,
+            boot_id="boot-2",
+            stored_boot_id="boot-1-before-reboot",
+        )
+
+        report = pipeline.run(settings)
+
+        # A reboot resets CLOCK_MONOTONIC, so the offset comparison says
+        # nothing and the repo stays where its wall-clock age puts it.
+        assert report.infra_repos_past_grace == ["example-org.aaa"]
+        assert report.infra_repos_in_grace == []
+        moved = load_state(settings.state_path)["example-org.aaa"]["infra_since"]
+        assert time.time() - moved == pytest.approx(34 * 3600.0, abs=120.0)
+
+    def test_small_drift_is_not_a_freeze(self, env, monkeypatch):
+        _setup_extract_and_update_repos(env)
+        settings = env.settings(
+            extract_health_url=PROBE_URL, extract_health_check=_static_check(False)
+        )
+        monkeypatch.setattr(pipeline, "_boot_id", lambda: "boot-1")
+        self._seed(
+            settings,
+            infra_age_hours=INFRA_GRACE_DEFAULT_HOURS + 1.0,
+            frozen_seconds=30.0,
+            boot_id="boot-1",
+            stored_boot_id="boot-1",
+        )
+
+        report = pipeline.run(settings)
+
+        # 30s of NTP slew is below FROZEN_CLOCK_MIN_SECONDS.
+        assert 30.0 < pipeline.FROZEN_CLOCK_MIN_SECONDS
+        assert report.infra_repos_past_grace == ["example-org.aaa"]
+        moved = load_state(settings.state_path)["example-org.aaa"]["infra_since"]
+        expected = (INFRA_GRACE_DEFAULT_HOURS + 1.0) * 3600.0
+        assert time.time() - moved == pytest.approx(expected, abs=120.0)
+
+    def test_baseline_is_written_and_is_never_mistaken_for_a_repo(self, env, monkeypatch):
+        env.add_repo("example-org.aaa", "example-org", "aaa", "aaa.example-org.dev.lo")
+        env.write_registry()
+        monkeypatch.setattr(pipeline, "_boot_id", lambda: "boot-1")
+
+        report = pipeline.run(env.settings())
+
+        assert report.published
+        entry = load_state(env.settings().state_path)[CLOCK_STATE_KEY]
+        assert set(entry) == {"wall", "mono", "boot_id"}
+        assert entry["boot_id"] == "boot-1"
+        assert isinstance(entry["wall"], float)
+        assert isinstance(entry["mono"], float)
+        assert CLOCK_STATE_KEY not in _rows_by_repo(report)
+        assert report.stale_repos == []

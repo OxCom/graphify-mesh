@@ -730,7 +730,7 @@ def run_extract(
     *,
     policy: SandboxPolicy | None = None,
 ) -> CliResult:
-    """`graphify extract <root> --backend ollama --force --max-concurrency 1`
+    """`graphify extract <root> --backend ollama --max-concurrency 1`
     — semantic-inclusive incremental extraction (C18), also used for
     first-time bootstrap of a brand-new project.
 
@@ -739,12 +739,22 @@ def run_extract(
     that could redirect that backend must not be visible to it. `collection_path`
     is the registry-declared output directory, for the reason in `run_update`.
     """
+    # No `--force`. It skips the semantic cache READ (graphify/cli.py:3932-3937),
+    # so every run re-dispatched every semantic file to the model although the
+    # cache is keyed by content hash and prompt fingerprint and was being written
+    # correctly all along. This pipeline already decides update/extract/noop from
+    # its own source digest (`sync_project.py`), so `--force` only duplicated that
+    # decision at the cost of a full re-extraction. Measured 2026-09-21 on
+    # cryengine.hub, unchanged tree: with `--force` 527 s and 56 files re-sent to
+    # the model; without it 6 s, "semantic cache: 6 hit / 0 miss", 0 re-extracted,
+    # same graph. Replaying unchanged files from cache also stops the model
+    # randomly omitting one of them, which used to arm graphify's shrink guard and
+    # fail the whole repo.
     argv = _base_argv(graphify_bin) + [
         "extract",
         str(root),
         "--backend",
         "ollama",
-        "--force",
         "--max-concurrency",
         "1",
     ]
@@ -816,16 +826,3 @@ def run_label(
     staging_home.mkdir(parents=True, exist_ok=True)
     argv = _sandbox_argv(argv, [target_dir, staging_home])
     return _run(argv, cwd=None, env=_isolated_home_env(staging_home))
-
-
-def run_probe(argv: list[str], timeout: int) -> CliResult:
-    """Run a short introspection command with the same filtered environment the
-    graphify children get.
-
-    Exists for `backend.detect_actual_backend`, which used to call
-    `subprocess.run` with no `env=` and so handed a bare interpreter probe the
-    parent's whole environment, `GRAPHIFY_MESH_HTTP_TOKEN` included. The probe
-    parses no repository source, so it keeps the real HOME and is not
-    sandboxed — what it gets is the allowlist, not isolation.
-    """
-    return _run(argv, cwd=None, env=None, timeout=timeout)

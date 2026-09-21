@@ -19,6 +19,12 @@ from pathlib import Path
 # just turn a down service into a multi-minute pipeline hang).
 HEALTH_TIMEOUT_MAX_SECONDS = 300.0
 
+# Ceiling for one in-process labeling call (GRAPHIFY_API_TIMEOUT, which the
+# naming stage exports for graphify's own HTTP client). One hour: the whole
+# pipeline's systemd budget is shorter than upstream's 600 s default times the
+# ~11 sequential batches a 1000-community graph produces.
+API_TIMEOUT_MAX_SECONDS = 3600.0
+
 # Only plain HTTP(S) endpoints are ever legitimate LLM/embed base URLs; the
 # package is published publicly so file://, gopher:// etc. must never reach
 # urllib (SSRF/local-file-read surface).
@@ -60,6 +66,24 @@ def _health_timeout_from_env(var_name: str, default: float) -> float:
     return value
 
 
+def _api_timeout_from_env(var_name: str, default: float) -> float:
+    """Parse the labeling-call timeout override. Same fail-fast-at-startup
+    policy as `_health_timeout_from_env`, but a far larger ceiling: this bounds
+    one LLM completion batch, not a `/models` probe."""
+    raw = os.environ.get(var_name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{var_name} must be a number of seconds, got {raw!r}") from exc
+    if not value > 0:
+        raise ValueError(f"{var_name} must be > 0 seconds, got {raw!r}")
+    if value > API_TIMEOUT_MAX_SECONDS:
+        raise ValueError(f"{var_name} must be <= {API_TIMEOUT_MAX_SECONDS} seconds, got {raw!r}")
+    return value
+
+
 # C19: never re-litigate — see graphify_mesh.sync/__init__.py docstring for the
 # full evidence citation of why `merge-graphs` (stateless) is used instead of
 # `global add` (stateful, corrupts on out-of-order re-add).
@@ -91,6 +115,11 @@ OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1"
 OLLAMA_DEFAULT_MODEL = "qwen2.5-coder:14b"
 OLLAMA_DEFAULT_API_KEY = "dummy"
 OLLAMA_DEFAULT_HEALTH_TIMEOUT = 3.0
+# Per-call ceiling for in-process community labeling. Upstream's own default is
+# 600 s with zero retries for ollama, and the naming stage issues one call per
+# batch of communities, so a wedged backend ("healthy /models, hung
+# completions") could outlast the pipeline's whole systemd budget.
+OLLAMA_DEFAULT_API_TIMEOUT = 180.0
 
 # >30% of registered repos stale => refuse to publish (WS1 item 7 / plan
 # Verification #5). Kept as a named constant per dict-dispatch/no-magic-number
@@ -493,6 +522,14 @@ class Settings:
     ollama_health_timeout: float = field(
         default_factory=lambda: _health_timeout_from_env(
             "GRAPHIFY_MESH_OLLAMA_HEALTH_TIMEOUT", OLLAMA_DEFAULT_HEALTH_TIMEOUT
+        )
+    )
+    # Bounds ONE labeling call, exported to graphify as GRAPHIFY_API_TIMEOUT by
+    # naming.bind_upstream_backend. Separate from ollama_health_timeout: that
+    # one bounds a `/models` probe measured in seconds.
+    ollama_api_timeout: float = field(
+        default_factory=lambda: _api_timeout_from_env(
+            "GRAPHIFY_MESH_OLLAMA_API_TIMEOUT", OLLAMA_DEFAULT_API_TIMEOUT
         )
     )
     # Test-only dependency injection: a `(base_url, api_key, timeout) -> bool`

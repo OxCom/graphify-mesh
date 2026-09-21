@@ -152,17 +152,24 @@ deliberately invisible to them; see
 
 ### Step 3 — choose the cadence
 
-The example timer re-runs the sync 15 minutes after each completed run:
+The example timer runs the sync on every quarter hour of the wall clock:
 
 ```dosini
 [Timer]
-OnBootSec=5min
-OnUnitInactiveSec=15min
+OnCalendar=*:0/15
+Persistent=true
 AccuracySec=1min
 RandomizedDelaySec=60
 ```
 
-Tune `OnUnitInactiveSec` to your repo count and how fresh you need the graph.
+The monotonic bases (`OnBootSec=`, `OnUnitInactiveSec=`) are deliberately not
+used: on a VM the operator suspends with host-side "save state",
+`CLOCK_MONOTONIC` stops, so those timers pause for the whole saved state and
+never catch up, while `Persistent=true` on an `OnCalendar=` timer fires the
+missed elapse right after resume.
+
+Tune the `OnCalendar=` interval to your repo count and how fresh you need the
+graph.
 Because unchanged repos are near-free (digest diff → `noop`) and overlapping
 runs are lock-protected, erring on the frequent side is fine; the expensive
 stages only run for repos that actually changed.
@@ -248,6 +255,78 @@ manual touches:
 
 No restart of anything is required; discovery re-reads `registry.json` every
 run.
+
+## Promoting a new version of the engine
+
+If the scheduler imports the engine straight from a working tree — a
+`PYTHONPATH=` line in the env file pointing at a checkout's `src/` — then every
+save lands in the next scheduled run. A half-written module becomes a
+`SyntaxError` inside a run that has already written state and staging, and the
+transaction lock does not help: the hazard is an edit arriving *during* a run,
+not two runs overlapping.
+
+Point the scheduler at a promoted snapshot instead, and promote explicitly.
+
+Create the snapshot directory and give the unit its own import path through a
+drop-in, not through the env file:
+
+```bash
+mkdir -p /path/to/your/workspace/mesh-src
+systemctl --user edit graphify-mesh-sync.service
+# [Service]
+# Environment=PYTHONPATH=/path/to/your/workspace/mesh-src
+```
+
+`systemctl --user edit` reloads on save; after any hand-edit of the drop-in, run
+`systemctl --user daemon-reload` yourself. **Only then** remove the
+`PYTHONPATH=` line from the env file. systemd lets `EnvironmentFile=` override
+`Environment=`, so reversing the order leaves a window in which a run started in
+between imports the installed package rather than the snapshot. Verify:
+
+```bash
+systemctl --user show graphify-mesh-sync.service -p Environment | tr ' ' '\n' | grep PYTHONPATH
+```
+
+The drop-in rather than the env file, because that file is dual-purpose: systemd
+reads it and an operator sources it for manual runs. Repointing it would send
+every interactive run and every `--dry-run` at the snapshot too, which is the
+opposite of what a development loop needs. The cost is that a manual run against
+the working tree now names its own path:
+
+```bash
+PYTHONPATH=/path/to/your/checkout/src \
+  /path/to/your/venv/bin/graphify-mesh-sync --once --dry-run \
+  --mesh-root /path/to/your/workspace/graph-mesh \
+  --scan-root /path/to/your/workspace/checkouts
+```
+
+Promotion is then one command, run while the timer is stopped:
+
+```bash
+systemctl --user stop graphify-mesh-sync.timer
+systemctl --user is-active graphify-mesh-sync.service   # must not print "activating"
+rsync -a --delete /path/to/your/checkout/src/ /path/to/your/workspace/mesh-src/
+systemctl --user start graphify-mesh-sync.timer
+```
+
+`--delete` is what makes the snapshot a copy rather than an accumulation: a
+module deleted in the checkout must not stay importable in the snapshot.
+
+The MCP server is a separate unit and usually runs the installed package with no
+`PYTHONPATH`, so writer and reader are on different code by construction. It
+picks a new generation up on the symlink flip without a restart as long as the
+generation format is unchanged. Restart it when a promotion changes something it
+shares, such as a dependency version:
+
+```bash
+systemctl --user restart <your-mcp-unit>.service
+```
+
+To roll a promotion back, `systemctl --user revert graphify-mesh-sync.service`
+drops the drop-in, and `publish.prune_old_generations` keeps the previous
+generation on disk (`keep_structural_generations`, default 2), so repointing
+`current` at it is a `ln -sfn` away. Restore the env file's `PYTHONPATH=` line in
+the same act, or the unit falls back to the installed package.
 
 ## Troubleshooting
 

@@ -13,8 +13,12 @@ Description=Timer for reap-graphify-serve.service
 #      publish run — the two units fail independently.
 
 [Timer]
-OnBootSec=3min
-OnUnitInactiveSec=10min
+# Wall-clock slots, for the same reason as graphify-mesh-sync.timer: a host-side
+# VM "save state" stops CLOCK_MONOTONIC, so monotonic bases pause for the whole
+# saved duration and never catch up. Persistent=true works only with OnCalendar=
+# and fires the missed elapse on resume — exactly when orphans have piled up.
+OnCalendar=*:0/10
+Persistent=true
 AccuracySec=1min
 RandomizedDelaySec=30
 Unit=reap-graphify-serve.service

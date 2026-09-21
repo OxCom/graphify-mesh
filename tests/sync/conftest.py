@@ -154,6 +154,25 @@ def _fake_graphify_env_passthrough(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_live_labeling(monkeypatch):
+    """Every naming test gets a deterministic labeler.
+
+    A test that wants the degraded path sets its own health check to False; a
+    test that wants names gets them from here, not from a backend. Without this,
+    the suite's behavior depends on whether an Ollama happens to be listening.
+
+    The fake returns `Community Name <cid>`, which deliberately does NOT match
+    validate.PLACEHOLDER_RE (`^Community \\d+$`) — a name that did would send
+    every test down the provisional path.
+    """
+
+    def fake_llm_names(G, communities, *, backend, model):
+        return {cid: f"Community Name {cid}" for cid in communities}, "llm"
+
+    monkeypatch.setattr("graphify_mesh.sync.clustering.llm_names", fake_llm_names, raising=True)
+
+
 @pytest.fixture()
 def env(tmp_path, monkeypatch) -> Env:
     e = Env(tmp_path)

@@ -19,6 +19,10 @@ from graphify_mesh.sync.config import IGNORED_DIR_NAMES, categorize_file
 
 log = logging.getLogger("graphify_mesh.sync")
 
+# Reserved top-level state key holding the wall/monotonic clock baseline of the
+# previous run. It is not a repo_id — readers of the state dict must skip it.
+CLOCK_STATE_KEY = "__clock__"
+
 
 @dataclass
 class SourceDigest:

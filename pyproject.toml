@@ -38,18 +38,37 @@ dependencies = [
     #   GRAPHIFY_BIN) AND imports `graphify.build.distinct_repo_tags` directly
     #   at merge time — this is a real importable dependency, not just a CLI
     #   on PATH, so it must be declared here.
-    "graphifyy>=0.9.63,<1.0",
+    # graphifyy[ollama]: the extra is what declares `openai`, which graphify's
+    #   ollama backend builds its HTTP client from (`from openai import OpenAI`,
+    #   graphify/llm.py). The naming stage calls generate_community_labels in
+    #   process, so the client must be importable HERE, not only in whatever
+    #   interpreter GRAPHIFY_BIN resolves to. That function catches its own
+    #   failures and degrades to "Community <n>" placeholders, so a missing
+    #   client is silent: every community would publish under a hub fallback.
+    #   Verified in graphifyy-0.9.63.dist-info/METADATA:
+    #   `Requires-Dist: openai; extra == "ollama"`.
+    "graphifyy[ollama]>=0.9.63,<1.0",
+    # openai floor is 1.55.3: httpx 0.28 removed `proxies=`, which openai
+    #   passed until that release, so an older client raises TypeError when the
+    #   client is CONSTRUCTED — swallowed by generate_community_labels into
+    #   placeholder names. The venv has no httpx today, so pip will resolve
+    #   0.28.x and the mismatch is not hypothetical.
+    "openai>=1.55.3,<3",
+    # networkx: the naming stage builds the merged graph with
+    #   `networkx.readwrite.json_graph.node_link_graph` and hands it to
+    #   graphify's clustering (graphify_mesh.sync.clustering). Same rule as
+    #   `packaging` above — it arrives transitively through graphifyy, and is
+    #   declared here because this package imports it directly.
+    "networkx>=3.4,<4",
     # numpy: float32 embedding matrices (sync shard build, overlay ANN
     #   similarity, server query scoring) + .npy shard-format-2 artifacts
     #   loaded with mmap on the read side. Replaced pure-Python list[float]
-    #   vectors that cost ~8x the RAM at 38K nodes (see
-    #   docs/superpowers/plans/2026-07-21-numpy-embeddings.md).
+    #   vectors that cost ~8x the RAM at 38K nodes.
     "numpy>=1.26,<3",
     # mcp: the official MCP SDK. Both transports (stdio and streamable HTTP)
     #   run through its low-level Server, so the 5 tools have exactly one
     #   registration path and cannot drift between modes. Replaced this
-    #   package's own newline-delimited JSON-RPC transport (server/protocol.py)
-    #   — see docs/superpowers/specs/2026-09-17-shared-http-daemon-design.md.
+    #   package's own newline-delimited JSON-RPC transport (server/protocol.py).
     #   Floor is the version the suite is actually run against: the HTTP
     #   adapter passes `max_request_body_size` to
     #   StreamableHTTPSessionManager, which older releases do not accept, and
@@ -135,6 +154,13 @@ warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
 module = "graphify.*"
+ignore_missing_imports = true
+
+# networkx ships no py.typed marker. types-networkx exists but pulls numpy stubs
+#   into the lint set for one module (sync/clustering.py), so the override is the
+#   cheaper equivalent of what `graphify.*` gets above.
+[[tool.mypy.overrides]]
+module = "networkx.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

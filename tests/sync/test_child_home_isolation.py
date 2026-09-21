@@ -174,7 +174,6 @@ def test_sandbox_on_wraps_argv(captured, sandbox, tmp_path):
         str(repo),
         "--backend",
         "ollama",
-        "--force",
         "--max-concurrency",
         "1",
     ]
@@ -524,3 +523,12 @@ def test_a_real_sandboxed_run_publishes(env, monkeypatch, tmp_path):
     assert report.published, report.errors
     rows = {row["repo_id"]: row["status"] for row in report.project_actions}
     assert rows["example-org.aaa"] in {"updated", "unchanged", "noop"}, rows
+
+
+def test_extract_does_not_pass_force_so_the_semantic_cache_is_read(captured, tmp_path):
+    """`--force` skips the semantic cache read, re-sending every semantic file to
+    the model on every run. Measured on cryengine.hub with an unchanged tree:
+    527 s with it, 6 s without."""
+    graphify_cli.run_extract("graphify", tmp_path / "repo", tmp_path / "coll", tmp_path / "home")
+    argv = captured[-1]["argv"]
+    assert "--force" not in argv

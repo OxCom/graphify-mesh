@@ -120,3 +120,25 @@ def test_generation_manifest_missing_keys():
     result = validate.validate_generation_manifest({"generation_id": "x"})
     assert not result.ok
     assert len(result.errors) > 1
+
+
+def test_forbidden_edges_catches_the_naming_collapse_shape():
+    """The live incident: cem.hub's README was collapsed into
+    oxcom.atlassian-mcp's, moving 29 of cem.hub's edges onto a node in another
+    repo. Had the collapse published, these edges are what validate must reject."""
+    data = {
+        "nodes": [
+            {"id": "cem.hub::svc", "repo": "cem.hub"},
+            {"id": "oxcom.atlassian-mcp::readme", "repo": "oxcom.atlassian-mcp"},
+        ],
+        "links": [
+            {
+                "source": "cem.hub::svc",
+                "target": "oxcom.atlassian-mcp::readme",
+                "relation": "references",
+            }
+        ],
+    }
+    result = validate.validate_forbidden_edges(data)
+    assert result.ok is False
+    assert any("cross-repo edge" in err for err in result.errors)

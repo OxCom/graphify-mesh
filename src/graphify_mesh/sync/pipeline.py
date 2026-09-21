@@ -25,6 +25,7 @@ is stripped of them right after the repo-tag remap — see
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -64,6 +65,7 @@ from graphify_mesh.sync.discovery import assert_registry_containment, discover_f
 from graphify_mesh.sync.locking import transaction_lock
 from graphify_mesh.sync.registry import Registry, RepoEntry, load_registry, registry_hash
 from graphify_mesh.sync.state import (
+    CLOCK_STATE_KEY,
     SourceDigest,
     compute_source_manifest,
     file_content_hash,
@@ -399,13 +401,64 @@ def _within_infra_grace(now: float, infra_since: float, grace_hours: float) -> b
     return (now - infra_since) <= grace_hours * 3600.0
 
 
+# Below this, a change in (CLOCK_REALTIME - CLOCK_MONOTONIC) is ordinary NTP
+# slew rather than a suspend, and must move nobody's outage clock.
+FROZEN_CLOCK_MIN_SECONDS = 60.0
+
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+
+
+def _boot_id() -> str | None:
+    """The kernel boot id, or None where it cannot be read. A different boot id
+    means the host rebooted, which resets CLOCK_MONOTONIC and makes any
+    comparison against the stored baseline meaningless."""
+    try:
+        with open(BOOT_ID_PATH, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def _frozen_seconds_since_last_run(
+    state: dict, *, wall: float, mono: float, boot_id: str | None
+) -> float:
+    """Wall-clock seconds that elapsed while this guest was frozen since the
+    previous run.
+
+    The operator suspends this VM with a host-side state save. The guest never
+    enters S3, so CLOCK_MONOTONIC and CLOCK_BOOTTIME both stop and only
+    CLOCK_REALTIME jumps on resume (journal evidence: real=52877s against
+    mono=1348s). Growth of `realtime - monotonic` is therefore the only
+    in-guest freeze signal; BOOTTIME carries none.
+
+    Returns 0.0 whenever the comparison cannot be trusted: no stored baseline,
+    a malformed one, a missing or changed boot id, or a drift too small to be a
+    freeze.
+    """
+    if boot_id is None:
+        return 0.0
+    previous = state.get(CLOCK_STATE_KEY)
+    if not isinstance(previous, dict) or previous.get("boot_id") != boot_id:
+        return 0.0
+    try:
+        previous_offset = float(previous["wall"]) - float(previous["mono"])
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    delta = (wall - mono) - previous_offset
+    if delta < FROZEN_CLOCK_MIN_SECONDS:
+        return 0.0
+    return delta
+
+
 STAGING_PREFIX = "graphify-mesh-sync-staging-"
 # A SIGKILLed/OOM-killed run never reaches the `finally` that removes its
 # staging dir, so stale siblings accumulate in the temp dir forever. Swept
 # at startup (under the transaction lock) once they're old enough that no
 # live run can plausibly still own them — a full sync is minutes, so 6h is
-# very conservative (and also clears concurrently-running dry-runs' dirs
-# only long after those dry-runs are dead).
+# very conservative. The age threshold is NOT what protects a concurrent dry
+# run: a host-side VM resume jumps the wall clock hours forward in one step
+# and can age a live (frozen) dry-run's dir past 6h. The `dry-run.lock` probe
+# in the sweep loop below is that protection.
 STALE_STAGING_MAX_AGE_SECONDS = 6 * 3600.0
 
 
@@ -427,6 +480,24 @@ def _sweep_stale_staging(
             continue
         if age < max_age_seconds:
             continue
+        lock_file = candidate / "dry-run.lock"
+        if lock_file.exists():
+            # A dry run holds LOCK_EX on this file for its whole run, so a
+            # failed non-blocking acquire means the dir is live however old
+            # its mtime looks.
+            try:
+                with open(lock_file, "a+") as fh:
+                    try:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except OSError:
+                        log.debug(
+                            "staging sweep: %s is held by a live dry run, keeping it",
+                            candidate.name,
+                        )
+                        continue
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                continue
         shutil.rmtree(candidate, ignore_errors=True)
         removed.append(candidate.name)
     return removed
@@ -671,6 +742,35 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         )
 
     state = load_state(settings.state_path)
+    # A host-side VM suspend stops CLOCK_MONOTONIC but not CLOCK_REALTIME, so
+    # an infra outage can cross out of its grace window without a single retry
+    # ever having run. Discount the frozen interval exactly once here, by
+    # shifting the stored outage starts; `_within_infra_grace` and the gate
+    # loop stay plain wall-clock. The baseline is rewritten every run, and
+    # save_state (skipped on dry-run) is what persists it.
+    clock_wall = time.time()
+    clock_mono = time.monotonic()
+    clock_boot_id = _boot_id()
+    frozen_seconds = _frozen_seconds_since_last_run(
+        state, wall=clock_wall, mono=clock_mono, boot_id=clock_boot_id
+    )
+    state[CLOCK_STATE_KEY] = {"wall": clock_wall, "mono": clock_mono, "boot_id": clock_boot_id}
+    if frozen_seconds > 0.0:
+        shifted = 0
+        for key, entry in state.items():
+            if key == CLOCK_STATE_KEY or not isinstance(entry, dict):
+                continue
+            infra_since = entry.get("infra_since")
+            if isinstance(infra_since, (int, float)) and not isinstance(infra_since, bool):
+                entry["infra_since"] = float(infra_since) + frozen_seconds
+                shifted += 1
+        log.info(
+            "clock: wall clock jumped %.2fh while monotonic stood still (VM suspend/resume); "
+            "shifted infra_since forward for %d repo(s) so the outage grace is not consumed "
+            "by the freeze",
+            frozen_seconds / 3600.0,
+            shifted,
+        )
     broken_ids = set(reconciliation.broken)
     active_repos = [
         e for e in _repos_for_run(registry, reconciliation.to_dict()) if e.repo_id not in broken_ids
@@ -835,6 +935,20 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 outcomes[entry.repo_id].status,
                 action,
             )
+            # A failure whose reason is nowhere is a failure nobody can act on:
+            # the status line alone ("failed (extract)") sent an investigation
+            # to reproduce the child by hand before it could even name the
+            # cause. `reason` carries the child's own stderr tail.
+            if outcomes[entry.repo_id].status in UNREFRESHED_STATUSES and (
+                outcomes[entry.repo_id].reason
+            ):
+                log.warning(
+                    "[%d/%d] %s: %s",
+                    i,
+                    total_active,
+                    entry.repo_id,
+                    outcomes[entry.repo_id].reason,
+                )
             bar.tick(i, f"{entry.repo_id}: {outcomes[entry.repo_id].status}")
 
     # All shared-structure mutation happens here, single-threaded, strictly
@@ -1056,13 +1170,12 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         report.labeling = naming_result.labeling
         report.clustering_backend = naming_result.backend
         log.info("naming: %s (backend=%s)", naming_result.labeling, naming_result.backend)
-        if naming_result.labeling == naming.LABELING_DEGRADED:
-            previous_global_graph = publish.read_current_global_graph(settings.global_dir)
-            graph_data = naming.restore_last_global_community_names(
-                naming_result.graph_data, previous_global_graph
-            )
-        else:
-            graph_data = naming_result.graph_data
+        # No restore-from-last-published step: the naming state file carries
+        # names across an outage, and a degraded run now returns real names
+        # (carried, or hub fallbacks marked provisional). Overwriting them from
+        # the previous generation would mix two different clusterings inside one
+        # graph and contradict the state file.
+        graph_data = naming_result.graph_data
     # The pre-naming stripped graph (same object as the pre-strip merged
     # graph — strip_project_community_attrs mutates in place) is dead from
     # here on: when naming returned a freshly parsed copy, keeping this

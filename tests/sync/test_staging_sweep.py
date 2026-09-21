@@ -7,6 +7,7 @@ them on the next run."""
 
 from __future__ import annotations
 
+import fcntl
 import os
 import time
 
@@ -24,6 +25,11 @@ def _make_staging(parent, name, age_seconds):
     stale_mtime = time.time() - age_seconds
     os.utime(d, (stale_mtime, stale_mtime))
     return d
+
+
+def _reage(d):
+    stale_mtime = time.time() - STALE_STAGING_MAX_AGE_SECONDS - 60
+    os.utime(d, (stale_mtime, stale_mtime))
 
 
 def test_sweep_removes_only_stale_siblings(tmp_path):
@@ -62,3 +68,40 @@ def test_sweep_ignores_prefix_matching_files(tmp_path):
 
     assert removed == []
     assert not_a_dir.exists()
+
+
+def test_sweep_keeps_old_dir_whose_dry_run_lock_is_held(tmp_path):
+    """A resumed VM's wall-clock jump can age a live dry run's staging dir past
+    the threshold in one step, so the lock — not the mtime — is what protects
+    it."""
+    own = tmp_path / (STAGING_PREFIX + "own")
+    own.mkdir()
+    live = _make_staging(tmp_path, "live-dry-run", STALE_STAGING_MAX_AGE_SECONDS + 60)
+    lock_file = live / "dry-run.lock"
+    lock_file.touch()
+    _reage(live)
+
+    with open(lock_file, "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        removed = _sweep_stale_staging(own)
+        assert removed == []
+        assert live.exists()
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    # Released: the same dir is now ordinary debris.
+    removed = _sweep_stale_staging(own)
+    assert removed == [live.name]
+    assert not live.exists()
+
+
+def test_sweep_removes_old_dir_with_unheld_dry_run_lock(tmp_path):
+    own = tmp_path / (STAGING_PREFIX + "own")
+    own.mkdir()
+    dead = _make_staging(tmp_path, "dead-dry-run", STALE_STAGING_MAX_AGE_SECONDS + 60)
+    (dead / "dry-run.lock").touch()
+    _reage(dead)
+
+    removed = _sweep_stale_staging(own)
+
+    assert removed == [dead.name]
+    assert not dead.exists()

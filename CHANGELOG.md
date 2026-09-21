@@ -205,6 +205,20 @@
   symlinked project directory is not discovered; this is security hardening.
   Deeper scans may surface new `unregistered_discovered` or duplicate report
   rows for reconciliation; these rows are report-only and are not errors.
+- Fixed: an infra-outage grace window no longer expires while the host is
+  suspended. This VM is saved host-side, so the guest never enters S3 and both
+  CLOCK_MONOTONIC and CLOCK_BOOTTIME stop while CLOCK_REALTIME jumps on resume;
+  a repo marked `infra_failed` could therefore cross its 24h grace with no
+  retry ever having run, and then count toward the publish gate. Each run now
+  stores a `{wall, mono, boot_id}` baseline under the reserved `__clock__` key
+  in the state file and adds any growth in `realtime - monotonic` (at least 60s,
+  same boot id) to every stored `infra_since` once. A dry run does not move the
+  baseline, since it never writes state.
+- Fixed: the stale-staging sweep no longer deletes a live dry run's staging
+  directory. The sweep aged siblings by wall clock alone, and a resume-time
+  jump can push a live (frozen) dry run's directory past the 6h threshold in
+  one step. The sweep now probes `dry-run.lock` with a non-blocking `flock`
+  and keeps any directory whose lock is held. The 6h threshold is unchanged.
 
 ## 0.0.6
 

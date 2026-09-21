@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
 
@@ -146,44 +145,3 @@ def test_snapshot_is_removed_when_the_invoker_raises(tmp_path, monkeypatch):
 
     after = set(Path(tempfile.gettempdir()).glob("graphify-mesh-sync-snapshot-*"))
     assert after == before
-
-
-# ---------------------------------------------------------------------------
-# the backend probe runs with the child allowlist, not the parent environment
-# ---------------------------------------------------------------------------
-
-
-def test_backend_probe_env_is_filtered(monkeypatch):
-    from graphify_mesh.sync import backend, graphify_cli
-
-    seen: dict = {}
-
-    class _Proc:
-        returncode = 1
-        stdout = ""
-        stderr = ""
-
-    def fake_subprocess_run(argv, **kwargs):
-        seen["env"] = kwargs.get("env")
-        return _Proc()
-
-    monkeypatch.setenv("GRAPHIFY_MESH_HTTP_TOKEN", "super-secret")
-    monkeypatch.setattr(graphify_cli.subprocess, "run", fake_subprocess_run)
-
-    assert backend.detect_actual_backend(sys.executable) == backend.LOUVAIN_BACKEND
-    assert "GRAPHIFY_MESH_HTTP_TOKEN" not in seen["env"]
-    assert "PATH" in seen["env"]
-
-
-def test_backend_probe_exec_failure_is_not_read_as_louvain(monkeypatch):
-    import pytest
-
-    from graphify_mesh.sync import backend, graphify_cli
-
-    monkeypatch.setattr(
-        graphify_cli,
-        "_run",
-        lambda *a, **k: graphify_cli.CliResult(returncode=127, stdout="", stderr="exec error"),
-    )
-    with pytest.raises(backend.BackendMismatchError):
-        backend.detect_actual_backend(sys.executable)

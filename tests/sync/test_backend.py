@@ -1,75 +1,72 @@
 from __future__ import annotations
 
-import stat
+import importlib
 import sys
-from pathlib import Path
 
 import pytest
 
-from graphify_mesh.sync import backend
+from graphify_mesh.sync import backend as backend_mod
 from graphify_mesh.sync.config import PINNED_CLUSTERING_BACKEND
 
 
-def _make_executable(path: Path, content: str) -> Path:
-    path.write_text(content, encoding="utf-8")
-    mode = path.stat().st_mode
-    path.chmod(mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    return path
+def test_graspologic_absent_here_means_louvain():
+    """Neither graspologic spelling is installed in this environment, so the
+    check must answer Louvain — the same backend config pins."""
+    assert backend_mod._graspologic_importable() is False
+    assert PINNED_CLUSTERING_BACKEND == backend_mod.LOUVAIN_BACKEND
 
+    result = backend_mod.assert_pinned_backend()
 
-def _build_interpreter_without_graspologic(tmp_path: Path) -> Path:
-    """A `#!/bin/sh` shim that just execs the real system interpreter —
-    graspologic is not importable there (confirmed: neither the pipx venv
-    nor ~/.local graphify install nor system python3 has it installed)."""
-    interp = tmp_path / "interp_no_graspologic.sh"
-    return _make_executable(interp, f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-
-
-def _build_interpreter_with_graspologic(tmp_path: Path) -> Path:
-    """A `#!/bin/sh` shim that execs the system interpreter with PYTHONPATH
-    pointed at a directory containing a stub `graspologic` package (just an
-    empty `__init__.py`) — enough for `importlib.util.find_spec` to resolve
-    it, without installing anything real or touching global/system state."""
-    stub_root = tmp_path / "stub_site"
-    stub_pkg = stub_root / "graspologic"
-    stub_pkg.mkdir(parents=True)
-    (stub_pkg / "__init__.py").write_text("", encoding="utf-8")
-    interp = tmp_path / "interp_with_graspologic.sh"
-    return _make_executable(
-        interp,
-        f'#!/bin/sh\nexec env PYTHONPATH="{stub_root}" "{sys.executable}" "$@"\n',
-    )
-
-
-def _build_graphify_bin(tmp_path: Path, name: str, interpreter: Path) -> Path:
-    """A fake `graphify_bin` whose only relevant property is its shebang
-    line — `_resolve_interpreter` never executes this file, only reads its
-    first line."""
-    script = tmp_path / name
-    return _make_executable(script, f"#!{interpreter}\nprint('fake graphify')\n")
-
-
-def test_assert_pinned_backend_matches_when_graspologic_absent(tmp_path):
-    interp = _build_interpreter_without_graspologic(tmp_path)
-    graphify_bin = _build_graphify_bin(tmp_path, "graphify_louvain_only", interp)
-
-    result = backend.assert_pinned_backend(str(graphify_bin))
-
-    assert PINNED_CLUSTERING_BACKEND == backend.LOUVAIN_BACKEND
-    assert result.backend == backend.LOUVAIN_BACKEND
+    assert result.backend == backend_mod.LOUVAIN_BACKEND
     assert result.matches_pinned
 
 
-def test_assert_pinned_backend_raises_on_mismatch_when_graspologic_importable(tmp_path):
-    interp = _build_interpreter_with_graspologic(tmp_path)
-    graphify_bin = _build_graphify_bin(tmp_path, "graphify_leiden_capable", interp)
+def test_native_only_leiden_install_is_detected(tmp_path, monkeypatch):
+    """Python >= 3.13's `leiden` extra installs graspologic-native only.
 
-    with pytest.raises(backend.BackendMismatchError):
-        backend.assert_pinned_backend(str(graphify_bin))
+    A stub package on sys.path rather than a patched `find_spec`: patching it
+    process-wide breaks any import that happens inside the test body.
+    """
+    (tmp_path / "graspologic_native").mkdir()
+    (tmp_path / "graspologic_native" / "__init__.py").write_text("")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    assert backend_mod._graspologic_importable() is True
 
 
-def test_detect_actual_backend_without_raising_for_match(tmp_path):
-    interp = _build_interpreter_without_graspologic(tmp_path)
-    graphify_bin = _build_graphify_bin(tmp_path, "graphify", interp)
+def test_pure_python_graspologic_install_is_detected(tmp_path, monkeypatch):
+    """The other spelling: upstream falls back to `graspologic.partition.leiden`
+    when the native package is missing, so it counts as Leiden too."""
+    (tmp_path / "graspologic").mkdir()
+    (tmp_path / "graspologic" / "__init__.py").write_text("")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    assert backend_mod._graspologic_importable() is True
 
-    assert backend.detect_actual_backend(str(graphify_bin)) == backend.LOUVAIN_BACKEND
+
+def test_assert_pinned_backend_answers_for_this_interpreter(monkeypatch):
+    monkeypatch.setattr(backend_mod, "_graspologic_importable", lambda: False)
+    monkeypatch.setattr(backend_mod, "PINNED_CLUSTERING_BACKEND", backend_mod.LOUVAIN_BACKEND)
+    result = backend_mod.assert_pinned_backend()
+    assert result.backend == backend_mod.LOUVAIN_BACKEND
+    assert result.matches_pinned is True
+    assert result.interpreter == sys.executable
+
+
+def test_assert_pinned_backend_raises_when_actual_backend_differs(monkeypatch):
+    monkeypatch.setattr(backend_mod, "_graspologic_importable", lambda: True)
+    monkeypatch.setattr(backend_mod, "PINNED_CLUSTERING_BACKEND", backend_mod.LOUVAIN_BACKEND)
+    with pytest.raises(backend_mod.BackendMismatchError):
+        backend_mod.assert_pinned_backend()
+
+
+def test_graphify_bin_argument_is_accepted_and_ignored(monkeypatch):
+    """`pipeline.py` and `naming.py` still pass `settings.graphify_bin`; the
+    value no longer decides anything but must not break the call."""
+    monkeypatch.setattr(backend_mod, "_graspologic_importable", lambda: False)
+    monkeypatch.setattr(backend_mod, "PINNED_CLUSTERING_BACKEND", backend_mod.LOUVAIN_BACKEND)
+
+    with_bin = backend_mod.assert_pinned_backend("/nonexistent/graphify")
+    without_bin = backend_mod.assert_pinned_backend()
+
+    assert with_bin == without_bin

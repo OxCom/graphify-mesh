@@ -232,7 +232,8 @@ def compute_tag_to_repo_id(
 def rewrite_repo_tags(graph_data: dict, tag_to_repo_id: dict[str, str]) -> dict:
     """Rewrites `graph_data` in place (and returns it) so every node id /
     edge endpoint prefixed `<auto_tag>::` becomes `<true_repo_id>::`, and
-    every node's `repo` attribute becomes the true repo_id. A node/edge
+    every node's `repo` attribute becomes the true repo_id, and every
+    hyperedge id and member id is remapped the same way. A node/edge
     whose prefix does not match any known auto tag is left untouched
     (defensive: never crash on an id shape this module doesn't recognize —
     e.g. a bare external node with no `::` at all)."""
@@ -266,5 +267,33 @@ def rewrite_repo_tags(graph_data: dict, tag_to_repo_id: dict[str, str]) -> dict:
             link["source"] = id_remap[link["source"]]
         if link.get("target") in id_remap:
             link["target"] = id_remap[link["target"]]
+
+    # Upstream writes hyperedges into BOTH the top-level key and the nested
+    # graph.hyperedges slot (graphify/build.py:885-894 folds the nested one onto
+    # the top-level key when the latter is missing). Remapping only the
+    # top-level slot leaves the nested copy dangling: measured on the live
+    # merged graph, 39/39 members resolved in the top-level slot and 0/39 in the
+    # nested one.
+    _MEMBER_KEYS = ("nodes", "members", "node_ids")
+    hyperedge_slots = [graph_data.get("hyperedges")]
+    nested = graph_data.get("graph")
+    if isinstance(nested, dict):
+        hyperedge_slots.append(nested.get("hyperedges"))
+    seen_hyperedges: set[int] = set()
+    for hyperedges in hyperedge_slots:
+        if not isinstance(hyperedges, list):
+            continue
+        for hyperedge in hyperedges:
+            # The two slots can hold the same dict object; remapping it twice
+            # would re-prefix an id that is already correct.
+            if not isinstance(hyperedge, dict) or id(hyperedge) in seen_hyperedges:
+                continue
+            seen_hyperedges.add(id(hyperedge))
+            if "id" in hyperedge:
+                hyperedge["id"] = _remap_id(hyperedge["id"])
+            for key in _MEMBER_KEYS:
+                members = hyperedge.get(key)
+                if isinstance(members, list):
+                    hyperedge[key] = [_remap_id(m) for m in members]
 
     return graph_data

@@ -4,8 +4,15 @@ Description=Timer for graphify-mesh-sync.service
 # the merged graph to be.
 
 [Timer]
-OnBootSec=5min
-OnUnitInactiveSec=15min
+# Wall-clock slots, not monotonic: on a VM the operator suspends with host-side
+# "save state", CLOCK_MONOTONIC stops, so OnBootSec=/OnUnitInactiveSec= pause and
+# never catch up (a 14.7 h saved state produced 14.7 h with zero runs).
+# Persistent=true works only with OnCalendar= and fires a missed elapse on resume.
+# Cadence now means "every 15 minutes of wall clock", not "15 minutes after the
+# previous run finished". Runs cannot pile up: systemd will not start a second
+# instance of a running Type=oneshot unit, and sync/locking.py guards publish.
+OnCalendar=*:0/15
+Persistent=true
 AccuracySec=1min
 RandomizedDelaySec=60
 Unit=graphify-mesh-sync.service

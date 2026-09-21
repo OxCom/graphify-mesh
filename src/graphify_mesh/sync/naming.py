@@ -7,51 +7,52 @@ and `Settings`, `run_naming`:
      before doing anything else — a mismatch is a hard failure that
      propagates uncaught, blocking the naming stage and (by not being
      swallowed anywhere in pipeline.py) publish end-to-end.
-  2. Health-checks the configured Ollama endpoint with a short timeout. On
-     failure, `cluster-only`/`label` are not invoked AT ALL — this is
-     "degraded" mode: whatever `community`/`community_name` the input graph
-     already carries (which, by the time pipeline.py calls this, is nothing —
-     see `strip_project_community_attrs`) is returned untouched by this
-     stage. The pipeline-level restore-from-last-published-global fallback
-     (C23) lives in pipeline.py, not here, so this stage's "untouched"
-     contract stays simple and testable in isolation.
-  3. On success: stages the graph at `<naming_dir>/graphify-out/graph.json`
-     (a persistent, pipeline-owned workspace — NOT the ephemeral per-run
-     staging tempdir, and NOT any real project directory) so `cluster-only`/
-     `label` write outputs beside it. Runs `cluster-only --no-viz` (cheap,
-     deterministic hub-name fallback + sig-gated label reuse). Snapshots
-     `.graphify_labels.json.sig` before that call, diffs it against the
-     freshly written one afterward to find new/changed community ids,
-     deletes exactly those ids from `.graphify_labels.json`, then runs
-     `label --missing-only` so the LLM backend is invoked ONLY for
-     communities that are new or whose membership actually changed —
-     everything else keeps its previous name untouched.
+  2. Clusters and labels IN PROCESS through `graphify_mesh.sync.clustering`,
+     never through `graphify cluster-only` / `graphify label`. Those
+     subcommands rebuild the graph with `graphify.build.build_from_json`,
+     which collapses nodes sharing `(source_file, label)` across repository
+     boundaries and rewrites labels into full paths. The published graph is
+     now the mesh's own merged dict plus `community`/`community_name`, and
+     `assert_only_community_attrs_added` fails the run if it is anything else.
+  3. Carries names across runs through `<naming_dir>/naming-state.json`
+     (`graphify_mesh.sync.naming_state`), keyed by community membership
+     signature rather than by community id — ids renumber whenever membership
+     shifts. The state also records the clustering and labeling recipe, so a
+     changed model, backend or resolution invalidates reuse.
+  4. Degrades rather than crashes on a recoverable failure. Clustering is
+     local computation and always runs; only labeling is gated on the health
+     check. A community with no usable name takes a deterministic hub name and
+     is recorded `provisional`, which the next healthy run relabels. The two
+     failures that still propagate are the backend pin mismatch and
+     `NamingIntegrityError` — both mean the run must not publish.
 """
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import logging
+import os
+import sys
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from graphify_mesh.sync import graphify_cli, publish
+from graphify_mesh.sync import clustering, naming_state, publish
 from graphify_mesh.sync.backend import BackendCheckResult, assert_pinned_backend
 from graphify_mesh.sync.config import Settings, is_valid_http_base_url
-from graphify_mesh.sync.tls import ssl_context
+from graphify_mesh.sync.tls import resolve_tls_mode, ssl_context
+from graphify_mesh.sync.validate import PLACEHOLDER_RE
 
 log = logging.getLogger("graphify_mesh.sync.naming")
 
 LABELING_OK = "ok"
 LABELING_DEGRADED = "degraded"
 LABELING_REUSED = "ok (reused: merged-graph fingerprint unchanged)"
-# Canonical-hash sidecar of the STRIPPED merged graph that produced the
-# named graph.json sitting next to it. Written only after a fully
-# successful (LABELING_OK) naming run — reuse is only ever offered against
-# a known-good named graph, never a degraded/partial one.
-FINGERPRINT_FILENAME = ".merged-graph.fingerprint"
+
+CLUSTER_RESOLUTION = 1.0
 
 HealthCheckFn = Callable[[str, str, float], bool]
 
@@ -118,261 +119,410 @@ def strip_project_community_attrs(graph_data: dict) -> dict:
     return graph_data
 
 
-def _read_json_object(path: Path) -> dict:
-    if not path.exists():
-        return {}
+_COMMUNITY_ATTRS = ("community", "community_name")
+
+
+class NamingIntegrityError(RuntimeError):
+    """The naming stage changed something other than community annotations.
+
+    Publishing that graph would ship a silently altered structure — the exact
+    failure this stage stopped delegating to graphify's builder to avoid — so
+    the run fails instead.
+    """
+
+
+def structure_snapshot(graph_data: dict) -> dict:
+    """Everything the guard compares, without holding a second copy of the graph."""
+    nodes: dict[str, str] = {}
+    for node in graph_data.get("nodes", []):
+        if not isinstance(node, dict) or "id" not in node:
+            continue
+        if node["id"] in nodes:
+            # Two nodes under one id would collapse into a single snapshot entry
+            # and hide a later divergence. The merged graph must not contain one.
+            raise NamingIntegrityError(f"duplicate node id in the merged graph: {node['id']!r}")
+        payload = {k: v for k, v in node.items() if k not in _COMMUNITY_ATTRS}
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        nodes[node["id"]] = digest
+    return {"nodes": nodes, "edges": _edge_endpoints(graph_data)}
+
+
+def assert_only_community_attrs_added(before_snapshot: dict, after: dict) -> None:
+    """Fail unless `after` is the graph `before_snapshot` was taken of, plus
+    `community`/`community_name`. Take the snapshot with `structure_snapshot`
+    before the stage mutates anything."""
+    after_snapshot = structure_snapshot(after)
+
+    before_nodes = before_snapshot["nodes"]
+    after_nodes = after_snapshot["nodes"]
+    if set(before_nodes) != set(after_nodes):
+        lost = sorted(set(before_nodes) - set(after_nodes))[:5]
+        gained = sorted(set(after_nodes) - set(before_nodes))[:5]
+        raise NamingIntegrityError(
+            f"naming changed the node id set: {len(before_nodes)} -> {len(after_nodes)} "
+            f"(lost e.g. {lost}, gained e.g. {gained})"
+        )
+    changed_nodes = sorted(
+        node_id for node_id, digest in before_nodes.items() if after_nodes[node_id] != digest
+    )
+    if changed_nodes:
+        raise NamingIntegrityError(
+            f"naming changed attribute(s) on {len(changed_nodes)} node(s), e.g. {changed_nodes[:5]}"
+        )
+    if before_snapshot["edges"] != after_snapshot["edges"]:
+        raise NamingIntegrityError(
+            f"naming changed the edge set: {len(before_snapshot['edges'])} -> "
+            f"{len(after_snapshot['edges'])} endpoint triples"
+        )
+
+
+def _edge_endpoints(graph_data: dict) -> list[str]:
+    """One digest per edge, over the WHOLE edge record.
+
+    Endpoints plus relation would miss weights, confidence and every other edge
+    attribute. Sorting the digests (not the records) keeps multiplicity, so a
+    multigraph's duplicate edges cannot collapse into one entry.
+    """
+    links = graph_data.get("links", graph_data.get("edges", []))
+    return sorted(
+        hashlib.sha256(json.dumps(link, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        for link in links
+        if isinstance(link, dict)
+    )
+
+
+def _clustering_recipe(backend: str) -> dict:
+    return {"backend": backend, "resolution": CLUSTER_RESOLUTION}
+
+
+def _labeling_recipe(settings: Settings) -> dict:
+    """The endpoint is part of the recipe: the same model on a different server
+    is a different labeler, and two units on this host already point the same
+    variable at different hosts."""
+    return {
+        "backend": "ollama",
+        "model": settings.ollama_model,
+        "base_url": settings.ollama_base_url,
+    }
+
+
+def bind_upstream_backend(settings: Settings, env: MutableMapping[str, str] | None = None) -> str:
+    """Point graphify's ollama adapter at the endpoint this stage health-probes,
+    bound its per-call timeout, and return the URL it will actually use.
+
+    `BACKENDS["ollama"]["base_url"]` is resolved when `graphify.llm` is first
+    imported (graphify/llm.py:128), and the client is built from that cached
+    value — a later environment change does not move it. So the environment is
+    set BEFORE the first import, and the cached value is corrected and asserted
+    afterwards. The mesh probes `GRAPHIFY_MESH_OLLAMA_BASE_URL` while graphify
+    labels against `OLLAMA_BASE_URL`; nothing else enforces that they agree, and
+    the sibling MCP daemon unit already sets a different (HTTPS) value.
+    """
+    # `env` is injectable so a test does not leak these two keys into the rest
+    # of the pytest process; production passes os.environ, which is what
+    # graphify reads.
+    env = os.environ if env is None else env
+    # Only the API key has to travel through the environment: upstream reads it
+    # at call time (_get_backend_api_key), while the base URL is patched on
+    # BACKENDS below and the model is passed explicitly. Writing OLLAMA_BASE_URL
+    # and OLLAMA_MODEL here would also leak into every child spawned afterwards,
+    # because the child env allowlist forwards the OLLAMA_ prefix
+    # (graphify_cli.py:97).
+    if settings.ollama_api_key:
+        env["OLLAMA_API_KEY"] = settings.ollama_api_key
+    # The CLI child used to be bounded by GRAPHIFY_MESH_CLI_TIMEOUT; in process
+    # that bound is gone and upstream's own default is 600 s PER CALL with zero
+    # retries for ollama (llm.py:407, :1387). 1097 communities batch into ~11
+    # sequential calls, so a wedged backend — "healthy /models, hung
+    # completions", recorded on this host 2026-08-17 — could sit for 6600 s on
+    # top of a 75-90 minute pipeline and be SIGKILLed by TimeoutStartSec,
+    # skipping every cleanup. A per-call ceiling keeps the worst case bounded.
+    env["GRAPHIFY_API_TIMEOUT"] = str(settings.ollama_api_timeout)
+
+    from graphify.llm import BACKENDS
+
+    BACKENDS["ollama"]["base_url"] = settings.ollama_base_url
+    effective = BACKENDS["ollama"]["base_url"]
+    if effective != settings.ollama_base_url:
+        raise RuntimeError(
+            f"graphify would label against {effective!r} while this stage probes "
+            f"{settings.ollama_base_url!r}"
+        )
+    return effective
+
+
+def _tls_allows_labeling(settings: Settings, effective_url: str) -> bool:
+    """Refuse to label over an intercepted HTTPS chain instead of failing silently.
+
+    graphify builds its own `openai` client and exposes no transport seam
+    (`generate_community_labels` takes no client/http_client argument), so
+    `sync/tls.py`'s relaxed mode does not reach it. On this host an intercepted
+    HTTPS endpoint fails certificate validation, and
+    `generate_community_labels` turns that into placeholder names rather than an
+    error. Loopback HTTP — the configured naming endpoint — is unaffected.
+    """
+    if not effective_url.lower().startswith("https://"):
+        return True
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+        mode = resolve_tls_mode()
+    except ValueError as exc:
+        # An unparsable GRAPHIFY_MESH_TLS_MODE used to be swallowed by the
+        # health-check try block; it must not start crashing the stage now.
+        log.warning("labeling skipped: %s", exc)
+        return False
+    if mode == "strict":
+        return True
+    log.warning(
+        "labeling skipped: %s is https and GRAPHIFY_MESH_TLS_MODE=%s — graphify builds its own "
+        "client and this package's relaxed context cannot reach it, so a failure here would "
+        "surface as placeholder names rather than an error",
+        effective_url,
+        mode,
+    )
+    return False
 
 
-def _diff_changed_cids(old_sigs: dict, new_sigs: dict) -> list[str]:
-    """cids that are new this run or whose membership fingerprint changed
-    relative to the previous run's sig sidecar."""
-    return sorted(cid for cid, sig in new_sigs.items() if old_sigs.get(cid) != sig)
+def _openai_importable() -> bool:
+    """graphify's ollama backend builds its client with `from openai import
+    OpenAI`. Checked explicitly so a missing client degrades with a stated
+    reason instead of silently becoming placeholder names."""
+    return importlib.util.find_spec("openai") is not None
 
 
-def _try_reuse_named_graph(
-    graph_path: Path, fingerprint_path: Path, fingerprint: str
-) -> dict | None:
-    """Last run's fully-named graph, iff its fingerprint sidecar matches the
-    current stripped merged graph AND the named file still carries at least
-    one community_name (paranoia against a hand-truncated file). None means
-    'do a full naming run'."""
-    if not fingerprint_path.is_file() or not graph_path.is_file():
-        return None
-    try:
-        stored = fingerprint_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    if stored != fingerprint:
-        return None
-    named = _read_json_object(graph_path)
-    if not isinstance(named, dict):
-        return None
-    nodes = named.get("nodes", [])
-    named_count = sum(1 for n in nodes if isinstance(n, dict) and n.get("community_name"))
-    if not nodes or named_count == 0:
-        return None
-    return named
+def _reuse_is_safe(
+    state: naming_state.NamingState | None,
+    fingerprint: str,
+    graph_data: dict,
+    recipe_ok: bool,
+) -> bool:
+    """Reuse only against state that fully covers this graph and is final.
+
+    Fingerprint equality alone is not enough: it authenticates the INPUT, not
+    the stored assignments. A state missing one node would publish that node
+    with no community at all, and `validate_community_names` skips nodes whose
+    `community` is None, so nothing downstream would catch it.
+    """
+    if state is None or not recipe_ok or state.merged_fingerprint != fingerprint:
+        return False
+    node_ids = {n["id"] for n in graph_data.get("nodes", []) if isinstance(n, dict) and "id" in n}
+    if set(state.assignments) != node_ids:
+        return False
+    for cid in set(state.assignments.values()):
+        entry = state.communities.get(str(cid))
+        if entry is None or not entry.name:
+            return False
+    # A provisional name means the LLM has not spoken for that community yet.
+    # Returning REUSED here is what froze hub names permanently: an unchanged
+    # graph never gets a second chance once the backend recovers.
+    return not any(e.provisional for e in state.communities.values())
 
 
 def run_naming(
     graphify_bin: str,
     naming_dir: Path,
-    staging_home: Path,
+    staging_home: Path,  # noqa: ARG001 - kept for call-site compatibility; no child runs
     merged_graph_data: dict,
     settings: Settings,
     health_check: HealthCheckFn | None = None,
 ) -> NamingResult:
-    backend_check = assert_pinned_backend(graphify_bin)
-
-    out_dir = naming_dir / "graphify-out"
-    graph_path = out_dir / "graph.json"
-    fingerprint_path = out_dir / FINGERPRINT_FILENAME
+    backend_check = assert_pinned_backend()
     fingerprint = publish.output_hash(merged_graph_data)
+    state = naming_state.load(naming_dir)
+    # Two separate eligibilities, deliberately not one flag:
+    #   - clustering recipe decides whether the stored ASSIGNMENTS may seed id
+    #     stabilization. A labeling-model change must not renumber communities.
+    #   - labeling recipe decides whether stored NAMES may be carried.
+    clustering_ok = state is not None and state.clustering == _clustering_recipe(
+        backend_check.backend
+    )
+    labeling_ok = state is not None and state.labeling == _labeling_recipe(settings)
+    recipe_ok = clustering_ok and labeling_ok
 
-    reused = _try_reuse_named_graph(graph_path, fingerprint_path, fingerprint)
-    if reused is not None:
-        log.info(
-            "naming: merged-graph fingerprint unchanged — reusing on-disk names, "
-            "skipping cluster-only + label (no Ollama calls)"
-        )
+    if state is not None and _reuse_is_safe(state, fingerprint, merged_graph_data, recipe_ok):
+        reuse_before = structure_snapshot(merged_graph_data)
+        names = {cid: e.name for cid, e in state.communities.items()}
+        _apply(merged_graph_data, state.assignments, names)
+        # The reuse path writes onto the graph too, so it is guarded like any
+        # other return path — a stale or malformed state must not reshape it.
+        assert_only_community_attrs_added(reuse_before, merged_graph_data)
+        log.info("naming: merged-graph fingerprint unchanged — reusing stored names")
         return NamingResult(
             labeling=LABELING_REUSED,
-            graph_data=reused,
-            backend=backend_check.backend,
-            backend_check=backend_check,
-        )
-
-    # URL scheme gate BEFORE any health check runs: a base URL that is not
-    # plain http(s)-with-host (file://, gopher://, ...) fails this stage's
-    # health-check path outright — degraded mode, zero requests attempted.
-    if not is_valid_http_base_url(settings.ollama_base_url):
-        log.warning(
-            "invalid ollama base URL %r (scheme must be http or https with a non-empty host) — "
-            "skipping cluster-only/label entirely (degraded mode)",
-            settings.ollama_base_url,
-        )
-        return NamingResult(
-            labeling=LABELING_DEGRADED,
             graph_data=merged_graph_data,
             backend=backend_check.backend,
-            reason="invalid ollama base URL",
             backend_check=backend_check,
         )
 
-    check = health_check if health_check is not None else default_ollama_health_check
-    healthy = check(
-        settings.ollama_base_url, settings.ollama_api_key, settings.ollama_health_timeout
+    before = structure_snapshot(merged_graph_data)
+    G = clustering.graph_from_node_link(merged_graph_data)
+    previous = state.assignments if (state is not None and clustering_ok) else {}
+    communities = clustering.cluster_graph(
+        G, resolution=CLUSTER_RESOLUTION, previous_assignments=previous
+    )
+    sigs = clustering.membership_sigs(communities)
+
+    if state is None:
+        # Migration runs once, only when no state file exists. Seeding on an
+        # empty `carried` instead would resurrect sidecars a later run had
+        # legitimately emptied.
+        carried = {
+            e.sig: (e.name, e.provisional)
+            for e in naming_state.seed_from_graphify_sidecars(naming_dir).values()
+        }
+    else:
+        carried = naming_state.names_by_sig(state) if labeling_ok else {}
+        if not labeling_ok:
+            log.info(
+                "naming: labeling recipe changed since the last run (model or backend) — "
+                "every community will be relabeled; community ids stay stable"
+            )
+
+    names_by_cid: dict[int, str] = {}
+    provisional: dict[int, bool] = {}
+    needs_llm: dict[int, list[str]] = {}
+    for cid, members in communities.items():
+        carried_name, was_provisional = carried.get(sigs[cid], ("", True))
+        if carried_name and not was_provisional:
+            names_by_cid[cid] = carried_name
+            provisional[cid] = False
+        else:
+            needs_llm[cid] = members
+
+    effective_url = bind_upstream_backend(settings)
+    healthy = _backend_healthy(settings, health_check, effective_url)
+    llm_source = ""
+    if needs_llm and healthy:
+        llm_labels, llm_source = clustering.llm_names(
+            G, needs_llm, backend="ollama", model=settings.ollama_model
+        )
+        for cid in list(needs_llm):
+            label = (llm_labels.get(cid) or "").strip()
+            if label and not PLACEHOLDER_RE.match(label):
+                names_by_cid[cid] = label
+                provisional[cid] = False
+                needs_llm.pop(cid)
+
+    if needs_llm:
+        fallback = clustering.hub_names(G, needs_llm)
+        for cid in needs_llm:
+            # A carried name that is only *provisional* (a migrated sidecar
+            # entry, or a hub name from an earlier outage) is still better than
+            # a fresh hub name: it may be a real LLM name from before the
+            # migration. Keep the text, keep the provisional flag, relabel on
+            # the next healthy run.
+            carried_text = carried.get(sigs[cid], ("", True))[0]
+            names_by_cid[cid] = carried_text or fallback[cid]
+            provisional[cid] = True
+
+    assignments = {node_id: cid for cid, members in communities.items() for node_id in members}
+    _apply(merged_graph_data, assignments, {str(cid): n for cid, n in names_by_cid.items()})
+    assert_only_community_attrs_added(before, merged_graph_data)
+
+    naming_state.save(
+        naming_dir,
+        naming_state.NamingState(
+            merged_fingerprint=fingerprint,
+            clustering=_clustering_recipe(backend_check.backend),
+            labeling=_labeling_recipe(settings),
+            communities={
+                str(cid): naming_state.CommunityEntry(
+                    sig=sigs[cid], name=names_by_cid[cid], provisional=provisional[cid]
+                )
+                for cid in communities
+            },
+            assignments=assignments,
+        ),
     )
 
-    if not healthy:
-        log.warning(
-            "ollama unhealthy at %s — skipping cluster-only/label entirely (degraded mode)",
-            settings.ollama_base_url,
+    any_provisional = any(provisional.values())
+    changed = sorted(str(cid) for cid, was in provisional.items() if was)
+    if any_provisional:
+        reason = (
+            "ollama unreachable — provisional hub names kept"
+            if not healthy
+            else f"labeling incomplete (source={llm_source or 'none'})"
         )
+        log.warning("naming: %d community(ies) provisional — %s", len(changed), reason)
         return NamingResult(
             labeling=LABELING_DEGRADED,
             graph_data=merged_graph_data,
             backend=backend_check.backend,
-            reason="ollama health check failed",
+            changed_cids=changed,
+            reason=reason,
             backend_check=backend_check,
         )
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # Any crash between here and the OK-path sidecar write must leave no
-    # sidecar matching a half-labeled (or fully unlabeled) graph.json on
-    # disk — otherwise the next run's reuse gate would serve a stale,
-    # partially-named graph as if it were complete.
-    fingerprint_path.unlink(missing_ok=True)
-    # Overwrite this run's graph, but leave any pre-existing
-    # .graphify_labels.json / .sig from a prior run in place — that is
-    # exactly what makes sig-gated label reuse possible across runs.
-    # Streamed json.dump — never materializes the multi-MB serialized graph
-    # as one string. Direct (non-atomic) overwrite preserves the previous
-    # semantics here: the fingerprint sidecar was already unlinked above, so
-    # a crash mid-write can never be mistaken for a reusable named graph.
-    with graph_path.open("w", encoding="utf-8") as fh:
-        json.dump(merged_graph_data, fh)
-
-    labels_path = out_dir / ".graphify_labels.json"
-    sig_path = out_dir / ".graphify_labels.json.sig"
-    old_sigs = _read_json_object(sig_path)
-
-    cluster_result = graphify_cli.run_cluster_only(graphify_bin, naming_dir, staging_home)
-    if not cluster_result.ok:
-        raise RuntimeError(
-            f"graphify cluster-only failed: exit={cluster_result.returncode}: "
-            f"{cluster_result.stderr.strip()[:500]}"
-        )
-
-    new_sigs = _read_json_object(sig_path)
-    changed_cids = _diff_changed_cids(old_sigs, new_sigs)
-
-    if changed_cids:
-        labels = _read_json_object(labels_path)
-        for cid in changed_cids:
-            labels.pop(cid, None)
-        labels_path.write_text(json.dumps(labels), encoding="utf-8")
-
-        label_result = graphify_cli.run_label(
-            graphify_bin,
-            naming_dir,
-            staging_home,
-            backend="ollama",
-            model=settings.ollama_model,
-        )
-        if not label_result.ok:
-            # The pre-flight health check passed (server was up), but the
-            # actual `graphify label` call failed — a mid-run network blip,
-            # the Ollama host going down partway through a long labeling
-            # job, etc. This must degrade, not crash: clustering (local,
-            # already succeeded) is still valid, so fall back to whatever
-            # names are already on disk (a mix of prior names plus any
-            # communities the label call finished before failing) rather
-            # than losing the whole naming stage — and critically, rather
-            # than crashing the entire pipeline run (which would also throw
-            # away the embedding/overlay/publish stages that haven't even
-            # run yet).
-            log.warning(
-                "graphify label failed mid-run (exit=%s: %s) — "
-                "degrading naming for this generation, "
-                "keeping whatever names are already on disk",
-                label_result.returncode,
-                label_result.stderr.strip()[:500],
-            )
-            final_graph_data = json.loads(graph_path.read_text(encoding="utf-8"))
-            return NamingResult(
-                labeling=LABELING_DEGRADED,
-                graph_data=final_graph_data,
-                backend=backend_check.backend,
-                changed_cids=changed_cids,
-                reason=f"graphify label failed: {label_result.stderr.strip()[:300]}",
-                backend_check=backend_check,
-            )
-
-    final_graph_data = json.loads(graph_path.read_text(encoding="utf-8"))
-
-    # Verify the write actually happened before trusting exit-code success.
-    # A real, observed failure mode: `graphify cluster-only`/`label` can hit
-    # their OWN internal shrink-guard (e.g. a malformed node produces a
-    # node-count mismatch against the input), print "Done - N communities"
-    # and exit 0, yet silently refuse to write community/community_name onto
-    # any node. Trusting cluster_result.ok/label_result.ok alone would report
-    # LABELING_OK for a generation that carries zero real names — this check
-    # catches that specific upstream failure mode rather than propagating a
-    # false success.
-    nodes = final_graph_data.get("nodes", [])
-    named_count = sum(1 for n in nodes if isinstance(n, dict) and n.get("community_name"))
-    if nodes and named_count == 0:
-        log.warning(
-            "graphify cluster-only/label exited 0 but wrote zero community_name values onto "
-            "%d node(s) — a known upstream failure mode (internal shrink-guard silently refusing "
-            "the write, e.g. after a malformed node caused a node-count mismatch); degrading "
-            "rather than reporting a false LABELING_OK",
-            len(nodes),
-        )
-        return NamingResult(
-            labeling=LABELING_DEGRADED,
-            graph_data=merged_graph_data,
-            backend=backend_check.backend,
-            changed_cids=changed_cids,
-            reason="graphify cluster-only/label exited 0 but wrote no community_name onto any node",
-            backend_check=backend_check,
-        )
-
-    fingerprint_path.write_text(fingerprint + "\n", encoding="utf-8")
-
+    _retire_legacy_sidecars(naming_dir)
     return NamingResult(
         labeling=LABELING_OK,
-        graph_data=final_graph_data,
+        graph_data=merged_graph_data,
         backend=backend_check.backend,
-        changed_cids=changed_cids,
         backend_check=backend_check,
     )
 
 
-def restore_last_global_community_names(
-    graph_data: dict, previous_global_graph: dict | None
-) -> dict:
-    """Degraded-mode fallback (C23).
+_LEGACY_SIDECARS = (
+    ".graphify_labels.json",
+    ".graphify_labels.json.sig",
+    "graph.json",
+    "GRAPH_REPORT.md",
+)
 
-    Interpretation chosen (see WS2 design deliverable 3): when Ollama is
-    down, the naming stage skips clustering/labeling entirely and the graph
-    handed to `run_naming` already had `community`/`community_name` stripped
-    unconditionally (see `strip_project_community_attrs`). Left as-is, every
-    node would publish with no community name at all, even though nothing
-    about most communities actually changed.
 
-    Rather than gratuitously losing every name on a brief outage, or
-    reaching into the current merge's per-project inputs (which would leak
-    per-project names into the global graph — exactly what C23 forbids),
-    restore each node's community_name ONLY from the last PUBLISHED GLOBAL
-    generation (`global-graph.json` behind `global/current`). A node with no
-    entry there (new node, or first generation ever) stays unnamed rather
-    than inventing a name from nothing.
+def _retire_legacy_sidecars(naming_dir: Path) -> None:
+    """Delete the files the CLI-based stage used to own.
 
-    Mutates `graph_data` in place and returns the same object — same
-    rationale as `strip_project_community_attrs`: the merged graph is ~38K
-    nodes, and copying every node dict here while `previous_global_graph` is
-    also resident cost a whole extra graph's worth of peak RAM for nothing
-    (no caller uses the pre-restore dict afterwards, see pipeline.py).
+    Only on a fully successful run: a degraded run has not demonstrated that
+    `naming-state.json` carries everything these held, and they are the only
+    fallback if the migration turns out wrong.
     """
-    if not previous_global_graph:
-        return graph_data
-    prev_names = {
-        node["id"]: node.get("community_name")
-        for node in previous_global_graph.get("nodes", [])
-        if isinstance(node, dict) and "id" in node and node.get("community_name")
-    }
-    if not prev_names:
-        return graph_data
+    out_dir = naming_dir / "graphify-out"
+    for name in _LEGACY_SIDECARS:
+        path = out_dir / name
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:  # a stale file is untidy, never fatal
+            log.warning("could not remove legacy sidecar %s: %s", path, exc)
+
+
+def _apply(graph_data: dict, assignments: dict, names: dict) -> None:
+    """Write `community`/`community_name` onto nodes. Mutates in place: the
+    merged graph is ~33K nodes and a copy here costs a second graph's RAM."""
     for node in graph_data.get("nodes", []):
         if not isinstance(node, dict):
             continue
-        prior_name = prev_names.get(node.get("id"))
-        if prior_name:
-            node["community_name"] = prior_name
-    return graph_data
+        cid = assignments.get(node.get("id"))
+        if cid is None:
+            continue
+        node["community"] = int(cid)
+        name = names.get(str(cid)) or names.get(cid)
+        if name:
+            node["community_name"] = name
+
+
+def _backend_healthy(
+    settings: Settings, health_check: HealthCheckFn | None, effective_url: str
+) -> bool:
+    if not _tls_allows_labeling(settings, effective_url):
+        return False
+    if not _openai_importable():
+        log.warning(
+            "openai is not importable in %s — labeling skipped, clustering still runs. "
+            "Install the package's openai dependency.",
+            sys.executable,
+        )
+        return False
+    if not is_valid_http_base_url(settings.ollama_base_url):
+        log.warning(
+            "invalid ollama base URL %r — labeling skipped, clustering still runs",
+            settings.ollama_base_url,
+        )
+        return False
+    check = health_check if health_check is not None else default_ollama_health_check
+    healthy = check(
+        settings.ollama_base_url, settings.ollama_api_key, settings.ollama_health_timeout
+    )
+    if not healthy:
+        log.warning("ollama unhealthy at %s — labeling skipped", settings.ollama_base_url)
+    return healthy
