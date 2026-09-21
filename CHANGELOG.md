@@ -4,6 +4,45 @@
 
 ### Features and behavior changes
 
+- Changed: the naming stage clusters and labels **in process** through
+  graphify's Python API instead of shelling out to `graphify cluster-only` /
+  `label`. Those commands rebuild the graph through `build_from_json`, which
+  merges nodes sharing `(source_file, label)` without regard to `repo`; on the
+  merged multi-repo graph that collapses nodes across repositories, and the
+  resulting shrink trips upstream's own guard, so the stage exited 1 and killed
+  the run. Measured on live data: 1 node lost, 29 edges rewired, 1537
+  cross-repo colliding keys. The graph is now loaded with
+  `networkx.node_link_graph`; only `community` and `community_name` are written
+  onto it, and `assert_only_community_attrs_added` fails the run if anything
+  else moved. Names are reused by community membership signature via
+  `<global_dir>/naming/naming-state.json`, so an unchanged partition costs no
+  backend call. An unreachable backend keeps every known name, gives the rest
+  deterministic hub names marked provisional, and the next healthy run relabels
+  exactly those. Community labeling is pinned to `max_concurrency=1` against
+  upstream's default of 4: the backend serves one request at a time, so the
+  fan-out bought 1.17x throughput for 3.4x per-call latency against the
+  api-timeout budget. New settings: `GRAPHIFY_MESH_OLLAMA_API_TIMEOUT`
+  (default 180 s). New direct dependencies `graphifyy[ollama]`, `openai` and
+  `networkx`, because the stage imports them in **this** interpreter rather
+  than in whatever `GRAPHIFY_BIN` resolves to, and a missing client degrades
+  silently to placeholder names.
+- Fixed: `graphify extract` no longer runs with `--force`, so the semantic
+  cache is read again. That flag skips the cache READ while still writing it,
+  so every run re-sent every semantic file to the model although the cache is
+  keyed by content hash and prompt fingerprint and was correct all along. It
+  was redundant anyway: this pipeline already picks `update`/`extract`/`noop`
+  from its own source digest. Measured on a 13k-node repo with an unchanged
+  tree: 527 s and 56 files re-sent with `--force`, 6 s and
+  `semantic cache: 6 hit / 0 miss` without it, same graph. Replaying unchanged
+  files from cache also stops the model omitting one of them at random — an
+  omitted dispatched file makes graphify declare the extraction incomplete,
+  which arms its shrink guard and refuses the write, and that had left six
+  repositories permanently unrefreshed with the publish gate blocked.
+- Fixed: `rewrite_repo_tags` now also remaps the nested `graph.hyperedges`
+  slot, which upstream writes in parallel with the top-level key. On the live
+  merged graph the top-level slot resolved 39/39 members and the nested one
+  0/39, so every nested member reference dangled in the published generation.
+
 - Added: optional per-call `cwd` argument on `search` and `context_pack`.
   `scope: "current"` resolves the CLIENT's directory, which is this argument
   when the caller sends one and the server process's cwd otherwise. The server
