@@ -12,9 +12,11 @@ on:
       - "docs/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
-  # release.yml calls this after publish-index, so a new release goes live
-  # without waiting for the next docs change.
-  workflow_call:
+  # workflow_run uses the default branch ref, unlike workflow_call, which would
+  # inherit the release tag and be rejected by the protected Pages environment.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
 
 # Default deny; each job below requests only what it needs.
 permissions: {}
@@ -27,6 +29,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
