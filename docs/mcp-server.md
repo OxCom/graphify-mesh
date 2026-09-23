@@ -186,16 +186,18 @@ an interface, all importers of a module. On cem.hub, subclasses of
 | `relation` | string or string[] | — (required) | 1 to 16 relation names, e.g. `inherits`, `implements`, `imports`, `calls`. A name absent from the generation is an error that lists the names present. |
 | `direction` | string | — (required) | `in`: edges whose target is the current node (subclasses for `inherits`, importers for `imports`). `out`: edges whose source is the current node (parents for `inherits`). `both`: either. |
 | `depth` | integer | `1` | 1 to 16 hops. |
-| `include_inferred` | boolean | `false` | Also follow INFERRED-confidence edges. |
+| `include_inferred` | boolean | `false` | Also follow non-EXTRACTED (INFERRED and AMBIGUOUS) edges. By default only EXTRACTED edges are followed. |
 
 The payload lists `seeds` and `nodes`. Each node carries `depth`, a citation,
 and `via`, the edges that reached it from the previous hop. `complete` is true
-unless the 2000-node cap truncated the result (`truncated`).
+unless the 2000-node cap truncated the result (`truncated`). The cap counts
+seeds and nodes together: a label matching more than 2000 nodes returns the
+first 2000 seeds by key, no nodes, and `truncated: true`.
 `frontier_exhausted` says the walk ran out of new nodes before the depth limit.
 Nodes without a durable key are skipped and counted in `skipped_unkeyed`.
 
 `reliability` is `exact` unless the request followed `calls`,
-`indirect_call`, or INFERRED edges; then it is `partial` and `notes` says why.
+`indirect_call`, or non-EXTRACTED edges; then it is `partial` and `notes` says why.
 Call edges are incomplete: the extractor does not resolve method calls
 through typed properties, which is how dependency injection calls look. On
 cem.hub only 554 of 2797 PHP methods have any incoming call edge. A missing

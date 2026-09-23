@@ -263,7 +263,8 @@ def test_registered_repo_absent_from_generation(tmp_path):
 
 
 def test_truncation_at_cap(server, monkeypatch):
-    monkeypatch.setattr(traverse, "MAX_TRAVERSAL_NODES", 2)
+    # the cap counts the single Base seed too, leaving room for two nodes
+    monkeypatch.setattr(traverse, "MAX_TRAVERSAL_NODES", 3)
     payload = _call(server, node="Base", repo=REPO, relation="inherits", direction="in", depth=5)
     assert payload["count"] == 2
     assert payload["truncated"] is True
@@ -272,6 +273,8 @@ def test_truncation_at_cap(server, monkeypatch):
     # deterministic cut: Mid (depth 1) plus the lower key of the depth-2 pair
     assert _labels(payload)[0] == "Mid"
     assert payload["nodes"][1]["key"] == min(key_for(REPO, LEAF1), key_for(REPO, LEAF2))
+    assert traverse.NOTE_TRUNCATED in payload["notes"]
+    assert traverse.NOTE_COMPLETE_SET not in payload["notes"]
 
 
 @pytest.mark.parametrize(

@@ -126,6 +126,27 @@ def test_inferred_edges_excluded_by_default_from_structural_candidates():
     assert key_for("repo.a", inferred_neighbor) not in keys
 
 
+def test_ambiguous_edges_excluded_by_default_from_structural_candidates():
+    seed = make_node("repo.a", "OrderService", "src/order.py", node_id="seed")
+    ambiguous_neighbor = make_node("repo.a", "AmbiguousNeighbor", "src/ambiguous.py", node_id="amb")
+    links = [make_link("seed", "amb", confidence="AMBIGUOUS")]
+    gen = build_generation([seed, ambiguous_neighbor], links=links)
+    ambiguous_key = key_for("repo.a", ambiguous_neighbor)
+
+    default = rank("orderservice", gen, None, k=10, embed_query_fn=fake_embed_query_fn())
+    assert ambiguous_key not in {h.key for h in default.hits}
+
+    opted_in = rank(
+        "orderservice",
+        gen,
+        None,
+        k=10,
+        embed_query_fn=fake_embed_query_fn(),
+        include_inferred=True,
+    )
+    assert ambiguous_key in {h.key for h in opted_in.hits}
+
+
 def test_degraded_mode_renormalizes_over_available_retrievers_when_vectors_missing():
     n1 = make_node("repo.a", "AlphaThing", "src/alpha.py", node_id="n1")
     n2 = make_node("repo.a", "BetaThing", "src/beta.py", node_id="n2")

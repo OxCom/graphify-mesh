@@ -171,18 +171,17 @@ def structural_candidates(
     include_inferred: bool = False,
     depth: int = ranking.CANDIDATE_DEPTH_STRUCTURAL,
 ) -> list[str]:
-    """1-hop neighbors of `seed_keys` in the structural graph. INFERRED
-    edges are excluded by default (only EXTRACTED-confidence edges count as
-    traversal candidates unless the caller opts in) — baseline systemic
-    failure #4 (INFERRED edge pollution)."""
+    """1-hop neighbors of `seed_keys` in the structural graph. Non-EXTRACTED
+    (INFERRED/AMBIGUOUS) edges are excluded by default (only EXTRACTED-confidence
+    edges count as traversal candidates unless the caller opts in) — baseline
+    systemic failure #4 (INFERRED edge pollution)."""
     proximity: dict[str, int] = {}
     for seed_key in seed_keys:
         seed_id = generation.node_id_by_key.get(seed_key)
         if seed_id is None:
             continue
         for neighbor_id, edge in generation.adjacency.get(seed_id, []):
-            confidence = edge.get("confidence", ranking.CONFIDENCE_EXTRACTED)
-            if confidence == ranking.CONFIDENCE_INFERRED and not include_inferred:
+            if not ranking.edge_followable(edge, include_inferred):
                 continue
             neighbor_key = generation.key_by_node_id.get(neighbor_id)
             if neighbor_key is None:

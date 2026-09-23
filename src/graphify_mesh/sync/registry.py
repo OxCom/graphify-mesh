@@ -17,14 +17,14 @@ from pathlib import Path
 # names are impossible, and no separator characters are in the set.
 REPO_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
-# A single-use, per-repo shrink authorization: the `semantic_hash` of the exact
-# attempt the guard refused (state.compute_source_manifest emits a 16-char sha256
-# prefix). The operator copies it out of the refusal line into the repo's registry
-# entry, which authorizes THAT shrink for THAT repo — `--allow-shrink` disarms the
-# guard for every repo in the run, which is how four repos went through at once on
-# 2026-09-22 when only one deletion was intended. The token is matched against the
-# refused digest and consumed in per-repo state, so it never authorizes a second
-# shrink.
+# A single-use, per-repo shrink authorization: the attempt id of the exact attempt
+# the guard refused (state.SourceDigest.attempt_id, a 16-char sha256 prefix over
+# the code AND semantic digests). The operator copies it out of the refusal line
+# into the repo's registry entry, which authorizes THAT shrink for THAT repo —
+# `--allow-shrink` disarms the guard for every repo in the run, which is how four
+# repos went through at once on 2026-09-22 when only one deletion was intended. The
+# token is matched against the refused attempt and consumed in per-repo state, so
+# it never authorizes a second shrink.
 SHRINK_GRANT_PATTERN = re.compile(r"^[0-9a-f]{8,64}$")
 
 
@@ -76,7 +76,7 @@ def _optional_shrink_grant(entry: dict, index: int) -> str | None:
     who typed it believes a shrink is authorized, and a silent refusal would send
     them looking in the wrong place. A garbage token can never authorize anything
     either way, since acceptance requires an exact match against the refused
-    digest.
+    attempt id.
     """
     value = entry.get("allow_shrink_once")
     if value is None or value == "":
@@ -84,7 +84,7 @@ def _optional_shrink_grant(entry: dict, index: int) -> str | None:
     if not isinstance(value, str) or not SHRINK_GRANT_PATTERN.fullmatch(value):
         raise ValueError(
             f"registry repos[{index}]: invalid 'allow_shrink_once' {value!r} "
-            f"(expected the refused source digest, matching {SHRINK_GRANT_PATTERN.pattern})"
+            f"(expected the refused attempt id, matching {SHRINK_GRANT_PATTERN.pattern})"
         )
     return value
 

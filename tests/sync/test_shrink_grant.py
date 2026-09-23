@@ -3,20 +3,21 @@
 `--allow-shrink` disarms the guard for every repo in the run: on 2026-09-22 four
 repos were refused at once and approving the single intended deletion (cem.k8s,
 200 -> 168 nodes) would have accepted the other three too. The registry key names
-one repo and one refused source digest, so approving one shrink cannot blind the
+one repo and one refused attempt id, so approving one shrink cannot blind the
 guard anywhere else, and a token is spent once.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from graphify_mesh.sync.pipeline import _shrink_grant_for, run
 from graphify_mesh.sync.registry import RepoEntry, load_registry
-from graphify_mesh.sync.state import SourceDigest
+from graphify_mesh.sync.state import SourceDigest, compute_source_manifest
 from graphify_mesh.sync.sync_project import (
     ACTION_EXTRACT,
     ACTION_SKIP,
@@ -25,6 +26,7 @@ from graphify_mesh.sync.sync_project import (
 )
 
 REPO_ID = "example-org.styleguide"
+TOKEN_RE = re.compile(r'"allow_shrink_once": "([0-9a-f]+)"')
 
 
 def _read_json(path: Path) -> dict:
@@ -43,8 +45,11 @@ def _grant_repo(env, *, token: str | None) -> None:
     env.registry_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def _refused_digest(state_path: Path) -> str:
-    return _read_json(state_path)[REPO_ID]["refused_semantic_hash"]
+def _refused_token(report) -> str:
+    """The attempt id the refusal reason tells the operator to copy."""
+    match = TOKEN_RE.search(_row(report)["reason"])
+    assert match, _row(report)["reason"]
+    return match.group(1)
 
 
 @pytest.fixture
@@ -156,11 +161,31 @@ class TestDecideActionHonoursTheGrant:
 
     def test_matching_grant_re_extracts(self):
         current = SourceDigest(code_hash="code", semantic_hash="d1", file_count=1)
-        assert decide_action(self._prior("d1"), current, True, "d1") == ACTION_EXTRACT
+        grant = current.attempt_id
+        assert decide_action(self._prior("d1"), current, True, grant) == ACTION_EXTRACT
+
+    def test_semantic_hash_alone_is_not_a_grant(self):
+        current = SourceDigest(code_hash="code", semantic_hash="d1", file_count=1)
+        assert decide_action(self._prior("d1"), current, True, "d1") == ACTION_SKIP
 
     def test_grant_for_another_digest_still_skips(self):
         current = SourceDigest(code_hash="code", semantic_hash="d1", file_count=1)
         assert decide_action(self._prior("d1"), current, True, "d2") == ACTION_SKIP
+
+
+class TestAttemptId:
+    def test_differs_when_only_code_hash_differs(self):
+        a = SourceDigest(code_hash="c1", semantic_hash="s", file_count=1)
+        b = SourceDigest(code_hash="c2", semantic_hash="s", file_count=1)
+        assert a.attempt_id != b.attempt_id
+
+    def test_empty_sentinel_is_sixteen_hex_chars(self):
+        empty = SourceDigest(code_hash="empty", semantic_hash="empty", file_count=0)
+        assert re.fullmatch(r"[0-9a-f]{16}", empty.attempt_id)
+
+    def test_not_serialized(self):
+        digest = SourceDigest(code_hash="c", semantic_hash="s", file_count=1)
+        assert "attempt_id" not in digest.to_dict()
 
 
 class TestEndToEnd:
@@ -168,7 +193,8 @@ class TestEndToEnd:
         env = shrinking_repo
         report = run(env.settings())
         assert _status(report) == "shrink_refused"
-        digest = _refused_digest(env.settings().state_path)
+        root = env.scan_root / "styleguide.example-org.dev.lo"
+        digest = compute_source_manifest(root).attempt_id
         assert f'"allow_shrink_once": "{digest}"' in _row(report)["reason"]
 
     def test_matching_grant_accepts_the_shrink_once(self, shrinking_repo):
@@ -180,7 +206,7 @@ class TestEndToEnd:
         assert _status(first) == "shrink_refused"
         assert _read_json(collection / "graph.json") == original
 
-        digest = _refused_digest(env.settings().state_path)
+        digest = _refused_token(first)
         _grant_repo(env, token=digest)
         second = run(env.settings())
 
@@ -191,12 +217,16 @@ class TestEndToEnd:
 
         state = _read_json(env.settings().state_path)
         assert state[REPO_ID]["consumed_shrink_grant"] == digest
-        assert state[REPO_ID]["semantic_hash"] == digest
+        accepted = SourceDigest(
+            code_hash=state[REPO_ID]["code_hash"],
+            semantic_hash=state[REPO_ID]["semantic_hash"],
+            file_count=state[REPO_ID]["file_count"],
+        )
+        assert accepted.attempt_id == digest
 
     def test_spent_grant_does_not_authorize_a_second_shrink(self, shrinking_repo):
         env = shrinking_repo
-        run(env.settings())
-        digest = _refused_digest(env.settings().state_path)
+        digest = _refused_token(run(env.settings()))
         _grant_repo(env, token=digest)
         assert _status(run(env.settings())) == "updated"
 
@@ -206,7 +236,7 @@ class TestEndToEnd:
         (root / "README.md").write_text("changed", encoding="utf-8")
         third = run(env.settings())
         assert _status(third) == "shrink_refused"
-        assert _refused_digest(env.settings().state_path) != digest
+        assert _refused_token(third) != digest
 
     def test_grant_for_another_digest_does_not_accept(self, shrinking_repo):
         env = shrinking_repo
@@ -235,7 +265,7 @@ class TestEndToEnd:
         assert statuses[REPO_ID] == "shrink_refused"
         assert statuses["example-org.gamma"] == "shrink_refused"
 
-        _grant_repo(env, token=_refused_digest(env.settings().state_path))
+        _grant_repo(env, token=_refused_token(first))
         second = run(env.settings())
         statuses = {a["repo_id"]: a["status"] for a in second.project_actions}
         assert statuses[REPO_ID] == "updated"

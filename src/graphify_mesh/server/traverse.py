@@ -30,9 +30,10 @@ from graphify_mesh.server.store import Generation
 MAX_DEPTH = 16
 DEFAULT_DEPTH = 1
 
-# Hard cap on reported nodes. Past this the result is marked `truncated` and
-# `complete` is false — the payload stays bounded and never claims a
-# completeness it does not have.
+# Hard cap on reported nodes, seeds included: seeds plus traversed nodes never
+# exceed it. Past this the result is marked `truncated` and `complete` is
+# false — the payload stays bounded and never claims a completeness it does
+# not have.
 MAX_TRAVERSAL_NODES = 2000
 
 # Bounds on the `relation` argument: count per call and length per name.
@@ -64,7 +65,12 @@ NOTE_PARTIAL_RELATIONS = (
     "answers must not rest on these relations."
 )
 NOTE_INFERRED = (
-    "INFERRED-confidence edges were followed; they are extractor guesses, not resolved references."
+    "Non-EXTRACTED (INFERRED/AMBIGUOUS) edges were followed; they are extractor guesses, "
+    "not resolved references."
+)
+NOTE_TRUNCATED = (
+    "Result was truncated at the node cap, which counts seeds and nodes together; the set "
+    "is incomplete and must not be read as the full roster."
 )
 NOTE_UNKEYED_SKIPPED = (
     "Nodes without a source_file or label have no durable key and were neither "
@@ -96,7 +102,7 @@ class NeighborsResult:
 
     @property
     def notes(self) -> list[str]:
-        notes = [NOTE_COMPLETE_SET]
+        notes = [NOTE_TRUNCATED if self.truncated else NOTE_COMPLETE_SET]
         if PARTIAL_RELATIONS.intersection(self.relations):
             notes.append(NOTE_PARTIAL_RELATIONS)
         if self.include_inferred:
@@ -172,8 +178,7 @@ def _edge_matches(
 ) -> bool:
     if link.get("relation") not in relations:
         return False
-    confidence = link.get("confidence", ranking.CONFIDENCE_EXTRACTED)
-    if confidence == ranking.CONFIDENCE_INFERRED and not include_inferred:
+    if not ranking.edge_followable(link, include_inferred):
         return False
     # Adjacency is built undirected (each link listed under both endpoints),
     # so orientation is read back off the link itself.
@@ -221,7 +226,14 @@ def neighbors(
 
     key_of = generation.key_by_node_id
     seed_ids.sort(key=lambda nid: key_of[nid])
+    if len(seed_ids) > MAX_TRAVERSAL_NODES:
+        # The seeds alone fill the cap: report the deterministic first slice
+        # and stop, since no room is left for a single traversed node.
+        seed_ids = seed_ids[:MAX_TRAVERSAL_NODES]
+        result.truncated = True
     result.seeds = [_node_card(nid, key_of[nid], repo, generation) for nid in seed_ids]
+    if result.truncated:
+        return result
 
     relation_set = frozenset(relations)
     visited: set[str] = set(seed_ids)
@@ -251,7 +263,7 @@ def neighbors(
             result.frontier_exhausted = True
             break
         next_ids = sorted(reached, key=lambda nid: key_of[nid])
-        room = MAX_TRAVERSAL_NODES - len(result.nodes)
+        room = MAX_TRAVERSAL_NODES - len(result.seeds) - len(result.nodes)
         if len(next_ids) > room:
             next_ids = next_ids[:room]
             result.truncated = True

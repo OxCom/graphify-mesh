@@ -56,6 +56,21 @@ def test_find_similar_cross_repo_only_excludes_same_repo_structural_neighbors():
     assert key_for("repo.a", same_repo_neighbor) not in {h.key for h in result_cross_only.hits}
 
 
+def test_find_similar_does_not_follow_ambiguous_structural_edges():
+    seed = make_node("repo.a", "PaymentGateway", "src/gateway.py", node_id="seed")
+    extracted_neighbor = make_node("repo.a", "PaymentAdapter", "src/adapter.py", node_id="ext")
+    ambiguous_neighbor = make_node("repo.a", "RefundGuess", "src/refund.py", node_id="amb")
+    gen = build_generation(
+        [seed, extracted_neighbor, ambiguous_neighbor],
+        links=[make_link("seed", "ext"), make_link("seed", "amb", confidence="AMBIGUOUS")],
+    )
+
+    result = similar.find_similar("PaymentGateway", gen, k=5)
+    keys = {h.key for h in result.hits}
+    assert key_for("repo.a", extracted_neighbor) in keys
+    assert key_for("repo.a", ambiguous_neighbor) not in keys
+
+
 def test_find_similar_falls_back_to_exact_label_and_community_match_when_no_edges():
     seed = make_node("repo.a", "Widget", "src/widget.py", node_id="seed", community_name="commerce")
     unrelated = make_node(

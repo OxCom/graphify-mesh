@@ -258,6 +258,21 @@
   jump can push a live (frozen) dry run's directory past the 6h threshold in
   one step. The sweep now probes `dry-run.lock` with a non-blocking `flock`
   and keeps any directory whose lock is held. The 6h threshold is unchanged.
+- Changed: the `allow_shrink_once` token is now the attempt id, a 16-char
+  sha256 prefix over the code and semantic source digests, instead of the bare
+  `semantic_hash`. A code-only change keeps `semantic_hash`, so one approved
+  token also accepted a different, unreviewed code shrink, and two different
+  code-only refusals printed the same token. Tokens copied from a refusal
+  before this change no longer match: the guard stays armed, and the next
+  refusal prints a fresh token to copy. The refusal-retry hold is still keyed
+  on `semantic_hash`.
+- Fixed: a spent `allow_shrink_once` is written to the state file as soon as
+  the shrink is accepted. The smaller `graph.json` was already on disk, but the
+  spend lived only in memory until the end of the run, so a later stage that
+  raised left the token unspent and able to authorize a second shrink. Only
+  that repo's accepted entry is written onto the state read at run start; the
+  rest of the state is still saved at the end as before. A dry run writes
+  nothing.
 
 ## 0.0.6
 

@@ -108,14 +108,14 @@ def decide_action(
         # unchanged input just burns GPU for another refusal. Hold the last-good
         # graph instead and wait for the source to actually change.
         #
-        # An unspent `allow_shrink_once` for this digest overrides that hold:
-        # the operator authorized this exact refused attempt, and the only way
-        # to honour it is to re-run the extract and let the guard accept the
+        # An unspent `allow_shrink_once` naming this attempt id overrides that
+        # hold: the operator authorized this exact refused attempt, and the only
+        # way to honour it is to re-run the extract and let the guard accept the
         # result this time.
         if (
             current_manifest.semantic_hash == prior_state.get("refused_semantic_hash")
             and int(prior_state.get("refusal_streak") or 0) >= REFUSAL_RETRY_LIMIT
-            and shrink_grant != current_manifest.semantic_hash
+            and shrink_grant != current_manifest.attempt_id
         ):
             return ACTION_SKIP
         return ACTION_EXTRACT
@@ -347,10 +347,11 @@ def apply_action(
             graph_content_hash=new_hash,
         )
 
-    if outcome_status == STATUS_SHRINK_REFUSED and shrink_grant == current_manifest.semantic_hash:
+    if outcome_status == STATUS_SHRINK_REFUSED and shrink_grant == current_manifest.attempt_id:
         # Per-repo, single-use authorization: the registry entry carries the
-        # digest of the attempt the operator inspected and approved. Matching it
-        # exactly is the whole guarantee — a stale token (the source moved on),
+        # attempt id (code + semantic digests) of the attempt the operator
+        # inspected and approved. Matching it exactly is the whole guarantee — a
+        # stale token (the source moved on, code-only changes included),
         # a token for another repo, or no token at all leaves the guard armed,
         # which is the difference from --allow-shrink waving through every repo
         # in the run. The grant is reported back so the caller can spend it.
@@ -380,7 +381,7 @@ def apply_action(
                 f"cli reported success but node/edge counts did not grow "
                 f"(old={old_counts} new={new_counts}); last-good graph.json restored. "
                 f"If this shrink is intended, authorize this one attempt with "
-                f'"allow_shrink_once": "{current_manifest.semantic_hash}" '
+                f'"allow_shrink_once": "{current_manifest.attempt_id}" '
                 f"on this repo's registry entry"
             ),
             dirty_worktree=dirty,

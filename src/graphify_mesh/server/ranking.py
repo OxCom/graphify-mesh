@@ -55,13 +55,16 @@ HUB_PENALTY_FACTOR = 0.5
 DEPRECATED_PATH_MARKER = "/DEPRECATED/"
 DEPRECATED_PENALTY_FACTOR = 0.3
 
-# Confidence handling: INFERRED edges are excluded by default from
-# traversal-based (structural) candidate generation; callers opt in via
-# `include_inferred=True`. EXTRACTED is the graphify default confidence
+# Confidence handling is an allowlist: only EXTRACTED edges are followed by
+# default in traversal (structural candidates, similar, neighbors). graphify
+# also emits AMBIGUOUS, scored below INFERRED, so a denylist of INFERRED alone
+# lets the weaker class through. Callers opt in to every non-EXTRACTED edge
+# via `include_inferred=True`. EXTRACTED is the graphify default confidence
 # class for edges that don't carry an explicit `confidence` attribute (see
 # graphify/export.py's `_CONFIDENCE_SCORE_DEFAULTS`).
 CONFIDENCE_EXTRACTED = "EXTRACTED"
 CONFIDENCE_INFERRED = "INFERRED"
+CONFIDENCE_AMBIGUOUS = "AMBIGUOUS"
 
 # --- MMR (maximal marginal relevance) diversification -----------------
 
@@ -74,6 +77,12 @@ MMR_LAMBDA = 0.7
 MAX_K = 100
 DEFAULT_K = 10
 PAGE_SIZE = 20
+
+
+def edge_followable(edge: dict, include_inferred: bool) -> bool:
+    """True when traversal may follow `edge`: EXTRACTED (the default when the
+    edge carries no `confidence`), or any confidence once the caller opted in."""
+    return include_inferred or edge.get("confidence", CONFIDENCE_EXTRACTED) == CONFIDENCE_EXTRACTED
 
 
 def rrf_contribution(rank: int) -> float:

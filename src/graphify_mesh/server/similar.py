@@ -156,7 +156,7 @@ def same_repo_structural_neighbors(key: str, generation: Generation) -> list[str
     repo = node.get("repo")
     neighbors = []
     for neighbor_id, edge in generation.adjacency.get(node_id, []):
-        if edge.get("confidence", ranking.CONFIDENCE_EXTRACTED) == ranking.CONFIDENCE_INFERRED:
+        if not ranking.edge_followable(edge, include_inferred=False):
             continue
         neighbor_node = generation.node_by_id.get(neighbor_id, {})
         if neighbor_node.get("repo") != repo:

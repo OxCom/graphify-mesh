@@ -25,6 +25,7 @@ is stripped of them right after the repo-tag remap — see
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import hashlib
 import json
@@ -761,6 +762,10 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         )
 
     state = load_state(settings.state_path)
+    # What is on disk at run start. A spent shrink grant is written onto this
+    # copy alone, so persisting the spend early never publishes the rest of the
+    # in-memory state before `_finalize`.
+    disk_state = copy.deepcopy(state)
     # A host-side VM suspend stops CLOCK_MONOTONIC but not CLOCK_REALTIME, so
     # an infra outage can cross out of its grace window without a single retry
     # ever having run. Discount the frozen interval exactly once here, by
@@ -1055,6 +1060,12 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 if spent:
                     accepted["consumed_shrink_grant"] = spent
                 state[entry.repo_id] = accepted
+                if outcome.consumed_shrink_grant and not settings.dry_run:
+                    # The smaller graph.json is already durable, but later
+                    # stages can raise before `_finalize` saves state; persist
+                    # the spend now or the token authorizes a second shrink.
+                    disk_state[entry.repo_id] = accepted
+                    save_state(settings.state_path, disk_state)
         if graph_path.exists():
             graph_paths_by_repo[entry.repo_id] = graph_path
     bar.finish()

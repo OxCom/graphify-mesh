@@ -9,8 +9,8 @@ Confidence flag is always `ranking.CONFIDENCE_EXTRACTED` here:
 `context_pack` does not expose an `include_inferred` toggle the way
 `rank()` itself does, so every hit this function can ever surface is, by
 construction, drawn from the EXTRACTED-only default structural traversal
-plus lexical/vector matches — there is no code path by which an
-INFERRED-sourced hit reaches this function today. The field is still
+plus lexical/vector matches — there is no code path by which a
+non-EXTRACTED (INFERRED/AMBIGUOUS) sourced hit reaches this function today. The field is still
 carried explicitly (not hardcoded as a bare string) so a future
 `include_inferred` passthrough only needs to plumb the real value through,
 not invent the field.

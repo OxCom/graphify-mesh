@@ -30,6 +30,17 @@ class SourceDigest:
     semantic_hash: str
     file_count: int
 
+    @property
+    def attempt_id(self) -> str:
+        """Identity of one extract attempt over the whole source state.
+
+        The `allow_shrink_once` token: it covers code AND semantic content, so a
+        code-only change after approval yields a different id. Computed, never
+        serialized, and always hex, including for the "empty" sentinel digest.
+        """
+        raw = f"{self.code_hash}\n{self.semantic_hash}".encode()
+        return hashlib.sha256(raw).hexdigest()[:16]
+
     def to_dict(self) -> dict:
         return {
             "code_hash": self.code_hash,
