@@ -204,3 +204,66 @@ def test_writer_reader_packing_round_trip():
 def test_document_count():
     assert lexical_read.document_count(_v2_lexical()) == 2
     assert lexical_read.document_count(_v3_lexical()) == 2
+
+
+def _hits_lexical(postings: list) -> dict:
+    return {
+        "schema_version": 3,
+        "fields": ["label", "path", "snippet"],
+        "documents": [["r", f"k{i}"] for i in range(6)],
+        "postings": {"t": postings},
+        "document_count": 6,
+    }
+
+
+def test_doc_ids_by_key_v3_and_none_for_v2():
+    lexical = _v3_lexical()
+    lexical["documents"].append(["repoA", "keyA1"])  # same key, second document
+    lexical["documents"].append("corrupt")
+    assert lexical_read.doc_ids_by_key(lexical) == {"keyA1": [0, 2], "keyB1": [1]}
+    assert lexical_read.doc_ids_by_key(_v2_lexical()) is None
+
+
+def test_term_doc_hits_hit_miss_first_and_last_doc():
+    # docs 0, 2, 5 carry the term; doc 5 is the last entry of the list
+    lexical = _hits_lexical([0, 1, 9, 21])
+    assert lexical_read.term_doc_hits(lexical, "t", [0, 1, 2, 3, 4, 5]) == {0, 2, 5}
+    assert lexical_read.term_doc_hits(lexical, "t", [0]) == {0}
+    assert lexical_read.term_doc_hits(lexical, "t", [5]) == {5}
+    assert lexical_read.term_doc_hits(lexical, "t", [1, 3, 4, 99]) == set()
+    assert lexical_read.term_doc_hits(lexical, "missing", [0, 5]) == set()
+    assert lexical_read.term_doc_hits(lexical, "t", []) == set()
+
+
+def test_term_doc_hits_matches_term_postings_on_real_index():
+    lexical = build_lexical_index(
+        {
+            "repoA": {
+                "nodes": [
+                    {"id": f"n{i}", "label": f"Alpha{i}", "source_file": "a.py"} for i in range(20)
+                ]
+            }
+        },
+        {},
+    ).data
+    by_key = lexical_read.doc_ids_by_key(lexical)
+    assert by_key is not None
+    for term in ("alpha3", "a", "py", "nope"):
+        expected = {
+            by_key[key][0] for _repo, key, _field in lexical_read.term_postings(lexical, term)
+        }
+        assert lexical_read.term_doc_hits(lexical, term, range(20)) == expected
+
+
+def test_term_doc_hits_corrupt_entries_treated_as_absent():
+    # non-int / bool entries are skipped; unknown field index is not a hit
+    lexical = _hits_lexical([0, True, 4.5, 8, 15, 20])
+    assert lexical_read.term_doc_hits(lexical, "t", [0, 1, 2, 3, 5]) == {0, 2, 5}
+    # entries that do not compare with ints force the linear-scan fallback
+    lexical = _hits_lexical(["x", 21, None, 1, [4]])
+    assert lexical_read.term_doc_hits(lexical, "t", [0, 1, 5]) == {0, 5}
+    # a scalar where a posting list belongs
+    lexical = _hits_lexical([])
+    lexical["postings"]["t"] = 7
+    assert lexical_read.term_doc_hits(lexical, "t", [0, 1]) == set()
+    assert lexical_read.term_doc_hits("garbage", "t", [0]) == set()

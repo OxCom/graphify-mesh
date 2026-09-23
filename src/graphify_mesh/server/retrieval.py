@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from graphify_mesh.server import lexical_read, ranking
+from graphify_mesh.server import anchors, lexical_read, ranking
 from graphify_mesh.server.store import Generation
 from graphify_mesh.sync.lexical_index import normalize_alias_query, tokenize_text
 from graphify_mesh.sync.vectors import RepoVectors
@@ -37,7 +37,7 @@ class Hit:
     node_id: str
     degree: int
     score: float
-    match_type: str  # "exact" | "fused"
+    match_type: str  # "exact" | "anchor" | "fused"
     deprecated: bool
 
 
@@ -222,9 +222,10 @@ def rank(
     embed_query_fn: EmbedQueryFn,
     include_inferred: bool = False,
 ) -> RankedResult:
-    """Top-level WS5 search orchestration: exact-alias bypass, then
-    lexical+vector+structural candidate generation, RRF fusion, hub/
-    DEPRECATED penalties, MMR diversification, deterministic tie-break."""
+    """Top-level WS5 search orchestration: exact-alias bypass, symbol
+    anchors (`anchors.py`), then lexical+vector+structural candidate
+    generation, RRF fusion, hub/DEPRECATED penalties, MMR diversification,
+    deterministic tie-break."""
     k = max(1, min(k, ranking.MAX_K))
     # Store-level degraded markers (reload rejections, embeddings stamp
     # problems, ...) are merged into every tool response by the server layer
@@ -243,6 +244,19 @@ def rank(
     del exact_hits[k:]
     selected_keys = {h.key for h in exact_hits}
     remaining_slots = max(0, k - len(exact_hits))
+
+    anchor_hits: list[Hit] = []
+    anchor_key_set: set[str] = set()
+    if remaining_slots > 0:
+        for key in anchors.anchor_keys(query, generation, repo_filter, exclude=selected_keys):
+            hit = _hit_from_key(key, generation, anchors.ANCHOR_MATCH_SCORE, "anchor")
+            if hit:
+                anchor_hits.append(hit)
+        del anchor_hits[remaining_slots:]
+        # Anchors stay in the fused pool so MMR diversifies against them exactly
+        # as when they rank there on their own; they are dropped after selection.
+        anchor_key_set = {h.key for h in anchor_hits}
+        remaining_slots -= len(anchor_hits)
 
     fused_hits: list[Hit] = []
     if remaining_slots > 0:
@@ -283,11 +297,16 @@ def rank(
             (key, ranking.apply_penalties(key, score, degree_by_key, path_by_key))
             for key, score in fused_scores.items()
         ]
-        diversified_keys = ranking.mmr_select(penalized, path_by_key, remaining_slots)
+        diversified_keys = ranking.mmr_select(
+            penalized, path_by_key, remaining_slots + len(anchor_key_set)
+        )
+        diversified_keys = [key for key in diversified_keys if key not in anchor_key_set][
+            :remaining_slots
+        ]
         final_scores = dict(penalized)
         for key in diversified_keys:
             hit = _hit_from_key(key, generation, final_scores.get(key, 0.0), "fused")
             if hit:
                 fused_hits.append(hit)
 
-    return RankedResult(hits=exact_hits + fused_hits, degraded=sorted(set(degraded)))
+    return RankedResult(hits=exact_hits + anchor_hits + fused_hits, degraded=sorted(set(degraded)))

@@ -131,6 +131,15 @@ to the current project and only widens when asked. Fails closed if
 | `k` | integer | ranking default | Max results. |
 | `cwd` | string | — | "Absolute path of the project directory this call is about, used to resolve scope='current'. Pass it on every call — one session can move between projects. Omit it only with an explicit scope ('all' or 'repo:<id>'); a directory outside registry.json is refused." |
 
+Each `search` hit carries a `match_type`: `exact` when the whole query is an
+exact alias of the node (FQCN, label, bare method name, file basename), then
+`anchor`, then `fused` for the ranked hybrid results. A query token whose alias
+(`t` or `.t()`) names 1 to 10 nodes makes those nodes anchor candidates, each
+scored by the idf of the other query tokens found in its own fields and in its
+depth-1 EXTRACTED neighbours. At most two candidates are pinned, each only if it
+scores at least 10 and at least twice the next candidate; otherwise no `anchor`
+hit appears and ranking is unchanged.
+
 Hits from `search`, `cross_project` and `find_similar`, and `context_pack`
 cards, carry no `community_name`: the labels proved unreliable and cost payload
 without adding evidence.

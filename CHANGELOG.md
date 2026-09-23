@@ -4,6 +4,15 @@
 
 ### Features and behavior changes
 
+- Added: symbol-anchored ranking in `search`. A query token whose exact alias
+  (`t` or `.t()`) names at most 10 nodes makes them anchor candidates, scored
+  by the idf of the other query tokens in their own fields and depth-1
+  EXTRACTED neighbours. A candidate scoring at least 10 and twice the next one
+  is pinned after the exact hits with `match_type: "anchor"` (at most two).
+  Measured on live data: `TeamsController.export()` for "team export role
+  check HR company lead access" moves from #10 to the first anchor (45.47 vs
+  10.13 for the runner-up). Without a dominant candidate the output is
+  unchanged.
 - Changed: the naming stage clusters and labels **in process** through
   graphify's Python API instead of shelling out to `graphify cluster-only` /
   `label`. Those commands rebuild the graph through `build_from_json`, which

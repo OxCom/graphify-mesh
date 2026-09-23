@@ -22,6 +22,9 @@ degrades retrieval quality, it must not take the server down.
 
 from __future__ import annotations
 
+import bisect
+from collections.abc import Iterable
+
 SCHEMA_V2 = 2
 SCHEMA_V3 = 3
 # Low bits reserved for the field index inside a packed v3 posting entry.
@@ -141,6 +144,59 @@ def term_doc_freq(lexical: object, term: str) -> int:
         if isinstance(packed, int) and not isinstance(packed, bool)
     }
     return len(distinct)
+
+
+def doc_ids_by_key(lexical: object) -> dict[str, list[int]] | None:
+    """v3 only (`None` for v2): key -> doc ids from the `documents` table.
+    A list, not one id: two nodes sharing repo, source file and label share a
+    key but are separate documents. Malformed entries are skipped exactly as
+    `_doc_ref` skips them."""
+    if _schema(lexical) == SCHEMA_V2:
+        return None
+    by_key: dict[str, list[int]] = {}
+    for doc_id, entry in enumerate(_get_list(lexical, "documents")):
+        if not isinstance(entry, list) or len(entry) != 2 or not isinstance(entry[1], str):
+            continue
+        by_key.setdefault(entry[1], []).append(doc_id)
+    return by_key
+
+
+def _is_packed(entry: object) -> bool:
+    return isinstance(entry, int) and not isinstance(entry, bool)
+
+
+def term_doc_hits(lexical: object, term: str, doc_ids: Iterable[int]) -> set[int]:
+    """v3 only: the subset of `doc_ids` that `term` has a posting for, with
+    the same entry validity `term_postings` applies (int entry, known field).
+    Binary search per doc id over the sorted posting list; a list whose
+    entries do not compare (corrupt, mixed types) falls back to a scan."""
+    entries = _get_entries(_get_dict(lexical, "postings"), term)
+    field_count = len(_get_list(lexical, "fields"))
+    wanted = set(doc_ids)
+    try:
+        return {d for d in wanted if _bisect_hit(entries, d, field_count)}
+    except TypeError:
+        hits: set[int] = set()
+        for packed in entries:
+            if _is_packed(packed) and (packed & _FIELD_MASK) < field_count:
+                doc_id = packed >> FIELD_PACK_BITS
+                if doc_id in wanted:
+                    hits.add(doc_id)
+        return hits
+
+
+def _bisect_hit(entries: list, doc_id: int, field_count: int) -> bool:
+    index = bisect.bisect_left(entries, doc_id << FIELD_PACK_BITS)
+    while index < len(entries):
+        packed = entries[index]
+        index += 1
+        if not _is_packed(packed):
+            continue
+        if packed >> FIELD_PACK_BITS != doc_id:
+            return False
+        if (packed & _FIELD_MASK) < field_count:
+            return True
+    return False
 
 
 def document_count(lexical: object) -> int:
