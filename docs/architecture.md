@@ -35,7 +35,27 @@ discovery
   failed scan.
 - **per-project sync** compares a fresh per-repo source digest against saved
   state to decide `update` (AST-only) vs `extract` (semantic) vs `noop`, and
-  refuses a per-repo result that shrank unexpectedly.
+  refuses a per-repo result that shrank unexpectedly. A refusal restores the
+  last-good `graph.json` and names, in its reason, the source digest of the
+  attempt it refused. A deliberate deletion of functionality looks exactly like
+  a broken extraction, so the digest is how one specific shrink gets approved:
+  putting it in that repo's registry entry as
+  `"allow_shrink_once": "<digest>"` authorizes that one attempt for that one
+  repo, and nothing else. The token must equal the refused digest exactly, it
+  overrides the refusal-retry hold so the repo re-extracts once, and it is spent
+  in per-repo state (`consumed_shrink_grant`) the moment it is used — the
+  registry is never rewritten by the sync engine, because the mesh server and
+  `mesh-register.py` share that file. An absent, empty or spent key means the
+  guard is armed; a malformed one fails the registry load. `--allow-shrink`
+  still exists for the whole-run case and accepts every repo's shrink in that
+  run, which is why the per-repo key is the default way to approve one. When the
+  child exits
+  non-zero, the outcome reason carries the **last** 2000 characters of its
+  stderr and the whole stream is written to
+  `<collection>/.graphify_sync_error.log`, overwritten per failure. It used to
+  carry the first 300 characters, which is the wrong end: the CLI prints its
+  warnings first and its traceback last, so a failing repo reported a
+  semantic-cache warning and nothing about the cause.
 - **merge** always calls `graphify merge-graphs` with a deterministic,
   sorted-by-`repo_id` list of per-repo `graph.json` paths — **never** `graphify
   global add`. See the invariants below. `merge-graphs` writes cross-repo edges
@@ -165,7 +185,7 @@ There are two MCP servers in play, and they are complementary:
   `list_prs`, `triage_prs`. Repointing is a config change, not a rewrite.
 - **graphify-mesh's server** (`graphify-mesh-server`) owns everything
   hybrid / cross-project / evidence-oriented: `search`, `cross_project`,
-  `find_similar`, `project_map`, `context_pack`. These need scope resolution,
+  `find_similar`, `project_map`, `context_pack`, `neighbors`. These need scope resolution,
   the lexical index, the embedding index, and the cross-project overlay.
 
 ### Two transports, one tool surface

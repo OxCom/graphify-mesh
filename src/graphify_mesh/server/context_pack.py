@@ -60,7 +60,6 @@ class EvidenceCard:
     label: str
     source_file: str
     line: int | None
-    community_name: str | None
     confidence: str
     snippet: str
     score: float
@@ -170,7 +169,6 @@ def _card_from_hit(
         label=hit.label,
         source_file=hit.source_file,
         line=line,
-        community_name=hit.community_name,
         confidence=ranking.CONFIDENCE_EXTRACTED,
         snippet=snippet,
         score=hit.score,

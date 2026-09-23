@@ -1,7 +1,7 @@
 """`project_map(repo)` tool (WS5 tool 4): a structural overview of one
-registered repo in the CURRENT generation — node count, a community_name
-breakdown, and the top hub nodes by structural degree. Purely read-only over
-the already-loaded `Generation`; `Generation.nodes_by_repo` / `.adjacency`
+registered repo in the CURRENT generation — node count, a trimmed
+community_name breakdown, and the top hub nodes by structural degree. Purely
+read-only over the already-loaded `Generation`; `Generation.nodes_by_repo` / `.adjacency`
 already cover everything this needs, so no separate index is built here.
 
 Fails closed like everything else in this package: an unresolvable repo
@@ -22,6 +22,14 @@ from graphify_mesh.server.store import Generation
 # full node dump.
 TOP_HUBS_LIMIT = 15
 
+# `community_breakdown` keeps only communities of at least this size, and at
+# most this many of them (largest first). Community labels are LLM-named
+# clusters: an unreliable orientation hint, not a module map. Singletons were
+# most of the list — about 4 KB of noise per call on cem.hub's 128
+# communities. `communities_total` / `communities_omitted` report the cut.
+COMMUNITY_MIN_SIZE = 2
+COMMUNITY_BREAKDOWN_LIMIT = 25
+
 
 @dataclass
 class ProjectMapResult:
@@ -29,6 +37,8 @@ class ProjectMapResult:
     repo: str = ""
     node_count: int = 0
     community_breakdown: dict = field(default_factory=dict)
+    communities_total: int = 0  # every community in the repo, "unassigned" included
+    communities_omitted: int = 0  # communities_total minus len(community_breakdown)
     top_hubs: list = field(default_factory=list)  # [{key, label, degree, source_file, is_hub}]
     degraded: list = field(default_factory=list)
 
@@ -66,12 +76,17 @@ def project_map(repo_id: str, generation: Generation) -> ProjectMapResult:
             }
         )
 
+    # Deterministic: size desc, then name asc; then the size floor and limit.
+    ranked_communities = sorted(community_breakdown.items(), key=lambda kv: (-kv[1], kv[0]))
+    kept = [kv for kv in ranked_communities if kv[1] >= COMMUNITY_MIN_SIZE]
+    kept = kept[:COMMUNITY_BREAKDOWN_LIMIT]
+
     return ProjectMapResult(
         resolved=True,
         repo=repo_id,
         node_count=len(node_ids),
-        community_breakdown=dict(
-            sorted(community_breakdown.items(), key=lambda kv: (-kv[1], kv[0]))
-        ),
+        community_breakdown=dict(kept),
+        communities_total=len(ranked_communities),
+        communities_omitted=len(ranked_communities) - len(kept),
         top_hubs=top_hubs,
     )

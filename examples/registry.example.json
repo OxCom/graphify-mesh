@@ -10,7 +10,8 @@
       "repo_id": "example-org.frontend-b",
       "root": "/path/to/your/checkouts/frontend-b",
       "collection_path": "/path/to/your/graph-mesh/graphify/example-org/frontend-b",
-      "enabled": true
+      "enabled": true,
+      "allow_shrink_once": "0123456789abcdef"
     },
     {
       "repo_id": "example-org.infra-c",

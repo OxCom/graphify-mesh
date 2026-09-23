@@ -339,6 +339,7 @@ def _guarded_apply_action(
     settings: Settings,
     allow_shrink: bool = False,
     shrink_tolerance: float = 0.0,
+    shrink_grant: str | None = None,
     misconfig_once: _MisconfigLogOnce | None = None,
     sandbox_policy: graphify_cli.SandboxPolicy | None = None,
 ) -> ProjectOutcome:
@@ -378,6 +379,7 @@ def _guarded_apply_action(
         staging_home,
         allow_shrink=allow_shrink,
         shrink_tolerance=shrink_tolerance,
+        shrink_grant=shrink_grant,
         sandbox_policy=sandbox_policy,
     )
     if not guarded:
@@ -390,6 +392,23 @@ def _guarded_apply_action(
     outcome.status = STATUS_INFRA_FAILED
     outcome.reason = f"{outcome.reason}; backend probe failed"
     return outcome
+
+
+def _shrink_grant_for(entry: RepoEntry, prior_state: dict | None) -> str | None:
+    """The unspent `allow_shrink_once` token for this repo, if any.
+
+    Single use is tracked in per-repo state rather than by rewriting the registry:
+    the registry is shared with the mesh server and mesh-register.py, and this
+    package has never written it — a sync run editing it mid-flight would race
+    those writers. Once the token has been spent, the key is inert until the
+    operator replaces it with the digest of a new refusal.
+    """
+    grant = entry.allow_shrink_once
+    if not grant:
+        return None
+    if (prior_state or {}).get("consumed_shrink_grant") == grant:
+        return None
+    return grant
 
 
 def _within_infra_grace(now: float, infra_since: float, grace_hours: float) -> bool:
@@ -843,6 +862,9 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # shared is mutated until after every future has been joined.
     actionable: list[tuple[int, RepoEntry, Path, str, SourceDigest]] = []
     outcomes: dict[str, ProjectOutcome] = {}
+    # Per-repo, single-use shrink authorizations, resolved once against prior
+    # state so the decision and the invocation see the same token.
+    shrink_grants: dict[str, str | None] = {}
     misconfig_once = _MisconfigLogOnce()
     sandbox_policy = child_sandbox_policy(settings, staging_root)
     with ThreadPoolExecutor(max_workers=settings.extract_concurrency) as pool:
@@ -863,7 +885,9 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             has_graph = graph_path.exists()
             current_manifest = manifest_futures[entry.repo_id].result()
             prior_state = state.get(entry.repo_id)
-            action = decide_action(prior_state, current_manifest, has_graph)
+            shrink_grant = _shrink_grant_for(entry, prior_state)
+            shrink_grants[entry.repo_id] = shrink_grant
+            action = decide_action(prior_state, current_manifest, has_graph, shrink_grant)
             log.info("[%d/%d] %s: %s ...", i, total_active, entry.repo_id, action)
             bar.tick(i - 1, f"{entry.repo_id}: {action} ...")
 
@@ -913,6 +937,11 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 # apply here.
                 allow_shrink=settings.allow_shrink,
                 shrink_tolerance=settings.shrink_tolerance,
+                # Registry-declared authorization for ONE observed shrink of
+                # THIS repo. Unlike allow_shrink it does not disarm the guard:
+                # acceptance still requires the refused digest to equal the
+                # token, and the token is spent in state afterwards.
+                shrink_grant=shrink_grants.get(entry.repo_id),
                 # Shared across workers: a misconfigured probe endpoint is
                 # logged once per run, not once per launch.
                 misconfig_once=misconfig_once,
@@ -1016,7 +1045,16 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             if outcome.new_manifest is not None:
                 # A successful outcome clears any refusal memory: the source is
                 # accepted now, so a future refusal starts its own streak.
-                state[entry.repo_id] = outcome.new_manifest.to_dict()
+                # The spent shrink token is the one thing carried across, in
+                # both directions: a token spent THIS run must not authorize a
+                # second shrink, and one spent earlier must stay spent through
+                # every later run that rewrites this entry wholesale.
+                accepted = outcome.new_manifest.to_dict()
+                prior = state.get(entry.repo_id) or {}
+                spent = outcome.consumed_shrink_grant or prior.get("consumed_shrink_grant")
+                if spent:
+                    accepted["consumed_shrink_grant"] = spent
+                state[entry.repo_id] = accepted
         if graph_path.exists():
             graph_paths_by_repo[entry.repo_id] = graph_path
     bar.finish()

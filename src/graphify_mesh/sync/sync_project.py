@@ -73,6 +73,12 @@ class ProjectOutcome:
     # re-extracted and was refused on every run — a permanent retry loop that
     # also kept it in the stale bucket and blocked publish fleet-wide.
     refused_manifest: SourceDigest | None = None
+    # The per-repo `allow_shrink_once` token this outcome spent, when a shrink was
+    # accepted because it matched. The caller records it in per-repo state so the
+    # same token cannot authorize a second shrink: the registry key is operator-
+    # owned and this package never writes the registry (mesh-register.py does), so
+    # "single use" is enforced on the state side.
+    consumed_shrink_grant: str | None = None
 
 
 # How many consecutive refusals of the SAME source digest before the repo stops
@@ -83,7 +89,12 @@ class ProjectOutcome:
 REFUSAL_RETRY_LIMIT = 1
 
 
-def decide_action(prior_state: dict | None, current_manifest: SourceDigest, has_graph: bool) -> str:
+def decide_action(
+    prior_state: dict | None,
+    current_manifest: SourceDigest,
+    has_graph: bool,
+    shrink_grant: str | None = None,
+) -> str:
     if not has_graph:
         return ACTION_BOOTSTRAP
     if prior_state is None:
@@ -96,9 +107,15 @@ def decide_action(prior_state: dict | None, current_manifest: SourceDigest, has_
         # refused REFUSAL_RETRY_LIMIT times, re-running the extractor on
         # unchanged input just burns GPU for another refusal. Hold the last-good
         # graph instead and wait for the source to actually change.
+        #
+        # An unspent `allow_shrink_once` for this digest overrides that hold:
+        # the operator authorized this exact refused attempt, and the only way
+        # to honour it is to re-run the extract and let the guard accept the
+        # result this time.
         if (
             current_manifest.semantic_hash == prior_state.get("refused_semantic_hash")
             and int(prior_state.get("refusal_streak") or 0) >= REFUSAL_RETRY_LIMIT
+            and shrink_grant != current_manifest.semantic_hash
         ):
             return ACTION_SKIP
         return ACTION_EXTRACT
@@ -166,6 +183,43 @@ _INVOKERS: dict[str, Callable[..., graphify_cli.CliResult]] = {
     ACTION_BOOTSTRAP: graphify_cli.run_extract,
 }
 
+# How much of a failing child's stderr reaches the log line, and where the rest
+# goes. The log line used to carry `stderr[:300]`, which is the wrong end of the
+# stream: the CLI prints its warnings first and its traceback last, so a repo
+# that failed on 2026-09-22 reported only a RuntimeWarning about semantic-cache
+# vintages and nothing about why it exited 1. The tail is what names the cause.
+FAILURE_REASON_TAIL = 2000
+FAILURE_LOG_NAME = ".graphify_sync_error.log"
+
+
+def _failure_reason(returncode: int, stderr: str, collection_path: Path) -> str:
+    """Build the outcome's reason: the tail of stderr, with the whole of it on disk.
+
+    The full stream is written to `<collection>/.graphify_sync_error.log`, next to
+    the other `.graphify_*` state files, and overwritten on each failure — it is a
+    "why did the last run fail" file, not a history. A log that cannot be written
+    (read-only collection, full disk) must not turn a reported failure into an
+    unreported crash, so that error is swallowed and only the tail is returned.
+    """
+    text = (stderr or "").strip()
+    if not text:
+        return f"exit={returncode}: no stderr"
+
+    log_note = ""
+    try:
+        log_path = collection_path / FAILURE_LOG_NAME
+        log_path.write_text(text, encoding="utf-8")
+        log_note = f" [full stderr: {log_path}]"
+    except OSError:
+        pass
+
+    if len(text) <= FAILURE_REASON_TAIL:
+        return f"exit={returncode}: {text}{log_note}"
+    return (
+        f"exit={returncode}: ...(first {len(text) - FAILURE_REASON_TAIL} chars in the log)... "
+        f"{text[-FAILURE_REASON_TAIL:]}{log_note}"
+    )
+
 
 def apply_action(
     repo_id: str,
@@ -178,6 +232,7 @@ def apply_action(
     *,
     allow_shrink: bool = False,
     shrink_tolerance: float = 0.0,
+    shrink_grant: str | None = None,
     sandbox_policy: graphify_cli.SandboxPolicy | None = None,
 ) -> ProjectOutcome:
     graph_path = collection_path / "graph.json"
@@ -217,7 +272,7 @@ def apply_action(
             repo_id,
             action,
             status,
-            reason=f"exit={result.returncode}: {result.stderr.strip()[:300]}",
+            reason=_failure_reason(result.returncode, result.stderr, collection_path),
             dirty_worktree=dirty,
         )
 
@@ -292,6 +347,28 @@ def apply_action(
             graph_content_hash=new_hash,
         )
 
+    if outcome_status == STATUS_SHRINK_REFUSED and shrink_grant == current_manifest.semantic_hash:
+        # Per-repo, single-use authorization: the registry entry carries the
+        # digest of the attempt the operator inspected and approved. Matching it
+        # exactly is the whole guarantee — a stale token (the source moved on),
+        # a token for another repo, or no token at all leaves the guard armed,
+        # which is the difference from --allow-shrink waving through every repo
+        # in the run. The grant is reported back so the caller can spend it.
+        _cleanup_snapshot(snapshot_path)
+        return ProjectOutcome(
+            repo_id,
+            action,
+            STATUS_UPDATED,
+            reason=(
+                f"shrink accepted (registry allow_shrink_once={shrink_grant}): "
+                f"old={old_counts} new={new_counts}"
+            ),
+            dirty_worktree=dirty,
+            new_manifest=current_manifest,
+            graph_content_hash=new_hash,
+            consumed_shrink_grant=shrink_grant,
+        )
+
     if outcome_status == STATUS_SHRINK_REFUSED:
         _restore_snapshot(snapshot_path, graph_path)
         _cleanup_snapshot(snapshot_path)
@@ -301,7 +378,10 @@ def apply_action(
             STATUS_SHRINK_REFUSED,
             reason=(
                 f"cli reported success but node/edge counts did not grow "
-                f"(old={old_counts} new={new_counts}); last-good graph.json restored"
+                f"(old={old_counts} new={new_counts}); last-good graph.json restored. "
+                f"If this shrink is intended, authorize this one attempt with "
+                f'"allow_shrink_once": "{current_manifest.semantic_hash}" '
+                f"on this repo's registry entry"
             ),
             dirty_worktree=dirty,
             # Accepted state deliberately stays put (no new_manifest) so the

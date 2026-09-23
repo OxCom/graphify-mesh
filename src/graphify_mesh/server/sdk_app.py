@@ -1,4 +1,4 @@
-"""Registers this package's 5 tools on the MCP SDK's low-level Server.
+"""Registers this package's 6 tools on the MCP SDK's low-level Server.
 
 Both transports (stdio and streamable HTTP) go through here, so
 `GraphifyMeshServer.tool_schemas` / `.call_tool` stay the single source of

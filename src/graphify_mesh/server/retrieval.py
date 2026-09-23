@@ -35,7 +35,6 @@ class Hit:
     source_file: str
     label: str
     node_id: str
-    community_name: str | None
     degree: int
     score: float
     match_type: str  # "exact" | "fused"
@@ -209,7 +208,6 @@ def _hit_from_key(key: str, generation: Generation, score: float, match_type: st
         source_file=source_file,
         label=node.get("label", ""),
         node_id=node_id,
-        community_name=node.get("community_name"),
         degree=generation.degree(node_id),
         score=score,
         match_type=match_type,

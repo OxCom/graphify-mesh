@@ -117,7 +117,7 @@ cache in `server/scope.py` and the per-generation index cache in
 `server/similar.py` — are each guarded by their own lock, with the fast hit
 path lock-free.
 
-## The 5 tools
+## The 6 tools
 
 ### `search`
 Hybrid lexical + vector + structural search within a **scope**. Scope defaults
@@ -130,6 +130,10 @@ to the current project and only widens when asked. Fails closed if
 | `scope` | string | `current` | `current`, `all`, or `repo:<id>`. `all` means every **enabled** repo in `registry.json`, not "no filter": a repo disabled since the generation was published is not served. With no enabled repo at all, `all` raises rather than searching everything. |
 | `k` | integer | ranking default | Max results. |
 | `cwd` | string | — | "Absolute path of the project directory this call is about, used to resolve scope='current'. Pass it on every call — one session can move between projects. Omit it only with an explicit scope ('all' or 'repo:<id>'); a directory outside registry.json is refused." |
+
+Hits from `search`, `cross_project` and `find_similar`, and `context_pack`
+cards, carry no `community_name`: the labels proved unreliable and cost payload
+without adding evidence.
 
 ### `cross_project`
 Explicit cross-repo hybrid search, optionally restricted to a list of repos.
@@ -155,9 +159,47 @@ Structural overview of one **registered** repo in the current generation: node
 count, community breakdown, top hub nodes. Takes a `repo_id` that must resolve
 against `registry.json` — never an arbitrary on-disk path.
 
+`community_breakdown` keeps only communities of 2 or more nodes, and at most
+the 25 largest (`COMMUNITY_MIN_SIZE`, `COMMUNITY_BREAKDOWN_LIMIT` in
+`server/project_map.py`). `communities_total` and `communities_omitted` report
+what the trim dropped. Community labels are orientation hints, not evidence:
+on cem.hub, `UserRoleEnum`, `AbstractCronJob` and `LockWeeks` share one
+unrelated label, and the untrimmed list was 128 entries, mostly singletons.
+`top_hubs` is unchanged.
+
 | Arg | Type | Notes |
 |-----|------|-------|
 | `repo` | string (required) | A registered `repo_id`. |
+
+### `neighbors`
+Exact traversal over chosen relation types inside one registered repo. It
+returns **every** node reachable over the indexed edges of those relations
+within `depth`, not a ranked top-k. This is the tool for roster questions that
+have a structural answer: all subclasses of a base class, all implementors of
+an interface, all importers of a module. On cem.hub, subclasses of
+`AbstractCronJob` return the same 19 classes as a grep for `extends`.
+
+| Arg | Type | Default | Notes |
+|-----|------|---------|-------|
+| `node` | string | — (required) | Durable key, graph node id, or label. Labels match exactly, then case-insensitively, then as a bare method name (`reminderSubmitWeek` matches `.reminderSubmitWeek()`). Several matches all become seeds. |
+| `repo` | string | — (required) | A registered, enabled `repo_id`. The traversal never leaves it. |
+| `relation` | string or string[] | — (required) | 1 to 16 relation names, e.g. `inherits`, `implements`, `imports`, `calls`. A name absent from the generation is an error that lists the names present. |
+| `direction` | string | — (required) | `in`: edges whose target is the current node (subclasses for `inherits`, importers for `imports`). `out`: edges whose source is the current node (parents for `inherits`). `both`: either. |
+| `depth` | integer | `1` | 1 to 16 hops. |
+| `include_inferred` | boolean | `false` | Also follow INFERRED-confidence edges. |
+
+The payload lists `seeds` and `nodes`. Each node carries `depth`, a citation,
+and `via`, the edges that reached it from the previous hop. `complete` is true
+unless the 2000-node cap truncated the result (`truncated`).
+`frontier_exhausted` says the walk ran out of new nodes before the depth limit.
+Nodes without a durable key are skipped and counted in `skipped_unkeyed`.
+
+`reliability` is `exact` unless the request followed `calls`,
+`indirect_call`, or INFERRED edges; then it is `partial` and `notes` says why.
+Call edges are incomplete: the extractor does not resolve method calls
+through typed properties, which is how dependency injection calls look. On
+cem.hub only 554 of 2797 PHP methods have any incoming call edge. A missing
+call edge is not evidence that no call exists.
 
 ### `context_pack`
 Evidence cards (citations, snippets, confidence) for a goal, truncated to a

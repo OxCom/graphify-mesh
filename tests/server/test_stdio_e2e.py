@@ -100,7 +100,14 @@ def test_stdio_initialize_and_tools_list_over_real_subprocess(tmp_path):
 
         list_resp = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         names = {t["name"] for t in list_resp["result"]["tools"]}
-        assert names == {"search", "cross_project", "find_similar", "project_map", "context_pack"}
+        assert names == {
+            "search",
+            "cross_project",
+            "find_similar",
+            "project_map",
+            "context_pack",
+            "neighbors",
+        }
     finally:
         proc.stdin.close()
         proc.wait(timeout=5)
@@ -197,7 +204,14 @@ def test_unparseable_json_line_gets_parse_error(tmp_path):
         _initialize(proc)
         list_resp = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         names = {t["name"] for t in list_resp["result"]["tools"]}
-        assert names == {"search", "cross_project", "find_similar", "project_map", "context_pack"}
+        assert names == {
+            "search",
+            "cross_project",
+            "find_similar",
+            "project_map",
+            "context_pack",
+            "neighbors",
+        }
     finally:
         proc.stdin.close()
         proc.wait(timeout=5)

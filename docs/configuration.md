@@ -142,7 +142,7 @@ them is in place, treat every secret in that file as reachable by every
 | `--registry PATH` | Override `GRAPHIFY_MESH_REGISTRY`. |
 | `--skip-labeling` / `--no-skip-labeling` | Skip / enforce the non-placeholder community-name check. |
 | `--skip-embedding` | Log-skip the embedding stage. |
-| `--allow-shrink` | Authorize publishing a smaller graph than the previous generation; also authorizes per-repo (per-project) shrink acceptance — a shrunken per-repo graph is accepted and state advances instead of being refused. |
+| `--allow-shrink` | Authorize publishing a smaller graph than the previous generation; also authorizes per-repo (per-project) shrink acceptance for **every** repo in the run — a shrunken per-repo graph is accepted and state advances instead of being refused. To approve one repo's shrink only, use `repos[].allow_shrink_once` in the registry instead. |
 | `--extract-concurrency N` | Override `GRAPHIFY_MESH_EXTRACT_CONCURRENCY` (default 2, floor 1). |
 | `-v`, `--verbose` | Debug logging. |
 
@@ -296,6 +296,7 @@ Source of truth for which repos are in the mesh. See
 | `repos[].root` | The repo's checkout directory. Resolved and required to land under an approved root (a scan root or an `external_roots` entry), same as `collection_path`: the pipeline stat-walks this path and hands it to `graphify update`/`extract`. |
 | `repos[].collection_path` | Directory holding that repo's `graph.json`. Two enabled entries whose paths RESOLVE to the same directory (symlinks and `..` segments included) block the run: concurrent per-repo workers would otherwise snapshot, rewrite and roll back the same `graph.json`. |
 | `repos[].enabled` | If `false`, the repo is skipped. |
+| `repos[].allow_shrink_once` | Optional. The source digest (`semantic_hash`, as printed in the shrink refusal's reason) of ONE refused shrink to authorize for THIS repo. Acceptance requires an exact match against the refused attempt; the token is then spent in per-repo state and the guard is armed again. Absent, `null` or `""` means armed; anything that is not a `^[0-9a-f]{8,64}$` token is a load-time error. Unlike `--allow-shrink` it never loosens the guard for another repo. |
 | `disabled` | List of `repo_id`s to force-disable. |
 | `external_roots` | Additional approved roots for symlink resolution. |
 

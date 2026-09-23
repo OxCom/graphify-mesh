@@ -25,7 +25,7 @@ from typing import Final
 
 # Hard per-message size cap for both transports. The shared HTTP daemon is one
 # process serving every local agent, so its memory is a machine-wide resource,
-# and no legitimate JSON-RPC frame for these five tools comes close to 4 MiB —
+# and no legitimate JSON-RPC frame for these six tools comes close to 4 MiB —
 # a lower ceiling is worth more here than matching stdio's earlier 10 MB.
 # Over-limit input is rejected without ever being buffered whole.
 MAX_MESSAGE_BYTES: Final = 4 * 1024 * 1024

@@ -72,8 +72,13 @@ class Generation:
         default_factory=dict
     )  # graph node id -> durable logical-ref key (C27)
     node_id_by_key: dict = field(default_factory=dict)  # inverse of key_by_node_id
+    # Every distinct link `relation` in the graph, so the `neighbors` tool can
+    # reject a misspelt relation without a full link scan per call. Assigned
+    # once, as a frozenset, at the end of `build_indexes`.
+    relations: frozenset[str] = field(default_factory=frozenset)
 
     def build_indexes(self) -> None:
+        relations: set[str] = set()
         for node in self.graph.get("nodes", []):
             if not isinstance(node, dict) or "id" not in node:
                 continue
@@ -93,6 +98,10 @@ class Generation:
                 continue
             self.adjacency.setdefault(src, []).append((dst, link))
             self.adjacency.setdefault(dst, []).append((src, link))
+            relation = link.get("relation")
+            if isinstance(relation, str) and relation:
+                relations.add(relation)
+        self.relations = frozenset(relations)
 
     def degree(self, node_id: str) -> int:
         return len(self.adjacency.get(node_id, []))

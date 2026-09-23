@@ -1,6 +1,6 @@
-"""`graphify-mesh` stdio MCP server (WS5 deliverable 2): wires the 5 hybrid/
-cross-project/evidence tools (`search`, `cross_project`, `find_similar`,
-`project_map`, `context_pack`) onto the MCP SDK's stdio transport
+"""`graphify-mesh` stdio MCP server (WS5 deliverable 2): wires the 6 hybrid/
+cross-project/evidence/traversal tools (`search`, `cross_project`,
+`find_similar`, `project_map`, `context_pack`, `neighbors`) onto the MCP SDK's stdio transport
 (`mcp.server.stdio.stdio_server`), wrapped by `stdio_guard.capped_stdin` for
 the line-size cap the SDK's own reader does not provide.
 
@@ -31,6 +31,8 @@ from graphify_mesh.server import context_pack as context_pack_mod
 from graphify_mesh.server import project_map as project_map_mod
 from graphify_mesh.server import ranking
 from graphify_mesh.server import similar as similar_mod
+from graphify_mesh.server import traverse as traverse_mod
+from graphify_mesh.server.citation import citation
 from graphify_mesh.server.config import ConfigError, ServerConfig
 from graphify_mesh.server.embed_query import make_embed_query_fn
 from graphify_mesh.server.retrieval import Hit, rank
@@ -41,7 +43,6 @@ from graphify_mesh.server.scope import (
     resolve_scope,
 )
 from graphify_mesh.server.store import Generation, GenerationStore, GenerationUnavailableError
-from graphify_mesh.sync.embedding import node_line
 from graphify_mesh.sync.perms import audit_config_permissions
 
 log = logging.getLogger("graphify_mesh.server.server")
@@ -141,9 +142,40 @@ def _validate_repos(arguments: dict) -> list[str] | None:
     return repos
 
 
-def _citation(repo: str, source_file: str, node: dict) -> str:
-    line = node_line(node)
-    return f"[{repo}:{source_file}:{line if line is not None else '?'}]"
+def _validate_relations(arguments: dict) -> list[str]:
+    """`relation` is one relation name or a list of 1..MAX_RELATIONS of them,
+    each a non-empty string of at most MAX_RELATION_LENGTH characters.
+    Returned sorted and deduplicated so the traversal and its payload are
+    order-independent."""
+    value = arguments.get("relation")
+    names = [value] if isinstance(value, str) else value
+    limit = traverse_mod.MAX_RELATIONS
+    length = traverse_mod.MAX_RELATION_LENGTH
+    message = (
+        f"'relation' must be a non-empty string or a list of 1..{limit} non-empty strings "
+        f"of at most {length} characters"
+    )
+    if not isinstance(names, list) or not 1 <= len(names) <= limit:
+        raise ToolError(message)
+    if any(not isinstance(name, str) or not name or len(name) > length for name in names):
+        raise ToolError(message)
+    return sorted(set(names))
+
+
+def _validate_direction(arguments: dict) -> str:
+    direction = arguments.get("direction")
+    if direction not in traverse_mod.DIRECTIONS:
+        raise ToolError(f"'direction' must be one of {', '.join(traverse_mod.DIRECTIONS)}")
+    return direction
+
+
+def _validate_depth(arguments: dict) -> int:
+    """Real int (bools excluded) in [1, traverse.MAX_DEPTH]."""
+    depth = arguments.get("depth", traverse_mod.DEFAULT_DEPTH)
+    maximum = traverse_mod.MAX_DEPTH
+    if isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= maximum:
+        raise ToolError(f"'depth' must be an integer between 1 and {maximum}")
+    return depth
 
 
 def _hit_to_dict(hit: Hit, generation: Generation) -> dict:
@@ -153,8 +185,7 @@ def _hit_to_dict(hit: Hit, generation: Generation) -> dict:
         "repo": hit.repo,
         "label": hit.label,
         "source_file": hit.source_file,
-        "citation": _citation(hit.repo, hit.source_file, node),
-        "community_name": hit.community_name,
+        "citation": citation(hit.repo, hit.source_file, node),
         "degree": hit.degree,
         "score": hit.score,
         "match_type": hit.match_type,
@@ -276,6 +307,8 @@ class GraphifyMeshServer:
                 "repo": repo,
                 "node_count": 0,
                 "community_breakdown": {},
+                "communities_total": 0,
+                "communities_omitted": 0,
                 "top_hubs": [],
                 "degraded": ["repo_not_registered"],
             }
@@ -286,6 +319,8 @@ class GraphifyMeshServer:
             "repo": result.repo,
             "node_count": result.node_count,
             "community_breakdown": result.community_breakdown,
+            "communities_total": result.communities_total,
+            "communities_omitted": result.communities_omitted,
             "top_hubs": result.top_hubs,
             "degraded": result.degraded,
         }
@@ -311,7 +346,6 @@ class GraphifyMeshServer:
                     "citation": c.citation,
                     "repo": c.repo,
                     "label": c.label,
-                    "community_name": c.community_name,
                     "confidence": c.confidence,
                     "snippet": c.snippet,
                     "snippet_source": c.snippet_source,
@@ -323,6 +357,43 @@ class GraphifyMeshServer:
             "truncated": result.truncated,
             "degraded": result.degraded,
         }
+
+    def tool_neighbors(self, arguments: dict) -> dict:
+        node = arguments.get("node")
+        if not isinstance(node, str) or not node:
+            raise ToolError("'node' must be a non-empty string (a key, node id, or label)")
+        repo = arguments.get("repo")
+        if not isinstance(repo, str) or not repo:
+            raise ToolError("'repo' must be a non-empty string (a registered repo_id)")
+        relations = _validate_relations(arguments)
+        direction = _validate_direction(arguments)
+        depth = _validate_depth(arguments)
+        include_inferred = arguments.get("include_inferred", False)
+        if not isinstance(include_inferred, bool):
+            raise ToolError("'include_inferred' must be a boolean")
+        # Same registered-and-enabled gate as project_map, checked before
+        # the generation is touched.
+        registered = {entry.repo_id for entry in self._registry_entries() if entry.enabled}
+        if repo not in registered:
+            return traverse_mod.NeighborsResult(
+                resolved=False,
+                repo=repo,
+                relations=relations,
+                direction=direction,
+                depth=depth,
+                include_inferred=include_inferred,
+                degraded=["repo_not_registered"],
+            ).as_dict()
+        generation = self._generation()
+        unknown = [name for name in relations if name not in generation.relations]
+        if unknown:
+            raise ToolError(
+                f"unknown relation(s) {', '.join(unknown)}; relations in the current "
+                f"generation: {', '.join(sorted(generation.relations)) or '(none)'}"
+            )
+        return traverse_mod.neighbors(
+            node, repo, relations, direction, depth, include_inferred, generation
+        ).as_dict()
 
     def _generation(self) -> Generation:
         try:
@@ -351,6 +422,7 @@ class GraphifyMeshServer:
         "find_similar": "tool_find_similar",
         "project_map": "tool_project_map",
         "context_pack": "tool_context_pack",
+        "neighbors": "tool_neighbors",
     }
 
     def tool_schemas(self) -> list[dict]:
@@ -454,6 +526,71 @@ class GraphifyMeshServer:
                         },
                     },
                     "required": ["goal"],
+                },
+            },
+            {
+                "name": "neighbors",
+                "description": (
+                    "Exact, COMPLETE traversal over chosen relation types inside one "
+                    "registered repo: every node reachable over the indexed edges of those "
+                    "relations within `depth`, not a ranked top-k like search. Use it for "
+                    "'all subclasses of X' (relation=inherits, direction=in) or 'everything "
+                    "that imports M' (relation=imports, direction=in). `complete` is false "
+                    "only when the node cap truncated the result. calls/indirect_call edges "
+                    "are incomplete (calls through typed properties / DI are not extracted), "
+                    "so a missing call edge is not evidence of no call; those results come "
+                    "back with reliability='partial'."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "node": {
+                            "type": "string",
+                            "description": (
+                                "Durable key, graph node id, or label (exact, then "
+                                "case-insensitive, then a bare method name as '.name()'). "
+                                "Several label matches all become seeds."
+                            ),
+                        },
+                        "repo": {"type": "string", "description": "Registered repo_id."},
+                        "relation": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "minItems": 1,
+                                    "maxItems": traverse_mod.MAX_RELATIONS,
+                                },
+                            ],
+                            "description": (
+                                "Relation name(s), e.g. inherits, implements, imports, "
+                                "calls. An unknown name is an error listing the known ones."
+                            ),
+                        },
+                        "direction": {
+                            "type": "string",
+                            "enum": list(traverse_mod.DIRECTIONS),
+                            "description": (
+                                "'in': edges whose TARGET is the current node (for "
+                                "inherits: its subclasses; for imports: its importers). "
+                                "'out': edges whose SOURCE is the current node (for "
+                                "inherits: its parents). 'both': either."
+                            ),
+                        },
+                        "depth": {
+                            "type": "integer",
+                            "default": traverse_mod.DEFAULT_DEPTH,
+                            "minimum": 1,
+                            "maximum": traverse_mod.MAX_DEPTH,
+                        },
+                        "include_inferred": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Also follow INFERRED-confidence edges.",
+                        },
+                    },
+                    "required": ["node", "repo", "relation", "direction"],
                 },
             },
         ]

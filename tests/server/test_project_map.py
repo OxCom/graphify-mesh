@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from conftest import build_generation, key_for, make_link, make_node
 
+from graphify_mesh.server import project_map as project_map_mod
 from graphify_mesh.server import ranking
 from graphify_mesh.server.project_map import project_map
 
@@ -23,7 +24,41 @@ def test_project_map_node_count_and_community_breakdown():
     result = project_map("repo.a", gen)
     assert result.resolved is True
     assert result.node_count == 3
-    assert result.community_breakdown == {"commerce": 2, "billing": 1}
+    # "billing" is a singleton: below COMMUNITY_MIN_SIZE, counted as omitted.
+    assert result.community_breakdown == {"commerce": 2}
+    assert result.communities_total == 2
+    assert result.communities_omitted == 1
+
+
+def test_project_map_community_breakdown_limit_and_omitted_counts():
+    limit = project_map_mod.COMMUNITY_BREAKDOWN_LIMIT
+    nodes = []
+    # limit + 3 communities of size 3 (names zero-padded so name order is
+    # numeric), then two singletons and one unassigned node.
+    for c in range(limit + 3):
+        for i in range(3):
+            nodes.append(
+                make_node("repo.a", f"N{c}_{i}", f"src/n{c}_{i}.py", community_name=f"c{c:03d}")
+            )
+    # One bigger community must sort first regardless of name.
+    for i in range(4):
+        nodes.append(make_node("repo.a", f"Z{i}", f"src/z{i}.py", community_name="zzz"))
+    nodes.append(make_node("repo.a", "S1", "src/s1.py", community_name="single1"))
+    nodes.append(make_node("repo.a", "S2", "src/s2.py", community_name="single2"))
+    nodes.append(make_node("repo.a", "U", "src/u.py"))
+    gen = build_generation(nodes)
+
+    result = project_map("repo.a", gen)
+    names = list(result.community_breakdown)
+    assert len(names) == limit
+    assert names[0] == "zzz"
+    assert names[1:] == [f"c{c:03d}" for c in range(limit - 1)]
+    assert all(
+        size >= project_map_mod.COMMUNITY_MIN_SIZE for size in result.community_breakdown.values()
+    )
+    # (limit + 3) sized + zzz + 2 singletons + unassigned
+    assert result.communities_total == limit + 3 + 1 + 2 + 1
+    assert result.communities_omitted == result.communities_total - limit
 
 
 def test_project_map_top_hubs_sorted_by_degree_desc_deterministic():

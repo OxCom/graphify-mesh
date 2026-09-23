@@ -33,8 +33,13 @@ def make_node(repo, label, source_file, node_id=None, line=1, community_name=Non
     return node
 
 
-def make_link(src_id: str, dst_id: str, confidence: str = "EXTRACTED") -> dict:
-    return {"source": src_id, "target": dst_id, "confidence": confidence}
+def make_link(
+    src_id: str, dst_id: str, confidence: str = "EXTRACTED", relation: str | None = None
+) -> dict:
+    link = {"source": src_id, "target": dst_id, "confidence": confidence}
+    if relation is not None:
+        link["relation"] = relation
+    return link
 
 
 def key_for(repo: str, node: dict) -> str:
