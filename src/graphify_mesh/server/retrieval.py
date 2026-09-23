@@ -100,6 +100,34 @@ def _repo_scores(repo_vectors: RepoVectors, normalized_query: np.ndarray) -> np.
     return repo_vectors.normalized() @ normalized_query
 
 
+def _embeddings_degraded_marker(
+    embeddings: dict[str, RepoVectors], embed_query_fn: EmbedQueryFn
+) -> str:
+    """The `degraded` entry for a call where the vector retriever contributed
+    nothing.
+
+    Two very different situations used to collapse onto the same bare
+    `"embeddings_unavailable"` string: a generation that published no vectors
+    at all (a build/config problem) and a query-time embed call that failed
+    (a backend problem). A client could not tell them apart, which is the
+    whole reason a wedged backend looked like a misconfiguration for a day.
+
+    The bare marker is kept for the not-published case — `store` already
+    reports it that way for the same condition, and it stays the stable
+    string those checks match. A query-time failure instead reports
+    `"embeddings_unavailable:<reason>"`, taking the reason from the
+    embedder when it exposes one; a plain callable (the `EmbedQueryFn`
+    contract is only `str -> list[float] | None`) has no reason to give, so
+    it falls back to the bare marker rather than inventing one.
+    """
+    if not embeddings:
+        return "embeddings_unavailable"
+    reason_fn = getattr(embed_query_fn, "failure_reason", None)
+    if not callable(reason_fn):
+        return "embeddings_unavailable"
+    return f"embeddings_unavailable:{reason_fn()}"
+
+
 def vector_candidates(
     query: str,
     embeddings: dict[str, RepoVectors],
@@ -110,8 +138,9 @@ def vector_candidates(
     """Returns (ranked keys, degraded). `degraded=True` means the vector
     retriever contributed nothing this call (no embeddings published this
     generation, or the query-embed call failed) — the caller renormalizes
-    fusion over whichever OTHER retrievers succeeded and must surface
-    `"embeddings_unavailable"` in the response's `degraded` field.
+    fusion over whichever OTHER retrievers succeeded and must surface the
+    marker `_embeddings_degraded_marker` builds in the response's `degraded`
+    field, which distinguishes those two causes.
 
     Scoring is matrix cosine similarity per repo: each `RepoVectors`
     matrix's L2-normalized copy is cached on the instance
@@ -264,8 +293,10 @@ def rank(
         vector_ranked, vec_degraded = vector_candidates(
             query, generation.embeddings, repo_filter, embed_query_fn
         )
-        if vec_degraded and "embeddings_unavailable" not in degraded:
-            degraded.append("embeddings_unavailable")
+        if vec_degraded:
+            vec_marker = _embeddings_degraded_marker(generation.embeddings, embed_query_fn)
+            if vec_marker not in degraded:
+                degraded.append(vec_marker)
 
         seed_for_structural = (exact_keys + lexical_ranked)[:10]
         structural_ranked = structural_candidates(
