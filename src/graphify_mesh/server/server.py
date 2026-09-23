@@ -430,9 +430,14 @@ class GraphifyMeshServer:
             {
                 "name": "search",
                 "description": (
-                    "Hybrid lexical+vector+structural search within a scope (current project "
-                    "by default). Fails closed if scope='current' can't be resolved against "
-                    "registry.json."
+                    "Find WHERE something lives in an indexed repository when you do not "
+                    "already know the file: a mechanism, a responsibility, an entry point, "
+                    "the code behind a behaviour. Answers 'roughly where does X happen' and "
+                    "'what handles Y' across a whole repo at once, including files a keyword "
+                    "search misses because the name never appears in them. Returns candidate "
+                    "places with repo, path, line and label — verify them in the source. Not "
+                    "for rosters, counts or literal config values. Scope defaults to the "
+                    "current project and fails closed outside a registered repo root."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -461,7 +466,12 @@ class GraphifyMeshServer:
             {
                 "name": "cross_project",
                 "description": (
-                    "Explicit cross-repo hybrid search, optionally restricted to a repo_id list."
+                    "Answer a question that spans repositories you do not have open: which "
+                    "projects use a dependency, who consumes an endpoint or queue, where a "
+                    "service is deployed, what else implements a pattern. Searches every "
+                    "indexed repository at once, so it reaches code outside the working "
+                    "directory that no local search can see. Returns candidate repositories "
+                    "and places to open, not a final roster."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -476,8 +486,11 @@ class GraphifyMeshServer:
             {
                 "name": "find_similar",
                 "description": (
-                    "Cross-project (and optionally same-project) structurally/semantically "
-                    "similar nodes to a given node/label."
+                    "Find an existing implementation to copy or stay consistent with: 'where "
+                    "else is this done', 'has someone already solved this', 'what is the "
+                    "analogous handler in another service'. Takes a node or label you already "
+                    "have and returns structurally and semantically similar code elsewhere, "
+                    "across projects by default."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -492,8 +505,11 @@ class GraphifyMeshServer:
             {
                 "name": "project_map",
                 "description": (
-                    "Structural overview of one registered repo in the current generation: "
-                    "node count, community breakdown, top hub nodes."
+                    "Get oriented in an unfamiliar repository before reading it: what the "
+                    "main parts are, which nodes everything depends on, how big it is. Use "
+                    "when you have just been pointed at a repo you do not know and need its "
+                    "shape. Explicit request only — it is an overview, never evidence for a "
+                    "specific claim."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -504,8 +520,11 @@ class GraphifyMeshServer:
             {
                 "name": "context_pack",
                 "description": (
-                    "Evidence cards (citations, snippets, confidence) for a goal, truncated "
-                    "to a token budget without ever splitting a card."
+                    "Use when a search has stalled: several rounds of grep and reading have "
+                    "not reduced the task to named files and symbols. Takes the task goal and "
+                    "returns a budgeted set of evidence cards — citation, snippet and "
+                    "confidence per card — so one call replaces the next several searches. "
+                    "Works within one repo or across all of them."
                 ),
                 "inputSchema": {
                     "type": "object",
