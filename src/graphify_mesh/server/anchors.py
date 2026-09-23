@@ -100,6 +100,8 @@ def _neighbor_keys(
         return set()
     keys: set[str] = set()
     for neighbor_id, edge in generation.adjacency.get(node_id, []):
+        # Ignores the caller's `include_inferred` on purpose: a pin must rest
+        # on EXTRACTED evidence only.
         if not ranking.edge_followable(edge, include_inferred=False):
             continue
         neighbor_key = generation.key_by_node_id.get(neighbor_id)
@@ -145,11 +147,15 @@ def _candidate_scores(
     neighbors_by_key = {key: _neighbor_keys(key, generation, repo_filter) for key in via}
     needed = [t for t in tokens if any(t not in via_tokens for via_tokens in via.values())]
 
+    # idf is corpus-wide by design (one df table per generation), not per
+    # scope, so under `repo:<id>` it and ANCHOR_MIN_SCORE stay corpus-relative.
+    # Clamped at 0: a v2 index without `doc_freq.global` counts field
+    # postings, so df can exceed total_docs.
     total_docs = lexical_read.document_count(generation.lexical)
     token_idf: dict[str, float] = {}
     for token in needed:
         df = _doc_freq(token, generation, cache)
-        token_idf[token] = math.log(total_docs / df) if df > 0 and total_docs > 0 else 0.0
+        token_idf[token] = max(0.0, math.log(total_docs / df)) if df > 0 and total_docs > 0 else 0.0
 
     token_keys: dict[str, set[str]] = {}
     if cache.doc_ids_by_key is None:

@@ -268,7 +268,7 @@ import json, os, sys, urllib.error, urllib.request
 
 url = sys.argv[1]
 token = os.environ["GRAPHIFY_MESH_HTTP_TOKEN"]
-EXPECTED = {"search", "cross_project", "find_similar", "project_map", "context_pack"}
+EXPECTED = {"search", "cross_project", "find_similar", "project_map", "neighbors", "context_pack"}
 
 
 def post(payload, bearer):

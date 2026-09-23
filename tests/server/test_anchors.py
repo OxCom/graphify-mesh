@@ -186,9 +186,7 @@ def test_repo_filter_excludes_other_repo_anchors():
     assert all(h.match_type != "anchor" for h in result.hits)
 
 
-def _scores_both_paths(monkeypatch, query, gen, repo_filter):
-    """Per-candidate scores from the v3 probe path and the full-set path
-    (forced by making `doc_ids_by_key` report a v2 index)."""
+def _tokens_and_via(query, gen, repo_filter):
     tokens = list(dict.fromkeys(anchors.tokenize_text(query)))
     via: dict[str, set[str]] = {}
     for token in tokens:
@@ -197,6 +195,13 @@ def _scores_both_paths(monkeypatch, query, gen, repo_filter):
             if 1 <= len(members) <= anchors.ANCHOR_MAX_ALIAS_MEMBERS:
                 for key in members:
                     via.setdefault(key, set()).add(token)
+    return tokens, via
+
+
+def _scores_both_paths(monkeypatch, query, gen, repo_filter):
+    """Per-candidate scores from the v3 probe path and the full-set path
+    (forced by making `doc_ids_by_key` report a v2 index)."""
+    tokens, via = _tokens_and_via(query, gen, repo_filter)
     monkeypatch.setattr(anchors, "_cache", None)
     probe = anchors._candidate_scores(tokens, via, gen, repo_filter)
     with monkeypatch.context() as patch:
@@ -267,3 +272,72 @@ def test_cache_is_rebuilt_when_generation_changes():
     third = build_generation(_fillers() + nodes, links=links, generation_id="gen-b")
     assert anchors.anchor_keys(QUERY, third, None, exclude=set()) == [anchor_key]
     assert anchors._cache.generation() is third
+
+
+def test_df_above_document_count_contributes_zero_not_negative(monkeypatch):
+    # A v2 index without `doc_freq.global` counts field postings, so df can
+    # exceed the document count; that token must add 0, never subtract.
+    nodes, links = _controller("repo.a", "TeamsController")
+    gen = build_generation(_fillers() + nodes, links=links)
+    tokens, via = _tokens_and_via(QUERY, gen, None)
+    total_docs = lexical_read.document_count(gen.lexical)
+    real_doc_freq = anchors._doc_freq
+
+    def scores_with_access_df(df):
+        with monkeypatch.context() as patch:
+            patch.setattr(anchors, "_cache", None)
+            patch.setattr(
+                anchors,
+                "_doc_freq",
+                lambda token, *a: df if token == "access" else real_doc_freq(token, *a),
+            )
+            return anchors._candidate_scores(tokens, via, gen, None)
+
+    zero_idf = scores_with_access_df(total_docs)
+    assert zero_idf[0][1] > 0
+    assert scores_with_access_df(total_docs * 3) == zero_idf
+
+
+@pytest.mark.parametrize(
+    ("scores", "pinned"),
+    [
+        ([("A", 30.0), ("B", 14.0), ("C", 6.0)], ["A", "B"]),
+        ([("A", 30.0), ("B", 14.0), ("C", 8.0)], ["A"]),
+        ([("A", 30.0), ("B", 9.0)], ["A"]),
+        # C also clears the floor and dominates D, but the cap stops at two.
+        ([("A", 100.0), ("B", 40.0), ("C", 16.0), ("D", 6.0)], ["A", "B"]),
+    ],
+)
+def test_second_pin_needs_its_own_dominance_and_cap_is_two(monkeypatch, scores, pinned):
+    nodes, links = _controller("repo.a", "TeamsController")
+    gen = build_generation(_fillers() + nodes, links=links)
+    monkeypatch.setattr(anchors, "_candidate_scores", lambda *a: scores)
+
+    assert anchors.anchor_keys(QUERY, gen, None, exclude=set()) == pinned
+
+
+def test_anchor_hits_truncated_to_k(monkeypatch):
+    teams, teams_links = _controller("repo.a", "TeamsController")
+    users, users_links = _controller("repo.a", "UsersController")
+    gen = build_generation(_fillers() + teams + users, links=teams_links + users_links)
+    first, second = key_for("repo.a", teams[0]), key_for("repo.a", users[0])
+    monkeypatch.setattr(anchors, "anchor_keys", lambda *a, **kw: [first, second])
+
+    result = rank(QUERY, gen, None, k=1, embed_query_fn=fake_embed_query_fn())
+
+    assert [(h.key, h.match_type) for h in result.hits] == [(first, "anchor")]
+
+
+def test_exact_hit_filling_k_skips_anchor_lookup(monkeypatch):
+    exact = make_node("repo.a", QUERY, "src/misc/e.py", node_id="exact")
+    nodes, links = _controller("repo.a", "TeamsController")
+    gen = build_generation(_fillers() + [exact] + nodes, links=links)
+
+    def fail(*_a, **_kw):
+        raise AssertionError("anchor_keys consulted with no slot left")
+
+    monkeypatch.setattr(anchors, "anchor_keys", fail)
+
+    result = rank(QUERY, gen, None, k=1, embed_query_fn=fake_embed_query_fn())
+
+    assert [(h.key, h.match_type) for h in result.hits] == [(key_for("repo.a", exact), "exact")]

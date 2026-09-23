@@ -170,7 +170,8 @@ body {
   border-radius: 0.3rem;
 }
 
-.markdown-body pre {
+.markdown-body pre,
+.markdown-body .highlight pre {
   color: #c9d8ea;
   background: #080d17;
   border: 1px solid var(--mesh-border);
@@ -178,7 +179,8 @@ body {
   box-shadow: inset 0 1px rgba(255, 255, 255, 0.025);
 }
 
-.markdown-body pre code {
+.markdown-body pre code,
+.markdown-body .highlight pre code {
   color: inherit;
   background: transparent;
   border: 0;
@@ -190,13 +192,22 @@ body {
 
 .highlight .c,
 .highlight .c1,
-.highlight .cm {
+.highlight .cm,
+.highlight .cd,
+.highlight .cs,
+.highlight .cp {
   color: #6f849e;
 }
 
 .highlight .k,
+.highlight .kc,
 .highlight .kd,
 .highlight .kn,
+.highlight .kp,
+.highlight .kr,
+.highlight .kv,
+.highlight .ow,
+.highlight .o,
 .highlight .nt {
   color: var(--mesh-violet);
 }
@@ -204,8 +215,66 @@ body {
 .highlight .s,
 .highlight .s1,
 .highlight .s2,
+.highlight .sb,
+.highlight .sc,
+.highlight .sd,
+.highlight .se,
+.highlight .sh,
+.highlight .si,
+.highlight .sx,
+.highlight .sr,
+.highlight .ss,
 .highlight .nb {
   color: var(--mesh-code);
+}
+
+.highlight .nc,
+.highlight .nf,
+.highlight .ne,
+.highlight .nl,
+.highlight .nd,
+.highlight .nn,
+.highlight .kt,
+.highlight .ni {
+  color: var(--mesh-cyan);
+}
+
+.highlight .m,
+.highlight .mb,
+.highlight .mf,
+.highlight .mh,
+.highlight .mi,
+.highlight .mo,
+.highlight .mx,
+.highlight .il {
+  color: #f5c07a;
+}
+
+.highlight .gp,
+.highlight .gh,
+.highlight .gu,
+.highlight .go,
+.highlight .w {
+  color: var(--mesh-muted);
+}
+
+.highlight .err {
+  color: #ff8a8a;
+  background: transparent;
+}
+
+.highlight .gd {
+  color: #ff9c9c;
+  background: rgba(255, 90, 90, 0.12);
+}
+
+.highlight .gi {
+  color: #9ff0b8;
+  background: rgba(90, 255, 140, 0.1);
+}
+
+.highlight .ge {
+  color: inherit;
 }
 
 .markdown-body table tr {

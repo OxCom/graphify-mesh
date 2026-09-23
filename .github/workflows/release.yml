@@ -221,3 +221,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
+
+  # gh-pages only stores the index; pages.yml is what serves it. Redeploy here
+  # so the new release shows up on /simple/ without waiting for a docs change.
+  # A called workflow cannot hold more permissions than its calling job, so
+  # this job grants the union of what pages.yml's build and deploy jobs need.
+  pages:
+    needs: [publish-index]
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/pages.yml

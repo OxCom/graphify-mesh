@@ -138,7 +138,9 @@ exact alias of the node (FQCN, label, bare method name, file basename), then
 scored by the idf of the other query tokens found in its own fields and in its
 depth-1 EXTRACTED neighbours. At most two candidates are pinned, each only if it
 scores at least 10 and at least twice the next candidate; otherwise no `anchor`
-hit appears and ranking is unchanged.
+hit appears and ranking is unchanged. The idf is corpus-wide, not per scope.
+`cross_project` and `context_pack` rank through the same code, so anchors apply
+to them as well.
 
 Hits from `search`, `cross_project` and `find_similar`, and `context_pack`
 cards, carry no `community_name`: the labels proved unreliable and cost payload

@@ -1,0 +1,96 @@
+name: Pages
+
+# The site is two sources joined at deploy time: the Jekyll landing page from
+# docs/ on main, and the PEP 503 index that release.yml stores on the gh-pages
+# branch. A branch-based Pages source can serve only one of them, which is why
+# /simple/ returned 404 while the landing page worked.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+  # release.yml calls this after publish-index, so a new release goes live
+  # without waiting for the next docs change.
+  workflow_call:
+
+# Default deny; each job below requests only what it needs.
+permissions: {}
+
+# One deployment at a time, and never cancel one in flight: a cancelled deploy
+# can leave the site on a half-finished release. Queued runs still collapse.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Always main: a release run starts from a tag ref, but the site shows the
+      # docs as they are on main.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Check whether gh-pages exists
+        # Same check as release.yml: actions/checkout fails noisily on a ref
+        # that does not exist, which is the state before the first release.
+        id: gh-pages-check
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out gh-pages
+        if: steps.gh-pages-check.outputs.exists == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: gh-pages
+          path: index-branch
+          persist-credentials: false
+
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Build the landing page
+        uses: actions/jekyll-build-pages@44a6e6beabd48582f863aeeb6cb2151cc1716697 # v1.0.13
+        with:
+          source: ./docs
+          destination: ./_site
+
+      - name: Add the simple index
+        if: steps.gh-pages-check.outputs.exists == 'true'
+        # jekyll-build-pages runs in a container and leaves _site owned by
+        # root, so the runner user needs sudo to write into it.
+        run: |
+          if [ -d index-branch/simple ]; then
+            sudo mkdir -p _site/simple
+            sudo cp -a index-branch/simple/. _site/simple/
+          else
+            echo "gh-pages has no simple/ tree; deploying the landing page only"
+          fi
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ./_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+      contents: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

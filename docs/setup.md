@@ -42,10 +42,11 @@ This provides three console scripts: `graphify-mesh-sync`,
 
 ### Installing from the project's own package index
 
-graphify-mesh is published to a PEP 503 "simple" index, built and pushed to
-the `gh-pages` branch of this repository by the release workflow
-(`.github/workflows/release.yml`). Once Pages is enabled on the repo, install
-a specific version with:
+graphify-mesh is published to a PEP 503 "simple" index. The release workflow
+(`.github/workflows/release.yml`) stores the index on the `gh-pages` branch.
+The Pages workflow (`.github/workflows/pages.yml`) deploys the docs landing
+page and that index together, so the repository's Pages source must be set to
+"GitHub Actions". Install a specific version with:
 
 ```bash
 pip install \
