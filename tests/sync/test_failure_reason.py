@@ -1,4 +1,5 @@
 """The failure reason must carry the END of stderr and persist the whole of it."""
+
 from pathlib import Path
 
 from graphify_mesh.sync.sync_project import (
