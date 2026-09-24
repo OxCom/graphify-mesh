@@ -196,15 +196,11 @@ def make_embed_query_fn(
     resolved_timeout = (
         timeout
         if timeout is not None
-        else _positive_float_env(
-            "GRAPHIFY_MESH_QUERY_EMBED_TIMEOUT", DEFAULT_QUERY_EMBED_TIMEOUT
-        )
+        else _positive_float_env("GRAPHIFY_MESH_QUERY_EMBED_TIMEOUT", DEFAULT_QUERY_EMBED_TIMEOUT)
     )
     resolved_cooldown = (
         cooldown
         if cooldown is not None
-        else _positive_float_env(
-            "GRAPHIFY_MESH_QUERY_EMBED_COOLDOWN", DEFAULT_FAILURE_COOLDOWN
-        )
+        else _positive_float_env("GRAPHIFY_MESH_QUERY_EMBED_COOLDOWN", DEFAULT_FAILURE_COOLDOWN)
     )
     return QueryEmbedder(resolved_base_url, resolved_model, resolved_timeout, resolved_cooldown)

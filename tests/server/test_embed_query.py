@@ -29,8 +29,7 @@ class _Recorder:
 
 def _timeout(_inputs):
     raise RuntimeError(
-        "embed_batch request to https://backend:11434/api/embed failed: "
-        "<urlopen error timed out>"
+        "embed_batch request to https://backend:11434/api/embed failed: <urlopen error timed out>"
     )
 
 
