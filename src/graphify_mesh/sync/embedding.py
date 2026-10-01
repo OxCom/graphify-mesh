@@ -113,6 +113,26 @@ SNIPPET_READ_LINE_CAP = 4000
 # pieces above were individually bounded.
 EMBED_INPUT_MAX_CHARS = 3000
 
+# Context window requested for the embedding model, overridable with
+# GRAPHIFY_MESH_EMBED_NUM_CTX.
+#
+# The model's own default is 4096, and on a shared GPU that default is expensive: measured
+# 2026-09-30 on the live host, `qwen3-embedding:0.6b` occupied 2.37 GB of VRAM of which
+# only 0.64 GB is weights — the remaining 1.73 GB was KV cache for a window nothing uses.
+# Measured over 1500 cem.hub nodes, the actual embed input runs 621 chars at the median,
+# 820 at p99 and 831 at the maximum, because SNIPPET_MAX_CHARS caps the source window at
+# 800 long before EMBED_INPUT_MAX_CHARS could bite. That is about 332 tokens at a dense
+# code ratio, so 1024 leaves threefold headroom over the worst case observed.
+#
+# What it buys: the labeling model `qwen2.5-coder:7b` needs 4.68 GB of weights and was
+# getting 4.25 GB of VRAM with the embedder resident, so 27% of it ran on CPU and the
+# naming stage took 38 minutes against the 12.2 s per 100-community batch measured when
+# it fits. Freeing ~1.3 GB here is what lets it fit.
+#
+# Raise this if snippets grow: a value below the real input length truncates silently and
+# degrades the vector, with no error anywhere. The check is the measurement above, rerun.
+EMBED_NUM_CTX = int(os.environ.get("GRAPHIFY_MESH_EMBED_NUM_CTX", "1024"))
+
 # Skip heuristic: trivial one-line accessors are not worth an embedding call.
 # A node is "trivial" iff its label matches this accessor-naming pattern AND
 # its snippet (once built) has at most TRIVIAL_MAX_SNIPPET_LINES non-blank
@@ -484,7 +504,12 @@ def embed_batch(
     shown_url = display_url(url)
     if not is_valid_http_base_url(url):
         raise RuntimeError(f"embed_batch refused non-http(s) URL: {shown_url!r}")
-    payload = json.dumps({"model": model, "input": inputs}).encode("utf-8")
+    # `options.num_ctx` is honoured by /api/embed and decides the KV cache Ollama keeps
+    # resident for this model; see EMBED_NUM_CTX for why the default is well under the
+    # model's own.
+    payload = json.dumps(
+        {"model": model, "input": inputs, "options": {"num_ctx": EMBED_NUM_CTX}}
+    ).encode("utf-8")
     req = urllib.request.Request(  # noqa: S310 - scheme validated above
         url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
     )

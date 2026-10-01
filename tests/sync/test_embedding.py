@@ -160,7 +160,15 @@ def test_embed_batch_request_shape_matches_verified_native_contract(monkeypatch)
     # C9: native endpoint, NOT /v1/embeddings.
     assert captured["url"] == "https://ollama.example.com:11434/api/embed"
     assert captured["method"] == "POST"
-    assert captured["body"] == {"model": "qwen3-embedding:0.6b", "input": ["a", "b"]}
+    # `options.num_ctx` is part of the contract since 2026-09-30: the model's own default
+    # window costs 2.37 GB of VRAM against 0.64 GB of weights, and the measured embed input
+    # tops out around 332 tokens, so the request pins a small window. Dropping it silently
+    # restores the default and pushes the labeling model onto the CPU.
+    assert captured["body"] == {
+        "model": "qwen3-embedding:0.6b",
+        "input": ["a", "b"],
+        "options": {"num_ctx": embedding.EMBED_NUM_CTX},
+    }
     assert vectors == [[0.1, 0.2], [0.3, 0.4]]
 
 

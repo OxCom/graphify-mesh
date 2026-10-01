@@ -11,6 +11,7 @@ side does (`graphify/serve.py`), and it applies none of those heuristics.
 
 from __future__ import annotations
 
+import os
 import networkx as nx
 from networkx.readwrite import json_graph
 
@@ -65,6 +66,26 @@ def hub_names(G: nx.Graph, communities: dict[int, list[str]]) -> dict[int, str]:
     return label_communities_by_hub(G, communities)
 
 
+_LABEL_BATCH_SIZE_DEFAULT = 50
+
+
+def _label_batch_size() -> int:
+    """Communities per labeling call, overridable with GRAPHIFY_LABEL_BATCH_SIZE.
+
+    Read per call rather than at import so a test, or an operator editing the env file
+    the sync unit reads, does not need this module reloaded to take effect.
+    """
+    raw = os.environ.get("GRAPHIFY_LABEL_BATCH_SIZE", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return _LABEL_BATCH_SIZE_DEFAULT
+
+
 def llm_names(
     G: nx.Graph,
     communities: dict[int, list[str]],
@@ -91,6 +112,29 @@ def llm_names(
     # `Settings.ollama_api_timeout` bounds, so the fan-out was spending the
     # timeout budget it had no way to earn back. The 2026-09-21 production run
     # degraded 14 communities to provisional names this way.
+    # batch_size against upstream's default of 100 (_LABEL_BATCH_SIZE, graphify's
+    # llm.py). That default is sized by context window, and the window was never the
+    # binding constraint: measured 2026-10-01 through the shim at num_ctx=16384, a
+    # 100-community prompt is 6.3k tokens and no reply was ever truncated. What a long
+    # list costs is attention, not context — the model answers the first stretch of it
+    # and stops. Same model, same communities, same prompt:
+    #
+    #   batch=100  53/100 names  1 call   15.1 s
+    #   batch= 50  95/100 names  2 calls  21.2 s
+    #   batch= 25  94/100 names  4 calls  15.4 s
+    #
+    # 25 buys nothing over 50, so 50 is the knee. The extra call is far cheaper than an
+    # unnamed community: upstream re-asks the missing ids in split batches, and whatever
+    # is still missing ships into the graph as a `Community N` placeholder.
+    #
+    # This is passed from here rather than patched into graphify because graphify is a
+    # third-party package (github.com/Graphify-Labs/graphify) — a local edit there is
+    # lost on the next upgrade, silently. `batch_size` is a documented keyword argument,
+    # so nothing has to be forked to set it.
+    #
+    # Re-measure when the labeling model changes: the knee is a property of the model's
+    # attention over a long list, not of graphify or of the window.
     return generate_community_labels(
-        G, communities, backend=backend, model=model, quiet=True, max_concurrency=1
+        G, communities, backend=backend, model=model, quiet=True,
+        max_concurrency=1, batch_size=_label_batch_size(),
     )
