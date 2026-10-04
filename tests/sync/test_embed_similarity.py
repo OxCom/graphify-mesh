@@ -397,9 +397,9 @@ def test_pairs_ordered_by_score_across_seed_keys(monkeypatch):
     tilts = {"a1": 0.5, "a2": 0.3, "a3": 0.0}
     vectors_by_repo = {
         "repo.a": _rv({key: [1.0, tilt, 0.0, 0.0] for key, tilt in tilts.items()}),
-        "repo.b": _rv({"b1": [1.0, 0.5, 0.0, 0.0],
-                       "b2": [1.0, 0.3, 0.0, 0.0],
-                       "b3": [1.0, 0.0, 0.0, 0.0]}),
+        "repo.b": _rv(
+            {"b1": [1.0, 0.5, 0.0, 0.0], "b2": [1.0, 0.3, 0.0, 0.0], "b3": [1.0, 0.0, 0.0, 0.0]}
+        ),
     }
     pairs = embed_similarity.mutual_top_k_pairs(vectors_by_repo, top_k=1, threshold=0.5)
 

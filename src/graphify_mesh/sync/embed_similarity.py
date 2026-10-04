@@ -145,11 +145,40 @@ LANGUAGE_FAMILIES = (
 #
 # Calibration still reads copies of ANY extension — a shared `composer.json` is a fine
 # measuring stick for what "identical" scores in a repo pair. Only emission is restricted.
-CODE_EXTENSIONS = frozenset({
-    ".php", ".py", ".go", ".rb", ".java", ".kt", ".cs", ".rs", ".swift", ".scala",
-    ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue",
-    ".c", ".h", ".cc", ".cpp", ".hpp", ".m", ".mm", ".pp", ".scss", ".css", ".sql",
-})
+CODE_EXTENSIONS = frozenset(
+    {
+        ".php",
+        ".py",
+        ".go",
+        ".rb",
+        ".java",
+        ".kt",
+        ".cs",
+        ".rs",
+        ".swift",
+        ".scala",
+        ".ts",
+        ".tsx",
+        ".mts",
+        ".cts",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".vue",
+        ".c",
+        ".h",
+        ".cc",
+        ".cpp",
+        ".hpp",
+        ".m",
+        ".mm",
+        ".pp",
+        ".scss",
+        ".css",
+        ".sql",
+    }
+)
 
 # Candidate generation floor. It must sit CLEARLY below every threshold the rules above
 # can produce, for two reasons found by measurement on 2026-09-30. A floor equal to the
@@ -236,7 +265,7 @@ def _bucket_signature_batch(matrix: np.ndarray, planes: np.ndarray) -> list[str]
 
 
 def _exact_pairs(
-    vectors_by_repo: dict[str, "RepoVectors"],
+    vectors_by_repo: dict[str, RepoVectors],
     repo_ids: list[str],
     keys: list[str],
     row_refs: list[tuple[str, int]],
@@ -357,9 +386,7 @@ def mutual_top_k_pairs(
         return []
 
     if len(keys) <= EXACT_MAX_ROWS:
-        return _exact_pairs(
-            vectors_by_repo, kept_repo_ids, keys, row_refs, top_k, threshold
-        )
+        return _exact_pairs(vectors_by_repo, kept_repo_ids, keys, row_refs, top_k, threshold)
 
     log.warning(
         "similar_approach: %d rows exceeds EXACT_MAX_ROWS=%d — falling back to LSH "

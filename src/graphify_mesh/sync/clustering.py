@@ -12,6 +12,7 @@ side does (`graphify/serve.py`), and it applies none of those heuristics.
 from __future__ import annotations
 
 import os
+
 import networkx as nx
 from networkx.readwrite import json_graph
 
@@ -135,6 +136,11 @@ def llm_names(
     # Re-measure when the labeling model changes: the knee is a property of the model's
     # attention over a long list, not of graphify or of the window.
     return generate_community_labels(
-        G, communities, backend=backend, model=model, quiet=True,
-        max_concurrency=1, batch_size=_label_batch_size(),
+        G,
+        communities,
+        backend=backend,
+        model=model,
+        quiet=True,
+        max_concurrency=1,
+        batch_size=_label_batch_size(),
     )

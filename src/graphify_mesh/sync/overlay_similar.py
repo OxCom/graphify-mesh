@@ -33,8 +33,8 @@ from graphify_mesh.sync.embed_similarity import (
     CODE_EXTENSIONS,
     CROSS_LANGUAGE_THRESHOLD,
     IDENTITY_FLOOR,
-    LANGUAGE_FAMILIES,
     IDENTITY_RELATIVE,
+    LANGUAGE_FAMILIES,
     MIN_CALIBRATION_COPIES,
     SIMILARITY_THRESHOLD_DEFAULT,
     mutual_top_k_pairs,
@@ -193,16 +193,10 @@ def _calibrated_line(
       constant, so the strictest of those is used before falling back.
     * The constant remains the last resort, for a pair with no family calibration at all.
     """
-    lines = [
-        admit[(repo_pair_key, ext)]
-        for ext in (ext_a, ext_b)
-        if (repo_pair_key, ext) in admit
-    ]
+    lines = [admit[(repo_pair_key, ext)] for ext in (ext_a, ext_b) if (repo_pair_key, ext) in admit]
     if lines:
         return max(lines)
-    family = next(
-        (f for f in LANGUAGE_FAMILIES if ext_a in f or ext_b in f), frozenset()
-    )
+    family = next((f for f in LANGUAGE_FAMILIES if ext_a in f or ext_b in f), frozenset())
     family_lines = [
         line
         for (pair_key, ext), line in admit.items()
