@@ -94,6 +94,7 @@ def decide_action(
     current_manifest: SourceDigest,
     has_graph: bool,
     shrink_grant: str | None = None,
+    ast_only: bool = False,
 ) -> str:
     if not has_graph:
         return ACTION_BOOTSTRAP
@@ -103,6 +104,10 @@ def decide_action(
         # cheap AST refresh rather than forcing an LLM extract every run.
         return ACTION_UPDATE
     if current_manifest.semantic_hash != prior_state.get("semantic_hash"):
+        if ast_only:
+            # The refusal-streak hold below exists for the non-deterministic
+            # extractor; an AST update is deterministic and cheap, so it always runs.
+            return ACTION_UPDATE
         # Break the refusal loop: if this exact source digest has already been
         # refused REFUSAL_RETRY_LIMIT times, re-running the extractor on
         # unchanged input just burns GPU for another refusal. Hold the last-good

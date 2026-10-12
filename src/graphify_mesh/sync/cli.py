@@ -100,6 +100,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_false",
         help="(default) Run the embedding stage.",
     )
+    # Default None, not False: neither flag leaves GRAPHIFY_MESH_AST_ONLY in charge.
+    parser.add_argument(
+        "--ast-only",
+        action="store_true",
+        default=None,
+        help=(
+            "Run `graphify update` (local AST) instead of LLM `extract` for changed repos. "
+            "Default: GRAPHIFY_MESH_AST_ONLY, else off."
+        ),
+    )
+    parser.add_argument(
+        "--no-ast-only",
+        dest="ast_only",
+        action="store_false",
+        help="Run LLM `extract` for changed repos even when GRAPHIFY_MESH_AST_ONLY=1.",
+    )
     parser.add_argument(
         "--allow-shrink",
         action="store_true",
@@ -119,19 +135,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(sys.argv[1:] if argv is None else argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s %(name)s: %(message)s",
-    )
-
+def build_overrides(args: argparse.Namespace) -> dict:
+    """The Settings.from_env overrides a parsed command line asks for. Absent keys
+    leave the environment's value in place."""
     overrides: dict = {
         "dry_run": args.dry_run,
         "skip_labeling": args.skip_labeling,
         "skip_embedding": args.skip_embedding,
         "allow_shrink": args.allow_shrink,
     }
+    # Only an explicit flag overrides, either way: the absent case must not mask
+    # GRAPHIFY_MESH_AST_ONLY=1, and --no-ast-only must beat it.
+    if args.ast_only is not None:
+        overrides["ast_only"] = args.ast_only
     if args.extract_concurrency is not None:
         # Same hard floor as the env-var path (_extract_concurrency_from_env):
         # a bad/too-low CLI value degrades to fully sequential rather than
@@ -143,7 +159,17 @@ def main(argv: list[str] | None = None) -> int:
         # shallowest scan rather than a zero/negative-depth walk, and a
         # too-high value is capped rather than triggering an unbounded walk.
         overrides["scan_depth"] = min(max(args.scan_depth, SCAN_MIN_DEPTH), SCAN_MAX_DEPTH)
+    return overrides
 
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
+    overrides = build_overrides(args)
     settings = Settings.from_env(
         mesh_root=args.mesh_root,
         scan_roots=args.scan_roots,

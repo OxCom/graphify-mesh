@@ -892,7 +892,9 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             prior_state = state.get(entry.repo_id)
             shrink_grant = _shrink_grant_for(entry, prior_state)
             shrink_grants[entry.repo_id] = shrink_grant
-            action = decide_action(prior_state, current_manifest, has_graph, shrink_grant)
+            action = decide_action(
+                prior_state, current_manifest, has_graph, shrink_grant, ast_only=settings.ast_only
+            )
             log.info("[%d/%d] %s: %s ...", i, total_active, entry.repo_id, action)
             bar.tick(i - 1, f"{entry.repo_id}: {action} ...")
 

@@ -505,6 +505,12 @@ class Settings:
     dry_run: bool = False
     skip_labeling: bool = False
     skip_embedding: bool = False
+    # Changed repos get local `graphify update` instead of LLM `extract`: measured
+    # 2026-10-12, 0 of 100 search hits came from LLM-extracted nodes (1-2% of a graph).
+    # Bootstrap is unaffected. Env GRAPHIFY_MESH_AST_ONLY=1 or CLI --ast-only.
+    ast_only: bool = field(
+        default_factory=lambda: os.environ.get("GRAPHIFY_MESH_AST_ONLY", "0") == "1"
+    )
     allow_shrink: bool = False
     ollama_base_url: str = field(
         default_factory=lambda: os.environ.get(
