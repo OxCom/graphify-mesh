@@ -28,15 +28,13 @@ def test_ast_only_turns_extract_into_update():
 def test_ast_only_docs_only_change_still_updates():
     # Code unchanged, docs changed: UPDATE rather than SKIP so the manifest advances.
     assert (
-        decide_action(PRIOR, digest(code="c1", semantic="s2"), True, ast_only=True)
-        == ACTION_UPDATE
+        decide_action(PRIOR, digest(code="c1", semantic="s2"), True, ast_only=True) == ACTION_UPDATE
     )
 
 
 def test_ast_only_code_change_updates():
     assert (
-        decide_action(PRIOR, digest(code="c2", semantic="s1"), True, ast_only=True)
-        == ACTION_UPDATE
+        decide_action(PRIOR, digest(code="c2", semantic="s1"), True, ast_only=True) == ACTION_UPDATE
     )
 
 

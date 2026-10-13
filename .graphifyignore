@@ -5,7 +5,6 @@
 .cache/
 
 docs/
-tests/
 graphify-out
 graphify-out/
 
