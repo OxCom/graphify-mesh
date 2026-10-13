@@ -319,6 +319,19 @@ def _reuse_is_safe(
     return not any(e.provisional for e in state.communities.values())
 
 
+def _orphan_name(label: str) -> str:
+    """Readable final name for an edgeless single-node community.
+
+    The LLM sees only the mangled id of such a node and no neighbours, so it
+    returns nothing usable; the label itself is all the context there is.
+    """
+    spaced = label.removeprefix("ref_").translate(str.maketrans("_/\\.-", "     "))
+    name = " ".join(spaced.split())
+    if not name or PLACEHOLDER_RE.match(name):
+        return label
+    return name
+
+
 def run_naming(
     graphify_bin: str,
     naming_dir: Path,
@@ -420,6 +433,15 @@ def run_naming(
     if needs_llm:
         fallback = clustering.hub_names(G, needs_llm)
         for cid in needs_llm:
+            members = needs_llm[cid]
+            if len(members) == 1 and G.has_node(members[0]) and G.degree(members[0]) == 0:
+                # An orphan stub (observed 2026-10-13: an `external` ref node with
+                # 0 edges) is never named by the LLM, so a provisional flag here
+                # would keep every run degraded and re-ask it forever.
+                node = members[0]
+                names_by_cid[cid] = _orphan_name(str(G.nodes[node].get("label") or node))
+                provisional[cid] = False
+                continue
             # A carried name that is only *provisional* (a migrated sidecar
             # entry, or a hub name from an earlier outage) is still better than
             # a fresh hub name: it may be a real LLM name from before the

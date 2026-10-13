@@ -23,6 +23,7 @@ from graphify_mesh.sync.config import (
     EXTRACT_MIN_CONCURRENCY,
     SCAN_MAX_DEPTH,
     SCAN_MIN_DEPTH,
+    SHRINK_POLICIES,
     Settings,
 )
 from graphify_mesh.sync.locking import LockHeldError
@@ -138,6 +139,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Explicitly authorize a smaller published graph than the previous generation.",
     )
+    # Default None: the absent flag leaves GRAPHIFY_MESH_SHRINK_POLICY in charge.
+    parser.add_argument(
+        "--shrink-policy",
+        choices=sorted(SHRINK_POLICIES),
+        default=None,
+        help=(
+            "Per-repo shrink guard: attributed/connected run graphify-shrink-check, "
+            "count uses node/edge floors only. Default: GRAPHIFY_MESH_SHRINK_POLICY, "
+            "else attributed."
+        ),
+    )
     parser.add_argument(
         "--extract-concurrency",
         type=int,
@@ -169,6 +181,8 @@ def build_overrides(args: argparse.Namespace) -> dict:
         overrides["skip_labeling"] = args.skip_labeling
     if args.relabel_all is not None:
         overrides["relabel_all"] = args.relabel_all
+    if args.shrink_policy is not None:
+        overrides["shrink_policy"] = args.shrink_policy
     if args.extract_concurrency is not None:
         # Same hard floor as the env-var path (_extract_concurrency_from_env):
         # a bad/too-low CLI value degrades to fully sequential rather than

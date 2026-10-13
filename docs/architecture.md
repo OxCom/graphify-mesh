@@ -48,7 +48,14 @@ discovery
   `mesh-register.py` share that file. An absent, empty or spent key means the
   guard is armed; a malformed one fails the registry load. `--allow-shrink`
   still exists for the whole-run case and accepts every repo's shrink in that
-  run, which is why the per-repo key is the default way to approve one. When the
+  run, which is why the per-repo key is the default way to approve one. Whether a
+  result "shrank unexpectedly" is decided by `graphify-shrink-check` under the
+  default `attributed` policy, which accepts loss explained by source changes,
+  and by the node/edge count floor when that tool is absent or errors
+  (`GRAPHIFY_MESH_SHRINK_POLICY`). A refusal restores `manifest.json` together
+  with `graph.json`, and a refused `update` is held while the attempt id,
+  producer and policy stay the same. Repos with `builder: graphify-php` run
+  `update` through `graphify-php-build` so the PHP resolver edges survive. When the
   child exits
   non-zero, the outcome reason carries the **last** 2000 characters of its
   stderr and the whole stream is written to

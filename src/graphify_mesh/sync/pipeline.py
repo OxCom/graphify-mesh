@@ -38,6 +38,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -64,7 +65,13 @@ from graphify_mesh.sync.config import (
 )
 from graphify_mesh.sync.discovery import assert_registry_containment, discover_filesystem, reconcile
 from graphify_mesh.sync.locking import transaction_lock
-from graphify_mesh.sync.registry import Registry, RepoEntry, load_registry, registry_hash
+from graphify_mesh.sync.registry import (
+    BUILDER_GRAPHIFY,
+    Registry,
+    RepoEntry,
+    load_registry,
+    registry_hash,
+)
 from graphify_mesh.sync.state import (
     CLOCK_STATE_KEY,
     SourceDigest,
@@ -77,6 +84,7 @@ from graphify_mesh.sync.sync_project import (
     ACTION_BOOTSTRAP,
     ACTION_EXTRACT,
     ACTION_SKIP,
+    ACTION_UPDATE,
     STATUS_BOOTSTRAP_FAILED,
     STATUS_FAILED,
     STATUS_INFRA_FAILED,
@@ -85,6 +93,8 @@ from graphify_mesh.sync.sync_project import (
     ProjectOutcome,
     apply_action,
     decide_action,
+    producer_for,
+    refusal_key,
 )
 from graphify_mesh.sync.tls import ssl_context
 from graphify_mesh.sync.vectors import RepoVectors
@@ -343,6 +353,8 @@ def _guarded_apply_action(
     shrink_grant: str | None = None,
     misconfig_once: _MisconfigLogOnce | None = None,
     sandbox_policy: graphify_cli.SandboxPolicy | None = None,
+    builder: str = BUILDER_GRAPHIFY,
+    producer_changed: bool = False,
 ) -> ProjectOutcome:
     """apply_action wrapped in the extract-backend infra guard.
 
@@ -382,6 +394,11 @@ def _guarded_apply_action(
         shrink_tolerance=shrink_tolerance,
         shrink_grant=shrink_grant,
         sandbox_policy=sandbox_policy,
+        builder=builder,
+        php_build_bin=settings.php_build_bin,
+        shrink_policy=settings.shrink_policy,
+        shrink_check_bin=settings.shrink_check_bin,
+        producer_changed=producer_changed,
     )
     if not guarded:
         return outcome
@@ -393,6 +410,53 @@ def _guarded_apply_action(
     outcome.status = STATUS_INFRA_FAILED
     outcome.reason = f"{outcome.reason}; backend probe failed"
     return outcome
+
+
+def _producer_changed(prior_state: dict | None, producer: str) -> bool:
+    """Whether this run's producer differs from the one of the accepted graph.
+
+    State written before producers were recorded has none; that is "unknown",
+    not "changed", so the shrink check keeps its strict reading.
+    """
+    prior_producer = (prior_state or {}).get("producer")
+    return bool(prior_producer) and prior_producer != producer
+
+
+def _explained_shrink_total(outcomes: Iterable[ProjectOutcome]) -> tuple[int, int]:
+    """Summed (nodes, edges) loss the per-repo shrink check accepted on evidence."""
+    nodes = edges = 0
+    for outcome in outcomes:
+        if outcome.status in STALE_STATUSES:
+            continue
+        nodes += outcome.explained_shrink[0]
+        edges += outcome.explained_shrink[1]
+    return nodes, edges
+
+
+# Per-repo state key: (nodes, edges) loss accepted since the last publish.
+UNPUBLISHED_SHRINK_KEY = "unpublished_shrink"
+
+
+def _unpublished_shrink(repo_state: dict | None) -> tuple[int, int]:
+    value = (repo_state or {}).get(UNPUBLISHED_SHRINK_KEY)
+    if (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in value)
+    ):
+        return value[0], value[1]
+    return 0, 0
+
+
+def _unpublished_shrink_total(state: dict, repo_ids: Iterable[str]) -> tuple[int, int]:
+    total = (0, 0)
+    for repo_id in repo_ids:
+        total = _add_shrink(total, _unpublished_shrink(state.get(repo_id)))
+    return total
+
+
+def _add_shrink(a: tuple[int, int], b: tuple[int, int]) -> tuple[int, int]:
+    return a[0] + b[0], a[1] + b[1]
 
 
 def _shrink_grant_for(entry: RepoEntry, prior_state: dict | None) -> str | None:
@@ -799,6 +863,10 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     active_repos = [
         e for e in _repos_for_run(registry, reconciliation.to_dict()) if e.repo_id not in broken_ids
     ]
+    # Read before the per-repo loop rewrites any entry: the loss accepted by
+    # earlier runs that have not published yet, which this run's outcomes no
+    # longer report because those repos are unchanged now.
+    carried_shrink = _unpublished_shrink_total(state, (e.repo_id for e in active_repos))
 
     # Two registry entries reaching the same collection_path would give two
     # workers the same graph.json to snapshot, rewrite and restore
@@ -893,7 +961,17 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             shrink_grant = _shrink_grant_for(entry, prior_state)
             shrink_grants[entry.repo_id] = shrink_grant
             action = decide_action(
-                prior_state, current_manifest, has_graph, shrink_grant, ast_only=settings.ast_only
+                prior_state,
+                current_manifest,
+                has_graph,
+                shrink_grant,
+                ast_only=settings.ast_only,
+                refusal_key=refusal_key(
+                    current_manifest,
+                    producer_for(ACTION_UPDATE, entry.builder),
+                    settings.shrink_policy,
+                ),
+                allow_shrink=settings.allow_shrink,
             )
             log.info("[%d/%d] %s: %s ...", i, total_active, entry.repo_id, action)
             bar.tick(i - 1, f"{entry.repo_id}: {action} ...")
@@ -955,6 +1033,10 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 # Built once per run from the same roots the registry guard
                 # used, so a writable bind can never land outside them.
                 sandbox_policy=sandbox_policy,
+                builder=entry.builder,
+                producer_changed=_producer_changed(
+                    state.get(entry.repo_id), producer_for(action, entry.builder)
+                ),
             )
             for (i, entry, root, action, current_manifest) in actionable
         }
@@ -1047,6 +1129,13 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                     **prior,
                     "refused_semantic_hash": refused_hash,
                     "refusal_streak": streak,
+                    # decide_action holds a refused update on this key; the
+                    # semantic hash above only holds a refused extract.
+                    "refused_key": refusal_key(
+                        outcome.refused_manifest,
+                        producer_for(action, entry.builder),
+                        settings.shrink_policy,
+                    ),
                 }
         else:
             if outcome.new_manifest is not None:
@@ -1057,10 +1146,19 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 # second shrink, and one spent earlier must stay spent through
                 # every later run that rewrites this entry wholesale.
                 accepted = outcome.new_manifest.to_dict()
+                accepted["producer"] = producer_for(action, entry.builder)
                 prior = state.get(entry.repo_id) or {}
                 spent = outcome.consumed_shrink_grant or prior.get("consumed_shrink_grant")
                 if spent:
                     accepted["consumed_shrink_grant"] = spent
+                # Accepted loss stays on record until a publish includes it. The
+                # global guard measures against the last published generation,
+                # so a run blocked for any other reason would otherwise leave the
+                # next run refusing a loss that was already accepted and its
+                # grant spent (2026-10-13).
+                unpublished = _add_shrink(_unpublished_shrink(prior), outcome.explained_shrink)
+                if unpublished != (0, 0):
+                    accepted[UNPUBLISHED_SHRINK_KEY] = list(unpublished)
                 state[entry.repo_id] = accepted
                 if outcome.consumed_shrink_grant and not settings.dry_run:
                     # The smaller graph.json is already durable, but later
@@ -1368,6 +1466,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         effective_allow_shrink,
         settings.skip_labeling,
         shrink_tolerance=settings.shrink_tolerance,
+        allowed_shrink=_add_shrink(_explained_shrink_total(outcomes.values()), carried_shrink),
     )
     report.validation_ok = validation.ok
     report.validation_errors = validation.errors
@@ -1545,6 +1644,11 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
 
     report.published = True
     report.generation_id = generation_id
+    # The published generation now holds every accepted loss: it is the new
+    # baseline the global guard measures against.
+    for repo_state in state.values():
+        if isinstance(repo_state, dict):
+            repo_state.pop(UNPUBLISHED_SHRINK_KEY, None)
     tracker.mark("validate_publish")
     _record_stage_rss(tracker, report)
 

@@ -27,6 +27,14 @@ REPO_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # it never authorizes a second shrink.
 SHRINK_GRANT_PATTERN = re.compile(r"^[0-9a-f]{8,64}$")
 
+# Which program refreshes a repo's graph on `update`. Plain `graphify update`
+# never registers graphify-php's resolvers, so a PHP repo built through
+# graphify-php lost its resolver edges on every mesh update (2026-10-13:
+# cem.messages 5766 -> 4101 edges, cem.hub 39279 -> 29824).
+BUILDER_GRAPHIFY = "graphify"
+BUILDER_GRAPHIFY_PHP = "graphify-php"
+BUILDERS = frozenset({BUILDER_GRAPHIFY, BUILDER_GRAPHIFY_PHP})
+
 
 @dataclass
 class RepoEntry:
@@ -35,6 +43,7 @@ class RepoEntry:
     collection_path: Path
     enabled: bool = True
     allow_shrink_once: str | None = None
+    builder: str = BUILDER_GRAPHIFY
 
 
 @dataclass
@@ -89,6 +98,22 @@ def _optional_shrink_grant(entry: dict, index: int) -> str | None:
     return value
 
 
+def _optional_builder(entry: dict, index: int) -> str:
+    """Parse `builder`; absent means plain graphify.
+
+    An unknown value is a hard error, not a fallback to graphify: the operator
+    who wrote it expects a different builder, and a silent fallback is exactly
+    the resolver-edge loss this key exists to stop.
+    """
+    value = entry.get("builder", BUILDER_GRAPHIFY)
+    if not isinstance(value, str) or value not in BUILDERS:
+        raise ValueError(
+            f"registry repos[{index}]: invalid 'builder' {value!r} "
+            f"(expected one of {sorted(BUILDERS)})"
+        )
+    return value
+
+
 def _str_list(raw: dict, key: str) -> list[str]:
     value = raw.get(key, [])
     if not isinstance(value, list):
@@ -114,6 +139,7 @@ def _parse_entry(entry, index: int) -> RepoEntry:
         collection_path=Path(_require_non_empty_str(entry, index, "collection_path")),
         enabled=_optional_bool(entry, index, "enabled", True),
         allow_shrink_once=_optional_shrink_grant(entry, index),
+        builder=_optional_builder(entry, index),
     )
 
 

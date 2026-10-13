@@ -7,6 +7,7 @@ typical single-host deployment; override them for your environment.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import urllib.parse
@@ -159,6 +160,38 @@ def _read_shrink_tolerance() -> float:
     if value < 0.0 or value >= 1.0:
         return SHRINK_TOLERANCE
     return value
+
+
+# How the per-repo shrink guard judges a smaller graph (2026-10-13):
+#   attributed - ask `graphify-shrink-check` which losses follow from deleted or
+#                changed source files and refuse only unexplained loss;
+#   connected  - same tool, its connectivity-based policy;
+#   count      - this package's own node/edge count floor (_classify_shrink).
+# Count-only refused legitimate deletions and accepted resolver-edge loss inside
+# the tolerance. The two tool policies fall back to `count` when the binary is
+# absent or errors, so the mesh keeps working without graphify-php installed.
+SHRINK_POLICIES = frozenset({"attributed", "connected", "count"})
+SHRINK_POLICY_DEFAULT = "attributed"
+
+
+def _read_shrink_policy() -> str:
+    """GRAPHIFY_MESH_SHRINK_POLICY, or the default for an unset or unknown value.
+
+    An unknown value warns instead of raising: every policy still refuses a
+    material loss, so a typo costs precision, never the guard itself.
+    """
+    raw = (os.environ.get("GRAPHIFY_MESH_SHRINK_POLICY") or "").strip().lower()
+    if not raw:
+        return SHRINK_POLICY_DEFAULT
+    if raw not in SHRINK_POLICIES:
+        logging.getLogger("graphify_mesh.sync").warning(
+            "GRAPHIFY_MESH_SHRINK_POLICY=%r is not one of %s — using %r",
+            raw,
+            sorted(SHRINK_POLICIES),
+            SHRINK_POLICY_DEFAULT,
+        )
+        return SHRINK_POLICY_DEFAULT
+    return raw
 
 
 # WS3 embedding-stage defaults (C9): the NATIVE Ollama `/api/embed` endpoint,
@@ -522,6 +555,17 @@ class Settings:
         default_factory=lambda: os.environ.get("GRAPHIFY_MESH_AST_ONLY", "0") == "1"
     )
     allow_shrink: bool = False
+    # Env GRAPHIFY_MESH_SHRINK_POLICY or CLI --shrink-policy (explicit flag wins).
+    shrink_policy: str = field(default_factory=lambda: _read_shrink_policy())
+    shrink_check_bin: str = field(
+        default_factory=lambda: os.environ.get(
+            "GRAPHIFY_MESH_SHRINK_CHECK_BIN", "graphify-shrink-check"
+        )
+    )
+    # Runs `update` for repos whose registry entry says builder=graphify-php.
+    php_build_bin: str = field(
+        default_factory=lambda: os.environ.get("GRAPHIFY_MESH_PHP_BUILD_BIN", "graphify-php-build")
+    )
     ollama_base_url: str = field(
         default_factory=lambda: os.environ.get(
             "GRAPHIFY_MESH_OLLAMA_BASE_URL", OLLAMA_DEFAULT_BASE_URL

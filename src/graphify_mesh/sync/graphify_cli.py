@@ -722,6 +722,79 @@ def run_update(
     return _run(argv, cwd=None, env=_isolated_home_env(staging_home))
 
 
+# Set on every graphify-php-build child. It skips that wrapper's own shrink
+# guard (exit 4): this package already runs one per repo, and two guards with
+# different floors turned one judgment into whichever refused first.
+PHP_MANAGED_ENV = {"GRAPHIFY_MESH_MANAGED": "1"}
+
+
+def run_php_update(
+    graphify_bin: str,
+    root: Path,
+    collection_path: Path,
+    staging_home: Path,
+    *,
+    policy: SandboxPolicy | None = None,
+    php_build_bin: str = "graphify-php-build",
+) -> CliResult:
+    """`graphify-php-build --graph <collection>/graph.json -- update <root>`.
+
+    For registry entries with `builder: graphify-php`. Plain `graphify update`
+    never registers graphify-php's resolvers, so their call and route edges
+    vanished on every mesh update (2026-10-13: cem.hub 39279 -> 29824 edges).
+    The wrapper loads them, runs the same update, and restores graph.json
+    itself before exiting 2/3 when an expected resolver failed.
+
+    `graphify_bin` is unused: the wrapper's interpreter carries its own graphify.
+    It stays in the signature so `_INVOKERS` callers need no special case.
+
+    GRAPHIFY_PHP_* settings (GRAPHIFY_PHP_EXTERNAL_STUBS in production) reach
+    the child through `_run`'s GRAPHIFY_* allowlist. GRAPHIFY_MESH_MANAGED does
+    not, because that allowlist drops GRAPHIFY_MESH_*, so it is set explicitly.
+
+    PYTHONUSERBASE is set explicitly too, to the parent's real user base. The
+    wrapper runs on /usr/bin/python3 with graphify_php installed editable in the
+    real user site, and an editable install is a `.pth` file. With HOME on the
+    staging dir the child looks for its user site under the fake HOME, and the
+    PYTHONPATH entry from `_isolated_home_env` does not help: `.pth` files are
+    processed only in site dirs, never in PYTHONPATH entries. Under bwrap this
+    failed with `No module named 'graphify_php'` (2026-10-13). The user site
+    itself is already read-only bound by `_read_paths`, so nothing new is exposed.
+
+    GRAPHIFY_PHP_STATUS and TMPDIR point into writable binds. The resolver status
+    record defaults to `graphify-out/` relative to the cwd, and PHPStan needs a temp
+    dir; under bwrap both sit on the read-only root, so all three resolvers failed
+    (2026-10-13). The record goes beside the graph, one per repo.
+    """
+    del graphify_bin
+    # Resolved here, in the parent, from the real HOME: computed in the child it
+    # would follow the staging HOME the env below installs.
+    user_base_env = {"PYTHONUSERBASE": site.getuserbase()}
+    staging_home.mkdir(parents=True, exist_ok=True)
+    tmp_dir = staging_home / "tmp"
+    tmp_dir.mkdir(exist_ok=True)
+    writable_env = {
+        "GRAPHIFY_PHP_STATUS": str(collection_path / ".graphify-php-status.json"),
+        "TMPDIR": str(tmp_dir),
+    }
+    argv = _sandbox_argv(
+        resolve_bin_argv(php_build_bin)
+        + ["--graph", str(collection_path / "graph.json"), "--", "update", str(root)],
+        _project_write_paths(root, collection_path, staging_home),
+        policy,
+    )
+    return _run(
+        argv,
+        cwd=None,
+        env={
+            **_isolated_home_env(staging_home),
+            **user_base_env,
+            **writable_env,
+            **PHP_MANAGED_ENV,
+        },
+    )
+
+
 def run_extract(
     graphify_bin: str,
     root: Path,

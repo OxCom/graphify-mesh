@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from graphify_mesh.sync import graphify_cli
+from graphify_mesh.sync import graphify_cli, validate
 from graphify_mesh.sync.pipeline import run
 
 REPO_ID = "example-org.styleguide"
@@ -143,3 +143,50 @@ class TestSpentGrantSurvivesALaterStageFailure:
         assert _row(report)["status"] == "unchanged"
         assert _read_json(collection / "graph.json") == shrunk
         assert _read_json(env.settings().state_path)[REPO_ID]["consumed_shrink_grant"] == token
+
+
+class TestGrantedLossReachesTheGlobalGuard:
+    """2026-10-13: the grant accepted a repo's loss, then the global shrink guard
+    refused the same loss because the outcome carried no explained shrink, so
+    the run never published although the grant was spent."""
+
+    def test_granted_shrink_publishes(self, accepted_baseline):
+        env, root, collection = accepted_baseline
+        baseline = run(env.settings())
+        assert baseline.published, baseline.publish_blocked_reason
+        (root / "app.py").write_text("v2\n", encoding="utf-8")
+        _grant(env, _token(run(env.settings())))
+
+        report = run(env.settings())
+
+        assert _row(report)["status"] == "updated"
+        assert report.validation_ok, report.validation_errors
+        assert report.published, report.publish_blocked_reason
+
+    def test_blocked_publish_does_not_strand_the_granted_loss(self, accepted_baseline, monkeypatch):
+        env, root, collection = accepted_baseline
+        assert run(env.settings()).published
+        (root / "app.py").write_text("v2\n", encoding="utf-8")
+        token = _token(run(env.settings()))
+        _grant(env, token)
+
+        # Something unrelated to this repo blocks the run that spends the grant.
+        real_run_all = validate.run_all
+
+        def failing_run_all(*args, **kwargs):
+            return validate.ValidationResult(ok=False, errors=["simulated unrelated failure"])
+
+        monkeypatch.setattr(validate, "run_all", failing_run_all)
+        blocked = run(env.settings())
+        monkeypatch.setattr(validate, "run_all", real_run_all)
+        assert _row(blocked)["status"] == "updated"
+        assert not blocked.published
+        assert _read_json(env.settings().state_path)[REPO_ID]["consumed_shrink_grant"] == token
+
+        # The repo is unchanged now, so this run's outcomes explain nothing; the
+        # accepted loss must still be known to the global guard.
+        report = run(env.settings())
+        assert _row(report)["status"] == "unchanged"
+        assert report.validation_ok, report.validation_errors
+        assert report.published, report.publish_blocked_reason
+        assert "unpublished_shrink" not in _read_json(env.settings().state_path)[REPO_ID]

@@ -267,6 +267,84 @@ def test_provisional_names_are_retried_once_the_backend_recovers(tmp_path, monke
     assert not any(e.provisional for e in after.communities.values())
 
 
+ORPHAN_LABEL = "ref_ckeditor_ckeditor5_adapter_ckfinder_src_uploadadapter"
+
+
+def test_edgeless_singleton_the_llm_skips_gets_a_final_derived_name(tmp_path, monkeypatch):
+    """The 2026-10-13 shape: an orphan `external` stub the LLM never names must
+    not keep every run degraded."""
+    asked = []
+
+    def fake_llm(G, communities, **kwargs):
+        asked.append(sorted(communities))
+        return {cid: f"Named {cid}" for cid, m in communities.items() if len(m) > 1}, "llm"
+
+    monkeypatch.setattr("graphify_mesh.sync.clustering.llm_names", fake_llm)
+    graph = json.loads(json.dumps(TWO_NODE_GRAPH))
+    graph["nodes"].append({"id": "ext::orphan", "label": ORPHAN_LABEL, "file_type": "external"})
+    result = naming.run_naming(
+        "graphify",
+        tmp_path / "naming",
+        tmp_path / "home",
+        graph,
+        _settings(tmp_path, ollama_model="test-model"),
+        health_check=lambda *a, **k: True,
+    )
+    assert result.labeling == naming.LABELING_OK
+    state = naming_state.load(tmp_path / "naming")
+    assert state is not None
+    orphan_cid = state.assignments["ext::orphan"]
+    assert asked and orphan_cid in asked[0], "the orphan must still be offered to the LLM"
+    entry = state.communities[str(orphan_cid)]
+    assert entry.name == "ckeditor ckeditor5 adapter ckfinder src uploadadapter"
+    assert entry.provisional is False
+
+
+def test_singleton_with_an_edge_stays_provisional(tmp_path, monkeypatch):
+    """Only degree 0 qualifies: a singleton with a neighbour has context the
+    LLM can use on a later run."""
+    monkeypatch.setattr(
+        "graphify_mesh.sync.clustering.cluster_graph",
+        lambda *a, **k: {0: ["a.one::x", "a.one::y"], 1: ["a.one::z"]},
+    )
+    monkeypatch.setattr(
+        "graphify_mesh.sync.clustering.llm_names",
+        lambda G, communities, **k: ({0: "Named 0"} if 0 in communities else {}, "llm"),
+    )
+    graph = json.loads(json.dumps(TWO_NODE_GRAPH))
+    graph["nodes"].append({"id": "a.one::z", "label": "ref_z", "repo": "a.one"})
+    graph["links"].append({"source": "a.one::x", "target": "a.one::z", "relation": "calls"})
+    result = naming.run_naming(
+        "graphify",
+        tmp_path / "naming",
+        tmp_path / "home",
+        graph,
+        _settings(tmp_path, ollama_model="test-model"),
+        health_check=lambda *a, **k: True,
+    )
+    assert result.labeling == naming.LABELING_DEGRADED
+    assert result.changed_cids == ["1"]
+    state = naming_state.load(tmp_path / "naming")
+    assert state is not None
+    assert state.communities["1"].provisional is True
+    assert state.communities["0"].provisional is False
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        (ORPHAN_LABEL, "ckeditor ckeditor5 adapter ckfinder src uploadadapter"),
+        ("src/app\\Http.Kernel-v2", "src app Http Kernel v2"),
+        ("  a__b  ", "a b"),
+        ("ref_", "ref_"),
+        ("_./-", "_./-"),
+        ("ref_Community_7", "ref_Community_7"),
+    ],
+)
+def test_orphan_name(label, expected):
+    assert naming._orphan_name(label) == expected
+
+
 def test_model_change_invalidates_carried_names(tmp_path, monkeypatch):
     calls = []
 
@@ -655,7 +733,10 @@ def test_pipeline_degraded_mode_no_leakage_and_publishes_stage_names(env):
     root_a = Path([r["root"] for r in env._repos if r["repo_id"] == "example-org.styleguide"][0])
     (root_a / "touched.py").write_text("# touch\n", encoding="utf-8")
 
-    settings_degraded = env.settings(ollama_health_check=lambda *a, **kw: False)
+    # relabel_all sends every community to the (down) backend. Without it the only
+    # community needing a name here is an edgeless singleton, which now gets a final
+    # derived name and would leave the run "ok" instead of degraded.
+    settings_degraded = env.settings(ollama_health_check=lambda *a, **kw: False, relabel_all=True)
     second = run(settings_degraded)
 
     assert second.published

@@ -67,6 +67,7 @@ def validate_shrink_guard(
     previous_counts: tuple[int, int] | None,
     allow_shrink: bool,
     tolerance: float = 0.0,
+    allowed_shrink: tuple[int, int] = (0, 0),
 ) -> ValidationResult:
     """Global-graph counterpart of the per-repo shrink guard.
 
@@ -75,23 +76,33 @@ def validate_shrink_guard(
     legitimately shrink the merged graph by a fraction of a percent per run,
     and a strict guard blocks every subsequent publish (observed 2026-07-21..
     08-18). A material collapse is still refused.
+
+    `allowed_shrink` is the (nodes, edges) loss the per-repo shrink check
+    accepted this run as explained by source changes (2026-10-13). It comes off
+    the previous counts before the floor, so a deletion accepted on evidence
+    for one repo is not refused again here, while unexplained loss still is.
     """
     if previous_counts is None or allow_shrink:
         return ValidationResult(ok=True)
     new_nodes, new_edges = new_counts
-    prev_nodes, prev_edges = previous_counts
+    prev_nodes = max(0, previous_counts[0] - max(0, allowed_shrink[0]))
+    prev_edges = max(0, previous_counts[1] - max(0, allowed_shrink[1]))
     errors = []
     if new_nodes < _shrink_floor(prev_nodes, tolerance):
         errors.append(
             f"shrink-guard: new global graph has {new_nodes} nodes, "
-            f"previous published had {prev_nodes}"
+            f"previous published had {previous_counts[0]}" + _explained_note(allowed_shrink[0])
         )
     if new_edges < _shrink_floor(prev_edges, tolerance):
         errors.append(
             f"shrink-guard: new global graph has {new_edges} edges, "
-            f"previous published had {prev_edges}"
+            f"previous published had {previous_counts[1]}" + _explained_note(allowed_shrink[1])
         )
     return ValidationResult(ok=not errors, errors=errors)
+
+
+def _explained_note(explained: int) -> str:
+    return f" ({explained} explained by source changes)" if explained > 0 else ""
 
 
 def validate_dangling_ids(data: dict) -> ValidationResult:
@@ -238,6 +249,7 @@ def run_all(
     allow_shrink: bool,
     skip_labeling: bool,
     shrink_tolerance: float = 0.0,
+    allowed_shrink: tuple[int, int] = (0, 0),
 ) -> ValidationResult:
     schema = validate_schema(data)
     if not schema.ok:
@@ -247,7 +259,9 @@ def run_all(
     new_counts = (len(data.get("nodes", [])), len(data.get("links", data.get("edges", []))))
     checks = [
         schema,
-        validate_shrink_guard(new_counts, previous_counts, allow_shrink, shrink_tolerance),
+        validate_shrink_guard(
+            new_counts, previous_counts, allow_shrink, shrink_tolerance, allowed_shrink
+        ),
         validate_dangling_ids(data),
         validate_forbidden_edges(data),
         validate_community_names(data, skip_labeling),
