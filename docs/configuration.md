@@ -140,7 +140,8 @@ them is in place, treat every secret in that file as reachable by every
 | `--scan-root PATH` | Add a scan root; repeat the flag for multiple roots. Explicit CLI roots take precedence over `GRAPHIFY_MESH_SCAN_ROOTS`, then legacy `GRAPHIFY_MESH_SCAN_ROOT`, then the current working directory. If every `--scan-root` value given is empty or whitespace-only, they are dropped and resolution falls through to `GRAPHIFY_MESH_SCAN_ROOTS`/`GRAPHIFY_MESH_SCAN_ROOT`/cwd exactly as if no `--scan-root` had been passed. |
 | `--scan-depth N` | Override `GRAPHIFY_MESH_SCAN_DEPTH`; values are clamped to `1`–`8`. |
 | `--registry PATH` | Override `GRAPHIFY_MESH_REGISTRY`. |
-| `--skip-labeling` / `--no-skip-labeling` | Skip / enforce the non-placeholder community-name check. |
+| `--skip-labeling` / `--no-skip-labeling` | Skip / enforce the naming stage and its non-placeholder community-name check. Default: `GRAPHIFY_MESH_SKIP_LABELING` (`1` = skip), else off; either flag beats the env var. |
+| `--relabel-all` | One-shot: ask the LLM to name every community, ignoring carried names and the unchanged-fingerprint reuse; community ids stay stable. Default: `GRAPHIFY_MESH_RELABEL_ALL` (`1` = on), else off. `--skip-labeling` wins, with a warning. |
 | `--skip-embedding` | Log-skip the embedding stage. |
 | `--allow-shrink` | Authorize publishing a smaller graph than the previous generation; also authorizes per-repo (per-project) shrink acceptance for **every** repo in the run — a shrunken per-repo graph is accepted and state advances instead of being refused. To approve one repo's shrink only, use `repos[].allow_shrink_once` in the registry instead. |
 | `--extract-concurrency N` | Override `GRAPHIFY_MESH_EXTRACT_CONCURRENCY` (default 2, floor 1). |
@@ -213,6 +214,13 @@ pipeline run. Notable fields and derived paths:
   constructed directly instead of through the environment parser.
 - `graphify_bin`, `stale_threshold`, `dry_run`, `skip_labeling`,
   `skip_embedding`, `allow_shrink` — run behavior.
+- `skip_labeling` — env `GRAPHIFY_MESH_SKIP_LABELING` (`1` = skip naming, no
+  network calls). `relabel_all` — env `GRAPHIFY_MESH_RELABEL_ALL` (`1` = every
+  community goes to the LLM this run; stored assignments still keep ids stable;
+  communities the LLM still fails to name get provisional hub names as usual).
+  While labeling runs, one INFO line per chunk of `4 × GRAPHIFY_LABEL_BATCH_SIZE`
+  communities reports progress, `named` counting non-placeholder labels so far:
+  `naming: labeled <done>/<total> communities (<named> named, chunk <i>/<n>, <secs>s)`.
 - `ollama_*` / `ollama_embed_*` — naming and embedding endpoints, models, and
   health timeouts (plus test-only injectable health checks). `ollama_api_timeout`
   is the per-labeling-call ceiling, separate from `ollama_health_timeout`.

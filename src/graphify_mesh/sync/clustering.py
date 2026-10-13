@@ -11,10 +11,16 @@ side does (`graphify/serve.py`), and it applies none of those heuristics.
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 
 import networkx as nx
 from networkx.readwrite import json_graph
+
+from graphify_mesh.sync.validate import PLACEHOLDER_RE
+
+log = logging.getLogger("graphify_mesh.sync.clustering")
 
 
 def graph_from_node_link(graph_data: dict) -> nx.Graph:
@@ -135,12 +141,42 @@ def llm_names(
     #
     # Re-measure when the labeling model changes: the knee is a property of the model's
     # attention over a long list, not of graphify or of the window.
-    return generate_community_labels(
-        G,
-        communities,
-        backend=backend,
-        model=model,
-        quiet=True,
-        max_concurrency=1,
-        batch_size=_label_batch_size(),
-    )
+    #
+    # Chunked here only for progress: one upstream call over every community printed
+    # nothing for many minutes (quiet=True). Each chunk is 4 batches and upstream still
+    # batches inside it with the same batch_size, so the 2026-10-01 measurement holds.
+    batch_size = _label_batch_size()
+    chunk_size = 4 * batch_size
+    items = list(communities.items())
+    total = len(items)
+    chunk_count = max(1, -(-total // chunk_size))
+    labels: dict[int, str] = {}
+    source = "placeholder"
+    any_llm = False
+    started = time.monotonic()
+    for index in range(chunk_count):
+        chunk = dict(items[index * chunk_size : (index + 1) * chunk_size])
+        chunk_labels, source = generate_community_labels(
+            G,
+            chunk,
+            backend=backend,
+            model=model,
+            quiet=True,
+            max_concurrency=1,
+            batch_size=batch_size,
+        )
+        any_llm = any_llm or source == "llm"
+        labels.update(chunk_labels)
+        named = sum(
+            1 for label in labels.values() if label and not PLACEHOLDER_RE.match(label.strip())
+        )
+        log.info(
+            "naming: labeled %d/%d communities (%d named, chunk %d/%d, %.1fs)",
+            min((index + 1) * chunk_size, total),
+            total,
+            named,
+            index + 1,
+            chunk_count,
+            time.monotonic() - started,
+        )
+    return labels, ("llm" if any_llm else source)

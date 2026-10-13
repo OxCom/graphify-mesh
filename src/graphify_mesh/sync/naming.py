@@ -340,7 +340,16 @@ def run_naming(
     labeling_ok = state is not None and state.labeling == _labeling_recipe(settings)
     recipe_ok = clustering_ok and labeling_ok
 
-    if state is not None and _reuse_is_safe(state, fingerprint, merged_graph_data, recipe_ok):
+    if settings.relabel_all:
+        log.info(
+            "naming: relabel_all is on — every community goes to the LLM; carried names "
+            "and fingerprint reuse are ignored, community ids stay stable"
+        )
+    if (
+        not settings.relabel_all
+        and state is not None
+        and _reuse_is_safe(state, fingerprint, merged_graph_data, recipe_ok)
+    ):
         reuse_before = structure_snapshot(merged_graph_data)
         names = {cid: e.name for cid, e in state.communities.items()}
         _apply(merged_graph_data, state.assignments, names)
@@ -363,7 +372,11 @@ def run_naming(
     )
     sigs = clustering.membership_sigs(communities)
 
-    if state is None:
+    if settings.relabel_all:
+        # Names only: `previous` above still seeds id stabilization, so a relabel
+        # renames communities without renumbering them.
+        carried: dict[str, tuple[str, bool]] = {}
+    elif state is None:
         # Migration runs once, only when no state file exists. Seeding on an
         # empty `carried` instead would resurrect sidecars a later run had
         # legitimately emptied.

@@ -76,17 +76,34 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     # both stages run by default now — a real run is expected to name
     # communities and embed nodes. --skip-* remain as explicit opt-outs for
     # fast local-only runs or when the Ollama host is unreachable.
+    # Default None, not False: neither flag leaves GRAPHIFY_MESH_SKIP_LABELING in charge.
     parser.add_argument(
         "--skip-labeling",
         action="store_true",
-        default=False,
-        help="Skip the naming stage and its non-placeholder community_name check. Default: off.",
+        default=None,
+        help=(
+            "Skip the naming stage and its non-placeholder community_name check. "
+            "Default: GRAPHIFY_MESH_SKIP_LABELING, else off."
+        ),
     )
     parser.add_argument(
         "--no-skip-labeling",
         dest="skip_labeling",
         action="store_false",
-        help="(default) Enforce the naming stage and its community_name check.",
+        help=(
+            "Enforce the naming stage and its community_name check even when "
+            "GRAPHIFY_MESH_SKIP_LABELING=1."
+        ),
+    )
+    parser.add_argument(
+        "--relabel-all",
+        action="store_true",
+        default=None,
+        help=(
+            "One-shot: ask the LLM to name every community, ignoring carried names and "
+            "fingerprint reuse; community ids stay stable. --skip-labeling wins. "
+            "Default: GRAPHIFY_MESH_RELABEL_ALL, else off."
+        ),
     )
     parser.add_argument(
         "--skip-embedding",
@@ -140,7 +157,6 @@ def build_overrides(args: argparse.Namespace) -> dict:
     leave the environment's value in place."""
     overrides: dict = {
         "dry_run": args.dry_run,
-        "skip_labeling": args.skip_labeling,
         "skip_embedding": args.skip_embedding,
         "allow_shrink": args.allow_shrink,
     }
@@ -148,6 +164,11 @@ def build_overrides(args: argparse.Namespace) -> dict:
     # GRAPHIFY_MESH_AST_ONLY=1, and --no-ast-only must beat it.
     if args.ast_only is not None:
         overrides["ast_only"] = args.ast_only
+    # Same explicit-only rule: the absent case must not mask the env values.
+    if args.skip_labeling is not None:
+        overrides["skip_labeling"] = args.skip_labeling
+    if args.relabel_all is not None:
+        overrides["relabel_all"] = args.relabel_all
     if args.extract_concurrency is not None:
         # Same hard floor as the env-var path (_extract_concurrency_from_env):
         # a bad/too-low CLI value degrades to fully sequential rather than

@@ -503,7 +503,17 @@ class Settings:
         default_factory=lambda: _read_shrink_tolerance(),
     )
     dry_run: bool = False
-    skip_labeling: bool = False
+    # Env GRAPHIFY_MESH_SKIP_LABELING=1 or CLI --skip-labeling; an explicit CLI flag
+    # either way beats the env value (cli.build_overrides).
+    skip_labeling: bool = field(
+        default_factory=lambda: os.environ.get("GRAPHIFY_MESH_SKIP_LABELING", "0") == "1"
+    )
+    # One-shot: the naming stage asks the LLM for EVERY community, ignoring carried
+    # names and the unchanged-fingerprint reuse. Community ids stay stable. Env
+    # GRAPHIFY_MESH_RELABEL_ALL=1 or CLI --relabel-all; skip_labeling wins over it.
+    relabel_all: bool = field(
+        default_factory=lambda: os.environ.get("GRAPHIFY_MESH_RELABEL_ALL", "0") == "1"
+    )
     skip_embedding: bool = False
     # Changed repos get local `graphify update` instead of LLM `extract`: measured
     # 2026-10-12, 0 of 100 search hits came from LLM-extracted nodes (1-2% of a graph).

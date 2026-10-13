@@ -1204,6 +1204,9 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         # Ollama involved) runs; graph_data and community/community_name
         # stay stripped/placeholder, exactly as the flag promises.
         log.info("naming: skipped (--skip-labeling) — no naming/Ollama calls made")
+        if settings.relabel_all:
+            # skip_labeling's zero-network promise outranks a relabel request.
+            log.warning("naming: relabel_all ignored — skip_labeling is on, no LLM calls made")
         backend_check = assert_pinned_backend(settings.graphify_bin)
         graph_data = stripped_graph_data
         report.labeling = "skipped (--skip-labeling)"

@@ -834,3 +834,76 @@ def test_sidecars_survive_a_degraded_run(tmp_path):
         health_check=lambda *a, **k: False,
     )
     assert (out_dir / ".graphify_labels.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# relabel_all
+# ---------------------------------------------------------------------------
+
+
+def _two_component_graph() -> dict:
+    graph = json.loads(json.dumps(TWO_NODE_GRAPH))
+    graph["nodes"] += [
+        {"id": "a.one::p", "label": "P", "source_file": "src/p.py", "repo": "a.one"},
+        {"id": "a.one::q", "label": "Q", "source_file": "src/q.py", "repo": "a.one"},
+    ]
+    graph["links"].append({"source": "a.one::p", "target": "a.one::q", "relation": "calls"})
+    return graph
+
+
+def test_relabel_all_bypasses_reuse_and_carried_names(tmp_path, monkeypatch):
+    """Unchanged graph, fully named state: without relabel_all this run would
+    be REUSED. With it, every community goes to the LLM and ids stay put."""
+    calls = []
+
+    def fake_llm(G, communities, *, backend, model):
+        calls.append(sorted(communities))
+        return {cid: f"Run{len(calls)} {cid}" for cid in communities}, "llm"
+
+    monkeypatch.setattr("graphify_mesh.sync.clustering.llm_names", fake_llm)
+    first = naming.run_naming(
+        "graphify",
+        tmp_path / "naming",
+        tmp_path / "home",
+        _two_component_graph(),
+        _settings(tmp_path, ollama_model="test-model"),
+        health_check=lambda *a, **k: True,
+    )
+    assert first.labeling == naming.LABELING_OK
+    before = naming_state.load(tmp_path / "naming")
+    assert before is not None and len(before.communities) == 2
+    assert not any(e.provisional for e in before.communities.values())
+
+    monkeypatch.setenv("GRAPHIFY_MESH_RELABEL_ALL", "1")
+    again = naming.run_naming(
+        "graphify",
+        tmp_path / "naming",
+        tmp_path / "home",
+        _two_component_graph(),
+        _settings(tmp_path, ollama_model="test-model"),
+        health_check=lambda *a, **k: True,
+    )
+    assert again.labeling == naming.LABELING_OK, "the fingerprint-reuse shortcut must be skipped"
+    assert len(calls) == 2
+    assert calls[1] == sorted(int(cid) for cid in before.communities), (
+        "every community, carried non-provisional names included, must be re-asked"
+    )
+    after = naming_state.load(tmp_path / "naming")
+    assert after is not None
+    assert after.assignments == before.assignments, "community ids must stay stable"
+    assert all(e.name.startswith("Run2 ") for e in after.communities.values())
+
+
+def test_relabel_all_off_still_reuses(tmp_path, monkeypatch):
+    monkeypatch.delenv("GRAPHIFY_MESH_RELABEL_ALL", raising=False)
+    settings = _settings(tmp_path, ollama_model="test-model")
+    for _ in range(2):
+        result = naming.run_naming(
+            "graphify",
+            tmp_path / "naming",
+            tmp_path / "home",
+            _two_component_graph(),
+            settings,
+            health_check=lambda *a, **k: True,
+        )
+    assert result.labeling == naming.LABELING_REUSED

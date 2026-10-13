@@ -393,3 +393,28 @@ def test_skip_labeling_makes_zero_naming_calls(env):
     assert naming_calls == [], (
         f"skip_labeling=True must make zero naming calls, got: {naming_calls}"
     )
+
+
+def test_skip_labeling_wins_over_relabel_all(env, monkeypatch, caplog):
+    """relabel_all asks for LLM calls; skip_labeling promises none. Skip wins, loudly."""
+    env.add_repo(
+        "example-org.styleguide",
+        "example-org",
+        "styleguide",
+        "styleguide.example-org.dev.lo",
+        "repo_a.json",
+    )
+    env.write_registry()
+    monkeypatch.setattr(
+        "graphify_mesh.sync.naming.run_naming",
+        lambda *a, **k: pytest.fail("skip_labeling must not reach run_naming"),
+    )
+    settings = env.settings(
+        skip_labeling=True, relabel_all=True, ollama_health_check=lambda *a, **kw: True
+    )
+
+    with caplog.at_level("WARNING", logger="graphify_mesh.sync"):
+        report = run(settings)
+
+    assert report.labeling == "skipped (--skip-labeling)"
+    assert any("relabel_all ignored" in r.getMessage() for r in caplog.records)
