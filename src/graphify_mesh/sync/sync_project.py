@@ -80,13 +80,18 @@ def producer_for(action: str, builder: str = BUILDER_GRAPHIFY) -> str:
     return PRODUCER_EXTRACT
 
 
-def refusal_key(digest: SourceDigest, producer: str, policy: str) -> str:
+def refusal_key(
+    digest: SourceDigest, producer: str, policy: str, graphify_version: str | None = None
+) -> str:
     """Identity of one refused update: the source, the program, the guard.
 
     The attempt id rather than the semantic hash: an AST update reads code, so a
-    code-only fix after a refusal must retry instead of staying held. Producer
-    and policy are in the key so switching either retries the same source once.
+    code-only fix after a refusal must retry instead of staying held. Producer,
+    graphify version and policy are in the key so changing any of them retries
+    the same source once. An unknown version keeps the versionless key.
     """
+    if graphify_version:
+        producer = f"{producer}@{graphify_version}"
     return f"{digest.attempt_id}:{producer}:{policy}"
 
 

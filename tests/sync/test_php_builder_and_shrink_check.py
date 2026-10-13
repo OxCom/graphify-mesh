@@ -23,10 +23,10 @@ from pathlib import Path
 
 import pytest
 
-from graphify_mesh.sync import graphify_cli, sync_project, validate
+from graphify_mesh.sync import graphify_cli, repo_tags, sync_project, validate
 from graphify_mesh.sync.cli import build_overrides, parse_args
 from graphify_mesh.sync.config import Settings
-from graphify_mesh.sync.pipeline import _explained_shrink_total, run
+from graphify_mesh.sync.pipeline import _explained_shrink_total, _producer_changed, run
 from graphify_mesh.sync.registry import load_registry
 from graphify_mesh.sync.state import SourceDigest
 from graphify_mesh.sync.sync_project import (
@@ -199,9 +199,12 @@ def test_run_php_update_child_imports_editable_install_from_real_user_site(tmp_p
     (src / "fake_graphify_php.py").write_text("MARK = 'loaded'\n", encoding="utf-8")
     (user_site / "__editable__.fake_graphify_php.pth").write_text(f"{src}\n", encoding="utf-8")
     out = tmp_path / "out.txt"
+    # The production wrapper runs on /usr/bin/python3. A venv interpreter never reads the
+    # user site, so under a venv pytest the child must use the base interpreter instead.
+    interpreter = getattr(sys, "_base_executable", sys.executable)
     script = _executable(
         tmp_path / "php-build",
-        f"#!{sys.executable}\n"
+        f"#!{interpreter}\n"
         "import fake_graphify_php, pathlib\n"
         f"pathlib.Path({str(out)!r}).write_text(fake_graphify_php.MARK)\n",
     )
@@ -592,6 +595,44 @@ def test_ast_only_hold_yields_to_matching_grant():
     )
 
 
+def test_refusal_key_includes_known_graphify_version():
+    current = SourceDigest("c1", "s1", 1)
+    assert refusal_key(current, "update", "attributed", "0.9.66").endswith(
+        ":update@0.9.66:attributed"
+    )
+    assert refusal_key(current, "update", "attributed", None) == _key(current)
+    assert refusal_key(current, "update", "attributed", "0.9.66") != refusal_key(
+        current, "update", "attributed", "0.9.89"
+    )
+
+
+@pytest.mark.parametrize(
+    ("prior", "producer", "version", "changed"),
+    [
+        ({"producer": "update", "graphify_version": "0.9.66"}, "update", "0.9.89", True),
+        ({"producer": "update", "graphify_version": "0.9.89"}, "update", "0.9.89", False),
+        ({"producer": "update"}, "update", "0.9.89", True),
+        ({"producer": "update", "graphify_version": "0.9.66"}, "update", None, False),
+        ({"producer": "update", "graphify_version": "0.9.89"}, "php-update", "0.9.89", True),
+        (None, "update", "0.9.89", False),
+        ({"code_hash": "c0"}, "update", "0.9.89", True),
+        ({"code_hash": "c0"}, "update", None, False),
+    ],
+    ids=[
+        "upgrade",
+        "same",
+        "prior-unrecorded",
+        "current-unknown",
+        "label",
+        "no-state",
+        "pre-producer-state",
+        "pre-producer-state-version-unknown",
+    ],
+)
+def test_producer_changed(prior, producer, version, changed):
+    assert _producer_changed(prior, producer, version) is changed
+
+
 def test_code_only_update_is_held_too():
     current = SourceDigest("c1", "s0", 1)
     prior = dict(PRIOR, refused_key=_key(current), refusal_streak=1)
@@ -677,6 +718,7 @@ def test_pipeline_threads_builder_and_records_producer(php_repo, monkeypatch):
 
 def test_pipeline_ast_only_refusal_is_held_by_refused_key(php_repo, monkeypatch):
     env, root = php_repo
+    monkeypatch.setattr(repo_tags, "_in_process_graphify_version", lambda: None)
     calls: list = []
     monkeypatch.setattr(
         "graphify_mesh.sync.pipeline.apply_action",
@@ -711,6 +753,39 @@ def test_pipeline_allow_shrink_reruns_a_held_update(php_repo, monkeypatch):
     run(env.settings(ast_only=True, shrink_policy="attributed", allow_shrink=True))
     assert len(calls) == 2, "--allow-shrink must re-run the held update"
     assert calls[-1]["allow_shrink"] is True
+
+
+def test_pipeline_records_graphify_version_and_flags_an_upgrade(php_repo, monkeypatch):
+    env, root = php_repo
+    calls: list = []
+    monkeypatch.setattr("graphify_mesh.sync.pipeline.apply_action", _recording_apply(calls))
+    monkeypatch.setattr(repo_tags, "_in_process_graphify_version", lambda: "0.9.66")
+    run(env.settings(shrink_policy="count"))
+    assert _state(env)["graphify_version"] == "0.9.66"
+
+    monkeypatch.setattr(repo_tags, "_in_process_graphify_version", lambda: "0.9.89")
+    (root / "app.php").write_text("<?php\n", encoding="utf-8")
+    run(env.settings(shrink_policy="count"))
+    assert calls[-1]["producer_changed"] is True, "an upgrade must loosen the shrink check"
+    assert _state(env)["graphify_version"] == "0.9.89"
+
+
+def test_pipeline_graphify_upgrade_retries_a_held_update(php_repo, monkeypatch):
+    env, _ = php_repo
+    calls: list = []
+    monkeypatch.setattr(
+        "graphify_mesh.sync.pipeline.apply_action",
+        _recording_apply(calls, status=STATUS_SHRINK_REFUSED),
+    )
+    monkeypatch.setattr(repo_tags, "_in_process_graphify_version", lambda: "0.9.66")
+    run(env.settings(ast_only=True, shrink_policy="attributed"))
+    assert _state(env)["refused_key"].endswith(":update@0.9.66:attributed")
+    run(env.settings(ast_only=True, shrink_policy="attributed"))
+    assert len(calls) == 1, "precondition: the refused update is held"
+
+    monkeypatch.setattr(repo_tags, "_in_process_graphify_version", lambda: "0.9.89")
+    run(env.settings(ast_only=True, shrink_policy="attributed"))
+    assert len(calls) == 2, "a graphify upgrade must retry the held update once"
 
 
 # ---------------------------------------------------------------------------

@@ -412,14 +412,24 @@ def _guarded_apply_action(
     return outcome
 
 
-def _producer_changed(prior_state: dict | None, producer: str) -> bool:
+def _producer_changed(
+    prior_state: dict | None, producer: str, graphify_version: str | None
+) -> bool:
     """Whether this run's producer differs from the one of the accepted graph.
 
-    State written before producers were recorded has none; that is "unknown",
-    not "changed", so the shrink check keeps its strict reading.
+    A different producer label, or a graphify version other than the recorded
+    one: an upgrade changes the extractor without changing the label. State
+    from before versions were recorded counts as changed once, because versions
+    began to be recorded at a graphify upgrade (0.9.66 -> 0.9.89, 2026-10-13)
+    and every accepted run records one. No state, or an unknown current
+    version, is "unknown", not "changed".
     """
-    prior_producer = (prior_state or {}).get("producer")
-    return bool(prior_producer) and prior_producer != producer
+    if not prior_state:
+        return False
+    prior_producer = prior_state.get("producer")
+    if prior_producer and prior_producer != producer:
+        return True
+    return bool(graphify_version) and prior_state.get("graphify_version") != graphify_version
 
 
 def _explained_shrink_total(outcomes: Iterable[ProjectOutcome]) -> tuple[int, int]:
@@ -938,6 +948,9 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # Per-repo, single-use shrink authorizations, resolved once against prior
     # state so the decision and the invocation see the same token.
     shrink_grants: dict[str, str | None] = {}
+    # graphify-php repos build via graphify-php-build, which imports the user-site
+    # graphify; this records the mesh's version, so upgrade both installs together.
+    graphify_version = repo_tags._in_process_graphify_version()
     misconfig_once = _MisconfigLogOnce()
     sandbox_policy = child_sandbox_policy(settings, staging_root)
     with ThreadPoolExecutor(max_workers=settings.extract_concurrency) as pool:
@@ -970,6 +983,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                     current_manifest,
                     producer_for(ACTION_UPDATE, entry.builder),
                     settings.shrink_policy,
+                    graphify_version,
                 ),
                 allow_shrink=settings.allow_shrink,
             )
@@ -1035,7 +1049,9 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 sandbox_policy=sandbox_policy,
                 builder=entry.builder,
                 producer_changed=_producer_changed(
-                    state.get(entry.repo_id), producer_for(action, entry.builder)
+                    state.get(entry.repo_id),
+                    producer_for(action, entry.builder),
+                    graphify_version,
                 ),
             )
             for (i, entry, root, action, current_manifest) in actionable
@@ -1135,6 +1151,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                         outcome.refused_manifest,
                         producer_for(action, entry.builder),
                         settings.shrink_policy,
+                        graphify_version,
                     ),
                 }
         else:
@@ -1147,6 +1164,8 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 # every later run that rewrites this entry wholesale.
                 accepted = outcome.new_manifest.to_dict()
                 accepted["producer"] = producer_for(action, entry.builder)
+                if graphify_version:
+                    accepted["graphify_version"] = graphify_version
                 prior = state.get(entry.repo_id) or {}
                 spent = outcome.consumed_shrink_grant or prior.get("consumed_shrink_grant")
                 if spent:
