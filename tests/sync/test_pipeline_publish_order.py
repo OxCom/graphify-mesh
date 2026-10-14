@@ -14,6 +14,7 @@ Three separate failure modes are covered here:
 from __future__ import annotations
 
 import json
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -513,3 +514,51 @@ def test_embedding_gc_runs_after_flip_current(env, monkeypatch):
 
     assert report.published
     assert calls == ["flip_current", "gc_embeddings"], calls
+
+
+# ---------------------------------------------------------------------------
+# 4. dated graphify backup snapshots are rotated only after the flip
+# ---------------------------------------------------------------------------
+
+
+def _dated_snapshots(collection: Path, ages_days: list[int]) -> list[str]:
+    today = date.today()
+    names = []
+    for age in ages_days:
+        name = (today - timedelta(days=age)).isoformat()
+        (collection / name).mkdir(parents=True)
+        (collection / name / "graph.json").write_text("{}", encoding="utf-8")
+        names.append(name)
+    return names
+
+
+def test_dated_snapshots_pruned_after_current_flips(env, monkeypatch):
+    _one_repo(env)
+    collection = env.collection_path("example-org", "styleguide")
+    old, recent = _dated_snapshots(collection, [30, 1])
+    calls = _record_publish_order(monkeypatch)
+    real_prune = publish.prune_dated_snapshots
+
+    def _prune(*args, **kwargs):
+        calls.append("prune_dated_snapshots")
+        return real_prune(*args, **kwargs)
+
+    monkeypatch.setattr("graphify_mesh.sync.pipeline.publish.prune_dated_snapshots", _prune)
+
+    report = run(env.settings(keep_snapshot_days=5))
+
+    assert report.published
+    assert calls.index("flip_current") < calls.index("prune_dated_snapshots"), calls
+    assert not (collection / old).exists()
+    assert (collection / recent).is_dir()
+
+
+def test_dry_run_prunes_no_dated_snapshots(env):
+    _one_repo(env)
+    collection = env.collection_path("example-org", "styleguide")
+    old, _ = _dated_snapshots(collection, [30, 1])
+
+    report = run(env.settings(dry_run=True, keep_snapshot_days=5))
+
+    assert not report.published
+    assert (collection / old).is_dir()

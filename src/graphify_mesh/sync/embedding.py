@@ -7,7 +7,7 @@ WS1 item 6 order: `... -> label -> embed changed -> overlay resolve -> ...`).
 Design notes (read before changing anything here):
 
   * C6 (embedding input): every embedded node's input string is
-    `label + bounded source snippet + path + community name` — see
+    `label + bounded source snippet + path` — see
     `build_embedding_input`. Nodes carry no context text by default, so the
     snippet is read directly from `source_file` on disk, bounded to a small
     line/char window (`SNIPPET_WINDOW_LINES`/`SNIPPET_MAX_CHARS`) so this
@@ -390,15 +390,13 @@ def build_snippet(source_root: Path | None, source_file: str | None, line: int |
     return snippet[:SNIPPET_MAX_CHARS]
 
 
-def build_embedding_input(
-    label: str, snippet: str, source_file: str, community_name: str | None
-) -> str:
-    """C6: label + bounded source snippet + path + community name,
-    concatenated into a single embedding input string."""
+def build_embedding_input(label: str, snippet: str, source_file: str) -> str:
+    """C6: label + bounded source snippet + path, concatenated into a single
+    embedding input string. The community name is excluded: it is an unstable
+    LLM label, and its churn would invalidate the content-hash cache."""
     parts = [
         f"label: {label}",
         f"path: {source_file}",
-        f"community: {community_name or 'unassigned'}",
     ]
     if snippet:
         parts.append(f"snippet:\n{snippet}")
@@ -567,7 +565,7 @@ def _embed_batch_with_retry(base_url: str, model: str, inputs: list[str]) -> lis
 
 
 def _iter_embeddable_nodes(repo_id: str, graph_data: dict, source_root: Path | None):
-    """Yields (key, label, source_file, community_name, snippet, is_trivial)
+    """Yields (key, label, source_file, snippet, is_trivial)
     for every node in this repo's raw graph that has enough fields to build
     a logical key at all. Nodes without a resolvable key (no source_file or
     label — e.g. bare external/library nodes) are not embeddable and are
@@ -580,9 +578,8 @@ def _iter_embeddable_nodes(repo_id: str, graph_data: dict, source_root: Path | N
             continue
         label = node["label"]
         source_file = node["source_file"]
-        community_name = node.get("community_name")
         snippet = build_snippet(source_root, source_file, node_line(node))
-        yield key, label, source_file, community_name, snippet, is_trivial_node(label, snippet)
+        yield key, label, source_file, snippet, is_trivial_node(label, snippet)
 
 
 def compute_repo_shard(
@@ -625,7 +622,7 @@ def compute_repo_shard(
             recipe_stamp or "<unknown>",
         )
 
-    for key, label, source_file, community_name, snippet, trivial in _iter_embeddable_nodes(
+    for key, label, source_file, snippet, trivial in _iter_embeddable_nodes(
         repo_id, graph_data, source_root
     ):
         if trivial:
@@ -633,7 +630,7 @@ def compute_repo_shard(
             stats.skipped_trivial += 1
             continue
 
-        input_text = build_embedding_input(label, snippet, source_file, community_name)
+        input_text = build_embedding_input(label, snippet, source_file)
         digest = _content_hash(input_text)
         prev_entry = previous_shard.entries.get(key) if reuse_allowed else None
         prev_vector = previous_shard.vectors.get(key) if reuse_allowed else None

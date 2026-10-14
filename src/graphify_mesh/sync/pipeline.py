@@ -1661,6 +1661,26 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             "publish: pruned %d old/incomplete generation(s): %s", len(pruned), ", ".join(pruned)
         )
 
+    # graphify's own pre-overwrite backups (`<collection>/<YYYY-MM-DD>/`) had
+    # no retention. Every registry entry, disabled ones included — their
+    # snapshots still pile up. Dry-run never reaches here; guarded anyway.
+    if not settings.dry_run and settings.keep_snapshot_days > 0:
+        snapshots_pruned: list[str] = []
+        seen_collections: set[Path] = set()
+        for entry in registry.repos:
+            collection = Path(entry.collection_path).resolve()
+            if collection in seen_collections:
+                continue
+            seen_collections.add(collection)
+            for name in publish.prune_dated_snapshots(collection, settings.keep_snapshot_days):
+                snapshots_pruned.append(f"{entry.repo_id}/{name}")
+        if snapshots_pruned:
+            log.info(
+                "publish: pruned %d dated snapshot dir(s): %s",
+                len(snapshots_pruned),
+                ", ".join(snapshots_pruned),
+            )
+
     report.published = True
     report.generation_id = generation_id
     # The published generation now holds every accepted loss: it is the new

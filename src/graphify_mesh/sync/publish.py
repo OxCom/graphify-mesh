@@ -14,10 +14,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import re
 import shutil
 import time
+from datetime import date
 from pathlib import Path
+
+log = logging.getLogger("graphify_mesh.sync.publish")
+
+# Name of a graphify pre-overwrite backup dir (`date.today().isoformat()`).
+_DATED_SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Every file the pipeline's full publish sequence writes into a generation
 # dir. Completeness for pruning is manifest-aware (see `_is_incomplete` in
@@ -256,6 +264,60 @@ def prune_old_generations(generations_dir: Path, current: Path, keep: int = 2) -
     for name in to_remove:
         target = generations_dir / name
         shutil.rmtree(target, ignore_errors=True)
+        removed.append(name)
+    return removed
+
+
+def prune_dated_snapshots(
+    collection_path: Path, keep_days: int, today: date | None = None
+) -> list[str]:
+    """Delete graphify's dated backup dirs under `collection_path` that are
+    more than `keep_days` days old, always keeping the newest one.
+
+    Upstream graphify's `backup_if_protected` copies graph.json,
+    GRAPH_REPORT.md, manifest.json etc. into `<collection>/<YYYY-MM-DD>/`
+    (local date) before overwriting a labeled graph, and nothing retained or
+    pruned them. Only direct children that are real directories (never
+    symlinks) named exactly `YYYY-MM-DD` with a valid calendar date count;
+    every other entry (`cache`, generation ids, timestamped names) is never
+    touched. A dir is old when `(today - dir_date).days > keep_days`.
+    `keep_days <= 0` disables rotation. A failed delete is logged as a
+    warning and skipped — wasted disk is acceptable, a failed run is not.
+    Returns the names actually removed.
+    """
+    if keep_days <= 0 or not collection_path.is_dir():
+        return []
+    today = today or date.today()
+    try:
+        children = list(collection_path.iterdir())
+    except OSError as exc:
+        log.warning("publish: could not list %s for dated snapshots: %s", collection_path, exc)
+        return []
+    dated: dict[str, date] = {}
+    for child in children:
+        if not _DATED_SNAPSHOT_RE.match(child.name):
+            continue
+        if child.is_symlink() or not child.is_dir():
+            continue
+        try:
+            dated[child.name] = date.fromisoformat(child.name)
+        except ValueError:
+            continue
+    if not dated:
+        return []
+    newest = max(dated, key=dated.__getitem__)
+
+    removed = []
+    for name in sorted(dated):
+        if name == newest or (today - dated[name]).days <= keep_days:
+            continue
+        try:
+            shutil.rmtree(collection_path / name)
+        except OSError as exc:
+            log.warning(
+                "publish: could not remove dated snapshot %s: %s", collection_path / name, exc
+            )
+            continue
         removed.append(name)
     return removed
 

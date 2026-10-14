@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -250,3 +251,159 @@ def test_prune_no_generations_dir_is_a_no_op(tmp_path):
         tmp_path / "does-not-exist", tmp_path / "current", keep=2
     )
     assert removed == []
+
+
+# ---------------------------------------------------------------------------
+# prune_dated_snapshots: graphify's pre-overwrite `<collection>/<YYYY-MM-DD>/`
+# backups (written by upstream backup_if_protected) had no retention at all.
+# ---------------------------------------------------------------------------
+
+TODAY = date(2026, 10, 14)
+
+
+def _make_snapshot(collection: Path, name: str) -> Path:
+    snap = collection / name
+    snap.mkdir(parents=True)
+    (snap / "graph.json").write_text("{}", encoding="utf-8")
+    return snap
+
+
+def test_prune_dated_snapshots_deletes_dirs_older_than_keep_days(tmp_path):
+    collection = tmp_path / "cem" / "hub"
+    for name in ["2026-10-01", "2026-10-08", "2026-10-13"]:
+        _make_snapshot(collection, name)
+
+    removed = publish.prune_dated_snapshots(collection, keep_days=5, today=TODAY)
+
+    assert sorted(removed) == ["2026-10-01", "2026-10-08"]
+    assert {p.name for p in collection.iterdir()} == {"2026-10-13"}
+
+
+def test_prune_dated_snapshots_keeps_dir_exactly_keep_days_old(tmp_path):
+    collection = tmp_path / "c"
+    _make_snapshot(collection, "2026-10-09")  # exactly 5 days old
+    _make_snapshot(collection, "2026-10-08")  # 6 days old
+    _make_snapshot(collection, "2026-10-14")
+
+    removed = publish.prune_dated_snapshots(collection, keep_days=5, today=TODAY)
+
+    assert removed == ["2026-10-08"]
+    assert {p.name for p in collection.iterdir()} == {"2026-10-09", "2026-10-14"}
+
+
+def test_prune_dated_snapshots_keeps_newest_even_when_all_are_old(tmp_path):
+    collection = tmp_path / "c"
+    for name in ["2026-08-01", "2026-09-01", "2026-09-15"]:
+        _make_snapshot(collection, name)
+
+    removed = publish.prune_dated_snapshots(collection, keep_days=5, today=TODAY)
+
+    assert sorted(removed) == ["2026-08-01", "2026-09-01"]
+    assert {p.name for p in collection.iterdir()} == {"2026-09-15"}
+
+
+def test_prune_dated_snapshots_ignores_non_matching_names(tmp_path):
+    collection = tmp_path / "c"
+    untouched = [
+        "cache",
+        "chunks",
+        "2026-10-12T18-18-17Z",
+        "20261014T104024Z-abcdef12-000000",
+        "2026-13-45",  # matches the pattern but is not a real date
+        "2026-1-01",
+    ]
+    for name in untouched:
+        _make_snapshot(collection, name)
+    (collection / "2026-01-01").write_text("a file, not a dir", encoding="utf-8")
+    _make_snapshot(collection, "2026-10-14")
+
+    removed = publish.prune_dated_snapshots(collection, keep_days=5, today=TODAY)
+
+    assert removed == []
+    remaining = {p.name for p in collection.iterdir()}
+    assert remaining == set(untouched) | {"2026-01-01", "2026-10-14"}
+
+
+def test_prune_dated_snapshots_skips_symlinks_named_like_a_date(tmp_path):
+    collection = tmp_path / "c"
+    target = _make_snapshot(tmp_path / "elsewhere", "real")
+    collection.mkdir()
+    (collection / "2026-01-01").symlink_to(target, target_is_directory=True)
+    _make_snapshot(collection, "2026-10-14")
+
+    removed = publish.prune_dated_snapshots(collection, keep_days=5, today=TODAY)
+
+    assert removed == []
+    assert (collection / "2026-01-01").is_symlink()
+    assert (target / "graph.json").is_file()
+
+
+def test_prune_dated_snapshots_symlink_is_not_counted_as_newest(tmp_path):
+    """A symlink named with a later date must not take the 'newest' slot and
+    thereby expose the real newest snapshot to deletion."""
+    collection = tmp_path / "c"
+    target = _make_snapshot(tmp_path / "elsewhere", "real")
+    _make_snapshot(collection, "2026-09-01")
+    (collection / "2026-10-14").symlink_to(target, target_is_directory=True)
+
+    removed = publish.prune_dated_snapshots(collection, keep_days=5, today=TODAY)
+
+    assert removed == []
+    assert (collection / "2026-09-01").is_dir()
+
+
+def test_prune_dated_snapshots_keep_days_zero_deletes_nothing(tmp_path):
+    collection = tmp_path / "c"
+    for name in ["2026-01-01", "2026-05-01", "2026-10-14"]:
+        _make_snapshot(collection, name)
+
+    removed = publish.prune_dated_snapshots(collection, keep_days=0, today=TODAY)
+
+    assert removed == []
+    assert len(list(collection.iterdir())) == 3
+
+
+def test_prune_dated_snapshots_missing_collection_dir_returns_empty(tmp_path):
+    assert publish.prune_dated_snapshots(tmp_path / "nope", keep_days=5, today=TODAY) == []
+
+
+def test_prune_dated_snapshots_rmtree_failure_is_logged_and_does_not_abort(
+    tmp_path, monkeypatch, caplog
+):
+    collection = tmp_path / "c"
+    for name in ["2026-01-01", "2026-02-01", "2026-10-14"]:
+        _make_snapshot(collection, name)
+    real_rmtree = publish.shutil.rmtree
+
+    def _rmtree(path, *args, **kwargs):
+        if Path(path).name == "2026-01-01":
+            raise PermissionError("simulated")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(publish.shutil, "rmtree", _rmtree)
+
+    with caplog.at_level("WARNING"):
+        removed = publish.prune_dated_snapshots(collection, keep_days=5, today=TODAY)
+
+    assert removed == ["2026-02-01"]
+    assert (collection / "2026-01-01").is_dir()
+    assert "2026-01-01" in caplog.text
+
+
+def test_prune_dated_snapshots_unlistable_collection_returns_empty(tmp_path, monkeypatch, caplog):
+    collection = tmp_path / "c"
+    _make_snapshot(collection, "2026-01-01")
+    real_iterdir = Path.iterdir
+
+    def _iterdir(self):
+        if self == collection:
+            raise PermissionError("simulated")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", _iterdir)
+
+    with caplog.at_level("WARNING"):
+        removed = publish.prune_dated_snapshots(collection, keep_days=5, today=TODAY)
+
+    assert removed == []
+    assert str(collection) in caplog.text

@@ -292,6 +292,30 @@ KEEP_EMBEDDING_GENERATIONS = 2
 # flip_current succeeds.
 KEEP_STRUCTURAL_GENERATIONS = 2
 
+# Upstream graphify's backup_if_protected copies graph.json & co. into
+# `<collection>/<YYYY-MM-DD>/` before overwriting a labeled graph, and nothing
+# ever pruned them (cem/hub reached 61 dirs, ~538M). The publish step deletes
+# dated dirs older than this many days, always keeping each repo's newest;
+# 0 disables rotation. See publish.prune_dated_snapshots.
+KEEP_SNAPSHOT_DAYS = 5
+
+
+def _keep_snapshot_days_from_env(name: str, default: int) -> int:
+    """Parse GRAPHIFY_MESH_KEEP_SNAPSHOT_DAYS. Unset -> default; unparsable
+    or negative -> default; 0 -> rotation disabled. Degrade, never raise —
+    a bad retention value must not abort the run."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < 0:
+        return default
+    return value
+
+
 # Overlay-only relation types (WS4). These must NEVER appear in the
 # structural (per-repo or merged global) graph output (C5, WS1 item 7).
 FORBIDDEN_OVERLAY_RELATION_TYPES = frozenset(
@@ -620,6 +644,11 @@ class Settings:
     ollama_embed_health_check: Callable[[str, float], bool] | None = None
     keep_embedding_generations: int = KEEP_EMBEDDING_GENERATIONS
     keep_structural_generations: int = KEEP_STRUCTURAL_GENERATIONS
+    keep_snapshot_days: int = field(
+        default_factory=lambda: _keep_snapshot_days_from_env(
+            "GRAPHIFY_MESH_KEEP_SNAPSHOT_DAYS", KEEP_SNAPSHOT_DAYS
+        )
+    )
 
     # Extract-backend health probe (infra-outage classification). Disabled OR
     # an empty URL makes the whole feature inert: no probes, every child

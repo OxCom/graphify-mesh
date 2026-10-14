@@ -8,8 +8,11 @@ import pytest
 
 from graphify_mesh.sync.config import (
     API_TIMEOUT_MAX_SECONDS,
+    KEEP_SNAPSHOT_DAYS,
     OLLAMA_DEFAULT_API_TIMEOUT,
+    Settings,
     _api_timeout_from_env,
+    _keep_snapshot_days_from_env,
     is_valid_http_base_url,
 )
 
@@ -70,3 +73,42 @@ def test_ollama_api_timeout_rejects_bad_values_naming_the_variable(monkeypatch, 
     monkeypatch.setenv("GRAPHIFY_MESH_OLLAMA_API_TIMEOUT", raw)
     with pytest.raises(ValueError, match="GRAPHIFY_MESH_OLLAMA_API_TIMEOUT"):
         _api_timeout_from_env("GRAPHIFY_MESH_OLLAMA_API_TIMEOUT", OLLAMA_DEFAULT_API_TIMEOUT)
+
+
+# ---------------------------------------------------------------------------
+# GRAPHIFY_MESH_KEEP_SNAPSHOT_DAYS: retention for graphify's dated
+# pre-overwrite backup dirs. Degrades to the default on bad input, never raises.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, KEEP_SNAPSHOT_DAYS),
+        ("7", 7),
+        ("abc", KEEP_SNAPSHOT_DAYS),
+        ("-1", KEEP_SNAPSHOT_DAYS),
+        ("0", 0),
+    ],
+)
+def test_keep_snapshot_days_env_parsing(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("GRAPHIFY_MESH_KEEP_SNAPSHOT_DAYS", raising=False)
+    else:
+        monkeypatch.setenv("GRAPHIFY_MESH_KEEP_SNAPSHOT_DAYS", raw)
+    assert (
+        _keep_snapshot_days_from_env("GRAPHIFY_MESH_KEEP_SNAPSHOT_DAYS", KEEP_SNAPSHOT_DAYS)
+        == expected
+    )
+
+
+def test_keep_snapshot_days_default_is_five_and_wired_into_settings(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRAPHIFY_MESH_KEEP_SNAPSHOT_DAYS", "9")
+    assert KEEP_SNAPSHOT_DAYS == 5
+    settings = Settings(
+        mesh_root=tmp_path,
+        scan_roots=[tmp_path],
+        approved_roots=[tmp_path],
+        registry_path=tmp_path / "registry.json",
+    )
+    assert settings.keep_snapshot_days == 9

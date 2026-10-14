@@ -81,16 +81,16 @@ def test_build_snippet_no_root_returns_empty():
 
 def test_build_embedding_input_truncated_to_max_chars():
     huge_snippet = "y" * 10000
-    text = embedding.build_embedding_input("MyLabel", huge_snippet, "src/x.py", "Some Community")
+    text = embedding.build_embedding_input("MyLabel", huge_snippet, "src/x.py")
     assert len(text) <= embedding.EMBED_INPUT_MAX_CHARS
     assert text.startswith("label: MyLabel")
 
 
 def test_build_embedding_input_no_snippet_still_includes_required_parts():
-    text = embedding.build_embedding_input("MyLabel", "", "src/x.py", "Some Community")
+    text = embedding.build_embedding_input("MyLabel", "", "src/x.py")
     assert "label: MyLabel" in text
     assert "path: src/x.py" in text
-    assert "community: Some Community" in text
+    assert "community:" not in text
     assert "snippet:" not in text
 
 
@@ -299,32 +299,78 @@ def test_compute_repo_shard_recomputes_when_content_changes(tmp_path, monkeypatc
 
     monkeypatch.setattr(embedding, "embed_batch", fake_embed_batch)
 
-    first_graph = _graph_with_one_node(extra="A")
+    stamp = embedding.recipe_stamp_for_model("m")
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "w.py").write_text("def Widget():\n    return 1\n", encoding="utf-8")
+    graph = _graph_with_one_node()
     first_shard = embedding.compute_repo_shard(
         "repo.a",
-        first_graph,
+        graph,
         tmp_path,
         previous_shard=embedding.RepoShard.empty(),
         base_url="https://host",
         model="m",
         stats=stats,
+        recipe_stamp=stamp,
     )
     assert call_count["n"] == 1
 
-    # community_name changed -> embedding input hash changes -> must recompute.
-    second_graph = _graph_with_one_node(extra="B")
+    # Source snippet changed -> embedding input hash changes -> must recompute.
+    (src / "w.py").write_text("def Widget():\n    return compute_total()\n", encoding="utf-8")
     second_shard = embedding.compute_repo_shard(
         "repo.a",
-        second_graph,
+        graph,
         tmp_path,
         previous_shard=first_shard,
         base_url="https://host",
         model="m",
         stats=stats,
+        recipe_stamp=stamp,
     )
     assert call_count["n"] == 2
     key = next(iter(second_shard.entries))
     assert list(second_shard.vectors.get(key)) == pytest.approx([2.0])
+
+
+def test_compute_repo_shard_reuses_vector_when_only_community_name_changes(tmp_path, monkeypatch):
+    stats = embedding.EmbeddingStats()
+    call_count = {"n": 0}
+
+    def fake_embed_batch(base_url, model, inputs, timeout=30.0):
+        call_count["n"] += 1
+        return [[1.0, 2.0] for _ in inputs]
+
+    monkeypatch.setattr(embedding, "embed_batch", fake_embed_batch)
+
+    stamp = embedding.recipe_stamp_for_model("m")
+    first_shard = embedding.compute_repo_shard(
+        "repo.a",
+        _graph_with_one_node(extra="A"),
+        tmp_path,
+        previous_shard=embedding.RepoShard.empty(),
+        base_url="https://host",
+        model="m",
+        stats=stats,
+        recipe_stamp=stamp,
+    )
+    assert call_count["n"] == 1
+
+    second_shard = embedding.compute_repo_shard(
+        "repo.a",
+        _graph_with_one_node(extra="B"),
+        tmp_path,
+        previous_shard=first_shard,
+        base_url="https://host",
+        model="m",
+        stats=stats,
+        recipe_stamp=stamp,
+    )
+    assert call_count["n"] == 1
+    assert stats.reused == 1
+    key = next(iter(second_shard.entries))
+    assert second_shard.entries[key]["content_hash"] == first_shard.entries[key]["content_hash"]
+    assert list(second_shard.vectors.get(key)) == pytest.approx([1.0, 2.0])
 
 
 def test_compute_repo_shard_skips_trivial_node_without_calling_embed(tmp_path, monkeypatch):
