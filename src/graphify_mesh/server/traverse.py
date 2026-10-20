@@ -48,21 +48,27 @@ DIRECTIONS = (DIRECTION_IN, DIRECTION_OUT, DIRECTION_BOTH)
 RELIABILITY_EXACT = "exact"
 RELIABILITY_PARTIAL = "partial"
 
-# Relations the upstream extractor resolves only partly: method calls made
-# through typed properties or dependency injection produce no `calls` edge
-# (measured: 554 of 2797 PHP methods in cem.hub carry one, ~20%). A missing
-# edge of these relations is therefore not evidence of a missing call.
+# Relations the upstream extractor resolves only partly: which calls produce
+# an edge depends on the extractor that built the repo. A missing edge of
+# these relations is therefore not evidence of a missing call.
 PARTIAL_RELATIONS = frozenset({"calls", "indirect_call"})
 
 NOTE_COMPLETE_SET = (
     "Result is the complete set of nodes reachable over the INDEXED edges of the "
     "requested relations in the published generation, not a ranked top-k."
 )
+NOTE_DEPTH_BOUNDED = (
+    "Exact for the nodes within depth {depth}; the frontier was not exhausted, so "
+    "deeper nodes may exist. Raise depth (max {max_depth}) for the full set."
+)
 NOTE_PARTIAL_RELATIONS = (
-    "calls/indirect_call edges are incomplete: method calls through typed properties "
-    "or dependency injection are not resolved by the extractor (measured ~20% coverage "
-    "of PHP methods in cem.hub). Absence of an edge is not evidence of no call; impact "
-    "answers must not rest on these relations."
+    "calls/indirect_call edges are incomplete: which calls are resolved depends on the "
+    "extractor that built the repo. Absence of an edge is not evidence of no call; "
+    "impact answers must not rest on these relations."
+)
+NOTE_RESOLVER = (
+    "Some call edges come from resolver '{name}' (typed receivers resolved); untyped "
+    "receivers, chained and dynamic calls remain unresolved."
 )
 NOTE_INFERRED = (
     "Non-EXTRACTED (INFERRED/AMBIGUOUS) edges were followed; they are extractor guesses, "
@@ -73,8 +79,9 @@ NOTE_TRUNCATED = (
     "is incomplete and must not be read as the full roster."
 )
 NOTE_UNKEYED_SKIPPED = (
-    "Nodes without a source_file or label have no durable key and were neither "
-    "reported nor traversed through; see skipped_unkeyed."
+    "Nodes without a source_file or label have no durable key (external/vendor stub "
+    "nodes with an empty source_file land here) and were neither reported nor "
+    "traversed through; see skipped_unkeyed."
 )
 
 
@@ -93,6 +100,8 @@ class NeighborsResult:
     frontier_exhausted: bool = False
     skipped_unkeyed: int = 0
     degraded: list[str] = field(default_factory=list)
+    # `_resolver` values seen on traversed calls/indirect_call edges (data only).
+    resolvers: set[str] = field(default_factory=set)
 
     @property
     def reliability(self) -> str:
@@ -102,9 +111,17 @@ class NeighborsResult:
 
     @property
     def notes(self) -> list[str]:
-        notes = [NOTE_TRUNCATED if self.truncated else NOTE_COMPLETE_SET]
+        if not self.resolved:
+            notes = []
+        elif self.truncated:
+            notes = [NOTE_TRUNCATED]
+        elif self.frontier_exhausted:
+            notes = [NOTE_COMPLETE_SET]
+        else:
+            notes = [NOTE_DEPTH_BOUNDED.format(depth=self.depth, max_depth=MAX_DEPTH)]
         if PARTIAL_RELATIONS.intersection(self.relations):
             notes.append(NOTE_PARTIAL_RELATIONS)
+            notes.extend(NOTE_RESOLVER.format(name=name) for name in sorted(self.resolvers))
         if self.include_inferred:
             notes.append(NOTE_INFERRED)
         if self.skipped_unkeyed:
@@ -243,6 +260,7 @@ def neighbors(
         # node_id -> {(from_key, relation, confidence)}: every matching edge
         # from the previous level into a newly reached node.
         reached: dict[str, set[tuple[str, str, str]]] = {}
+        reached_resolvers: dict[str, set[str]] = {}
         for current in frontier:
             for neighbor_id, link in generation.adjacency.get(current, []):
                 if neighbor_id in visited:
@@ -255,6 +273,9 @@ def neighbors(
                 if neighbor_id not in key_of:
                     unkeyed.add(neighbor_id)
                     continue
+                resolver = link.get("_resolver")
+                if resolver and link["relation"] in PARTIAL_RELATIONS:
+                    reached_resolvers.setdefault(neighbor_id, set()).add(str(resolver))
                 confidence = link.get("confidence", ranking.CONFIDENCE_EXTRACTED)
                 reached.setdefault(neighbor_id, set()).add(
                     (key_of[current], link["relation"], confidence)
@@ -268,6 +289,7 @@ def neighbors(
             next_ids = next_ids[:room]
             result.truncated = True
         for nid in next_ids:
+            result.resolvers.update(reached_resolvers.get(nid, ()))
             card = _node_card(nid, key_of[nid], repo, generation)
             card["depth"] = level
             card["via"] = [

@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shlex
 import shutil
 import site
 import subprocess
+import tempfile
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -793,6 +795,44 @@ def run_php_update(
             **PHP_MANAGED_ENV,
         },
     )
+
+
+# `graphify-php-build --version` prints `graphify-php <ver> (graphify <ver>)` and exits
+# before touching any file. Versions are plain tokens; anything else is garbage.
+_PHP_VERSION_RE = re.compile(
+    r"graphify-php ([0-9A-Za-z.+_-]{1,64}) \(graphify ([0-9A-Za-z.+_-]{1,64})\)"
+)
+PHP_VERSION_PROBE_TIMEOUT_SECONDS = 30  # same budget as repo_tags.VERSION_PROBE_TIMEOUT_SECONDS
+_UNKNOWN_VERSION = "unknown"
+
+
+def probe_php_build_version(php_build_bin: str) -> dict[str, str | None] | None:
+    """`{"graphify_php": ..., "graphify": ...}` as the wrapper's interpreter reports them.
+
+    That interpreter, not this one, runs the build: the daemon venv and the user site
+    can carry different graphify versions. A reported "unknown" becomes None. None for
+    the whole result on a missing binary, non-zero exit, timeout or unparsable output.
+    """
+    argv = resolve_bin_argv(php_build_bin)
+    if not argv:
+        return None
+    # An empty cwd: a wrapper too old to know `--version` runs a build and unlinks
+    # cwd-relative paths before graphify rejects the flag.
+    with tempfile.TemporaryDirectory(prefix="graphify-php-probe-") as scratch:
+        result = _run(
+            argv + ["--version"],
+            cwd=Path(scratch),
+            env=None,
+            timeout=PHP_VERSION_PROBE_TIMEOUT_SECONDS,
+        )
+    if not result.ok:
+        return None
+    lines = result.stdout.strip().splitlines()
+    match = _PHP_VERSION_RE.fullmatch(lines[0].strip()) if len(lines) == 1 else None
+    if match is None:
+        return None
+    php, graphify = (None if v == _UNKNOWN_VERSION else v for v in match.groups())
+    return {"graphify_php": php, "graphify": graphify}
 
 
 def run_extract(

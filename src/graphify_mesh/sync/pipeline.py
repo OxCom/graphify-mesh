@@ -42,6 +42,7 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 from graphify_mesh.sync import (
     embedding,
@@ -67,6 +68,7 @@ from graphify_mesh.sync.discovery import assert_registry_containment, discover_f
 from graphify_mesh.sync.locking import transaction_lock
 from graphify_mesh.sync.registry import (
     BUILDER_GRAPHIFY,
+    BUILDER_GRAPHIFY_PHP,
     Registry,
     RepoEntry,
     load_registry,
@@ -412,8 +414,20 @@ def _guarded_apply_action(
     return outcome
 
 
+# Per-repo state key: versions of the program that built the accepted graph,
+# as `probe_php_build_version` reports them. Only graphify-php repos carry it.
+PRODUCER_VERSIONS_KEY = "producer_versions"
+# The versions of a refused attempt. Accepted state still names the older
+# build, and the refusal key must not flip when a later probe fails.
+REFUSED_PRODUCER_VERSIONS_KEY = "refused_producer_versions"
+REFUSED_GRAPHIFY_VERSION_KEY = "refused_graphify_version"
+
+
 def _producer_changed(
-    prior_state: dict | None, producer: str, graphify_version: str | None
+    prior_state: dict | None,
+    producer: str,
+    graphify_version: str | None,
+    producer_versions: dict | None = None,
 ) -> bool:
     """Whether this run's producer differs from the one of the accepted graph.
 
@@ -422,14 +436,114 @@ def _producer_changed(
     from before versions were recorded counts as changed once, because versions
     began to be recorded at a graphify upgrade (0.9.66 -> 0.9.89, 2026-10-13)
     and every accepted run records one. No state, or an unknown current
-    version, is "unknown", not "changed".
+    version, is "unknown", not "changed". `producer_versions` compares only
+    where both sides are known (see `_producer_versions_differ`).
     """
     if not prior_state:
         return False
     prior_producer = prior_state.get("producer")
     if prior_producer and prior_producer != producer:
         return True
-    return bool(graphify_version) and prior_state.get("graphify_version") != graphify_version
+    if graphify_version and prior_state.get("graphify_version") != graphify_version:
+        return True
+    return _producer_versions_differ(prior_state, producer_versions)
+
+
+def _producer_versions_differ(prior_state: dict, producer_versions: dict | None) -> bool:
+    """Whether a recorded producer version differs from this run's, both known.
+
+    A name missing on either side, or a None value, is unknown, not changed:
+    state written before these versions were recorded must not rebuild every
+    graphify-php repo once.
+    """
+    recorded = prior_state.get(PRODUCER_VERSIONS_KEY)
+    if not producer_versions or not isinstance(recorded, dict):
+        return False
+    return any(
+        value and recorded.get(name) and recorded.get(name) != value
+        for name, value in producer_versions.items()
+    )
+
+
+def _producer_upgraded(
+    prior_state: dict | None, graphify_version: str | None, producer_versions: dict | None
+) -> bool:
+    """Whether the program that builds a repo was upgraded since its accepted graph.
+
+    The rebuild trigger for an unchanged source, so narrower than
+    `_producer_changed`: a producer label switch (extract -> update) and a
+    version never recorded are not upgrades. Only two known, different versions.
+    """
+    if not prior_state:
+        return False
+    recorded = prior_state.get("graphify_version")
+    if graphify_version and recorded and recorded != graphify_version:
+        return True
+    return _producer_versions_differ(prior_state, producer_versions)
+
+
+def _recorded_versions(prior_state: dict | None, key: str) -> dict[str, str]:
+    """Known producer versions under `key` in prior state; anything else is dropped."""
+    recorded = (prior_state or {}).get(key)
+    if not isinstance(recorded, dict):
+        return {}
+    return {k: v for k, v in recorded.items() if isinstance(v, str) and v}
+
+
+class RepoVersions(NamedTuple):
+    """Producer versions for one repo in one run.
+
+    `graphify` and `producer_versions` are recorded on accept and compared for
+    upgrades. `key_graphify` and `key_versions` build the refusal key and
+    prefer a refused attempt's versions, so the key of a held refusal does not
+    flip when a later probe fails.
+    """
+
+    graphify: str | None
+    producer_versions: dict | None
+    key_graphify: str | None
+    key_versions: dict | None
+
+
+def _repo_versions(
+    builder: str,
+    graphify_version: str | None,
+    php_versions: dict | None,
+    prior_state: dict | None = None,
+) -> RepoVersions:
+    """Versions of the program that builds a repo built by `builder`.
+
+    graphify-php repos build in the wrapper's interpreter, whose graphify can
+    differ from this process's, so the probed pair wins there. A value the
+    probe did not report keeps the last recorded one: a probe that fails now
+    and recovers later neither rebuilds nor releases a held refusal. This
+    process's graphify is used only when the probe failed and nothing is recorded.
+    """
+    if builder != BUILDER_GRAPHIFY_PHP:
+        return RepoVersions(graphify_version, None, graphify_version, None)
+    prior = prior_state or {}
+    probed = {name: value for name, value in (php_versions or {}).items() if value}
+    accepted = _recorded_versions(prior, PRODUCER_VERSIONS_KEY)
+    refused = _recorded_versions(prior, REFUSED_PRODUCER_VERSIONS_KEY)
+    fallback = graphify_version if php_versions is None else None
+    recorded_graphify = prior.get("graphify_version") or fallback
+    key_graphify = prior.get(REFUSED_GRAPHIFY_VERSION_KEY) or recorded_graphify
+    graphify = probed.get("graphify")
+    return RepoVersions(
+        graphify or recorded_graphify,
+        {**accepted, **probed} or None,
+        graphify or key_graphify,
+        {**accepted, **refused, **probed} or None,
+    )
+
+
+def _key_version(graphify_version: str | None, producer_versions: dict | None) -> str | None:
+    """Version part of a refusal key. The graphify-php version is in it, so a
+    plugin upgrade retries a held update once, as a graphify upgrade does."""
+    php = (producer_versions or {}).get("graphify_php")
+    if not php:
+        return graphify_version
+    return f"{graphify_version or ''}+graphify-php-{php}"
 
 
 def _explained_shrink_total(outcomes: Iterable[ProjectOutcome]) -> tuple[int, int]:
@@ -951,6 +1065,18 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # graphify-php repos build via graphify-php-build, which imports the user-site
     # graphify; this records the mesh's version, so upgrade both installs together.
     graphify_version = repo_tags._in_process_graphify_version()
+    # graphify-php repos record the wrapper's own versions instead, probed once per run.
+    has_php_repo = any(entry.builder == BUILDER_GRAPHIFY_PHP for entry in active_repos)
+    php_versions = (
+        graphify_cli.probe_php_build_version(settings.php_build_bin) if has_php_repo else None
+    )
+    if has_php_repo and php_versions is None:
+        log.warning(
+            "%s --version gave no usable answer: graphify-php repos keep their last "
+            "recorded producer versions this run, and a plugin upgrade is not detected",
+            settings.php_build_bin,
+        )
+    repo_versions: dict[str, RepoVersions] = {}
     misconfig_once = _MisconfigLogOnce()
     sandbox_policy = child_sandbox_policy(settings, staging_root)
     with ThreadPoolExecutor(max_workers=settings.extract_concurrency) as pool:
@@ -973,6 +1099,8 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             prior_state = state.get(entry.repo_id)
             shrink_grant = _shrink_grant_for(entry, prior_state)
             shrink_grants[entry.repo_id] = shrink_grant
+            versions = _repo_versions(entry.builder, graphify_version, php_versions, prior_state)
+            repo_versions[entry.repo_id] = versions
             action = decide_action(
                 prior_state,
                 current_manifest,
@@ -983,9 +1111,12 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                     current_manifest,
                     producer_for(ACTION_UPDATE, entry.builder),
                     settings.shrink_policy,
-                    graphify_version,
+                    _key_version(versions.key_graphify, versions.key_versions),
                 ),
                 allow_shrink=settings.allow_shrink,
+                producer_changed=_producer_upgraded(
+                    prior_state, versions.graphify, versions.producer_versions
+                ),
             )
             log.info("[%d/%d] %s: %s ...", i, total_active, entry.repo_id, action)
             bar.tick(i - 1, f"{entry.repo_id}: {action} ...")
@@ -1051,7 +1182,8 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 producer_changed=_producer_changed(
                     state.get(entry.repo_id),
                     producer_for(action, entry.builder),
-                    graphify_version,
+                    repo_versions[entry.repo_id].graphify,
+                    repo_versions[entry.repo_id].producer_versions,
                 ),
             )
             for (i, entry, root, action, current_manifest) in actionable
@@ -1138,6 +1270,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 # source digest was refused (and how many times) lets
                 # decide_action stop re-extracting an unchanged source forever.
                 prior = state.get(entry.repo_id) or {}
+                versions = repo_versions[entry.repo_id]
                 refused_hash = outcome.refused_manifest.semantic_hash
                 streak = int(prior.get("refusal_streak") or 0)
                 streak = streak + 1 if prior.get("refused_semantic_hash") == refused_hash else 1
@@ -1151,9 +1284,18 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                         outcome.refused_manifest,
                         producer_for(action, entry.builder),
                         settings.shrink_policy,
-                        graphify_version,
+                        _key_version(versions.key_graphify, versions.key_versions),
                     ),
                 }
+                if entry.builder == BUILDER_GRAPHIFY_PHP:
+                    # What the key above was built from, so the next run rebuilds the
+                    # same key even when its probe fails.
+                    if versions.key_versions:
+                        state[entry.repo_id][REFUSED_PRODUCER_VERSIONS_KEY] = dict(
+                            versions.key_versions
+                        )
+                    if versions.key_graphify:
+                        state[entry.repo_id][REFUSED_GRAPHIFY_VERSION_KEY] = versions.key_graphify
         else:
             if outcome.new_manifest is not None:
                 # A successful outcome clears any refusal memory: the source is
@@ -1164,8 +1306,11 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 # every later run that rewrites this entry wholesale.
                 accepted = outcome.new_manifest.to_dict()
                 accepted["producer"] = producer_for(action, entry.builder)
-                if graphify_version:
-                    accepted["graphify_version"] = graphify_version
+                versions = repo_versions[entry.repo_id]
+                if versions.graphify:
+                    accepted["graphify_version"] = versions.graphify
+                if versions.producer_versions:
+                    accepted[PRODUCER_VERSIONS_KEY] = dict(versions.producer_versions)
                 prior = state.get(entry.repo_id) or {}
                 spent = outcome.consumed_shrink_grant or prior.get("consumed_shrink_grant")
                 if spent:

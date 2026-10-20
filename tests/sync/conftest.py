@@ -155,6 +155,16 @@ def _fake_graphify_env_passthrough(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_php_build_probe(monkeypatch):
+    """A run with a `builder: graphify-php` repo probes `graphify-php-build --version`,
+    which would start whatever wrapper this machine has installed. None is a failed
+    probe, i.e. today's behaviour; tests of the probe call the original directly."""
+    monkeypatch.setattr(
+        "graphify_mesh.sync.graphify_cli.probe_php_build_version", lambda php_build_bin: None
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_live_labeling(monkeypatch):
     """Every naming test gets a deterministic labeler.
 

@@ -218,6 +218,67 @@ def test_calls_relation_is_partial_with_di_note(tmp_path):
     assert payload["complete"] is True
 
 
+def test_calls_note_without_resolver_edge_has_no_resolver_note(tmp_path):
+    caller = make_node(REPO, "caller", "src/x.py", node_id="caller")
+    callee = make_node(REPO, "callee", "src/y.py", node_id="callee")
+    server = _server(
+        tmp_path,
+        build_generation([caller, callee], [make_link("caller", "callee", relation="calls")]),
+    )
+    payload = _call(server, node="callee", repo=REPO, relation="calls", direction="in")
+    assert not any("resolver" in note for note in payload["notes"])
+    assert not any("typed properties" in note or "~20%" in note for note in payload["notes"])
+
+
+def test_calls_note_names_resolver_when_edge_carries_it(tmp_path):
+    caller = make_node(REPO, "caller", "src/x.py", node_id="caller")
+    callee = make_node(REPO, "callee", "src/y.py", node_id="callee")
+    link = make_link("caller", "callee", relation="calls")
+    link["_resolver"] = "some-resolver"
+    server = _server(tmp_path, build_generation([caller, callee], [link]))
+    payload = _call(server, node="callee", repo=REPO, relation="calls", direction="in")
+    assert traverse.NOTE_PARTIAL_RELATIONS in payload["notes"]
+    assert traverse.NOTE_RESOLVER.format(name="some-resolver") in payload["notes"]
+
+
+def test_depth_bounded_note_replaces_complete_set_when_frontier_not_exhausted(server):
+    payload = _call(server, node="Base", repo=REPO, relation="inherits", direction="in")
+    assert payload["frontier_exhausted"] is False
+    assert traverse.NOTE_COMPLETE_SET not in payload["notes"]
+    assert (
+        traverse.NOTE_DEPTH_BOUNDED.format(depth=1, max_depth=traverse.MAX_DEPTH)
+        in payload["notes"]
+    )
+
+
+def test_complete_set_note_when_frontier_exhausted(server):
+    payload = _call(server, node="Base", repo=REPO, relation="inherits", direction="in", depth=10)
+    assert payload["frontier_exhausted"] is True
+    assert traverse.NOTE_COMPLETE_SET in payload["notes"]
+
+
+def test_unresolved_seed_emits_no_completeness_note(server):
+    payload = _call(server, node="NoSuchNode", repo=REPO, relation="inherits", direction="in")
+    assert payload["resolved"] is False
+    assert traverse.NOTE_COMPLETE_SET not in payload["notes"]
+    assert not any("Exact for the nodes within depth" in note for note in payload["notes"])
+
+
+def test_resolver_on_edge_cut_by_node_cap_gives_no_note(tmp_path, monkeypatch):
+    monkeypatch.setattr(traverse, "MAX_TRAVERSAL_NODES", 2)
+    callee = make_node(REPO, "callee", "src/y.py", node_id="callee")
+    a = make_node(REPO, "a", "src/a.py", node_id="a")
+    z = make_node(REPO, "z", "src/z.py", node_id="z")
+    link_a = make_link("a", "callee", relation="calls")
+    link_z = make_link("z", "callee", relation="calls")
+    link_z["_resolver"] = "cut-resolver"
+    server = _server(tmp_path, build_generation([callee, a, z], [link_a, link_z]))
+    payload = _call(server, node="callee", repo=REPO, relation="calls", direction="in")
+    assert _labels(payload) == ["a"]
+    assert payload["truncated"] is True
+    assert not any("cut-resolver" in note for note in payload["notes"])
+
+
 def test_bare_method_name_resolves_to_method_label(tmp_path):
     method = make_node(REPO, ".reminderSubmitWeek()", "src/emails.py", node_id="m")
     caller = make_node(REPO, ".run()", "src/job.py", node_id="c")

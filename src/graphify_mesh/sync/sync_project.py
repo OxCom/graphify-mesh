@@ -144,6 +144,7 @@ def decide_action(
     ast_only: bool = False,
     refusal_key: str | None = None,
     allow_shrink: bool = False,
+    producer_changed: bool = False,
 ) -> str:
     """Pick the action for one repo.
 
@@ -154,6 +155,11 @@ def decide_action(
     `allow_shrink` is the run-level --allow-shrink. It releases both holds: the
     guard would accept the held attempt this run, and holding it instead left
     the flag with nothing to act on for exactly the repos it was passed for.
+
+    `producer_changed` means the program that builds this repo was upgraded
+    since its accepted graph. An unchanged source is then updated, not
+    skipped, under the same refusal hold. `graphify update` re-extracts every
+    code file and re-runs every resolver, so no manifest has to be cleared.
     """
     if not has_graph:
         return ACTION_BOOTSTRAP
@@ -187,7 +193,7 @@ def decide_action(
         ):
             return ACTION_SKIP
         return ACTION_EXTRACT
-    if current_manifest.code_hash != prior_state.get("code_hash"):
+    if current_manifest.code_hash != prior_state.get("code_hash") or producer_changed:
         return _update_unless_held(
             prior_state, current_manifest, shrink_grant, refusal_key, allow_shrink
         )

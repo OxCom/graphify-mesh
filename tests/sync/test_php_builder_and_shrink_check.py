@@ -26,7 +26,14 @@ import pytest
 from graphify_mesh.sync import graphify_cli, repo_tags, sync_project, validate
 from graphify_mesh.sync.cli import build_overrides, parse_args
 from graphify_mesh.sync.config import Settings
-from graphify_mesh.sync.pipeline import _explained_shrink_total, _producer_changed, run
+from graphify_mesh.sync.graphify_cli import probe_php_build_version
+from graphify_mesh.sync.pipeline import (
+    _explained_shrink_total,
+    _producer_changed,
+    _producer_upgraded,
+    _repo_versions,
+    run,
+)
 from graphify_mesh.sync.registry import load_registry
 from graphify_mesh.sync.state import SourceDigest
 from graphify_mesh.sync.sync_project import (
@@ -883,3 +890,432 @@ def test_no_snapshot_files_leak(tmp_path, monkeypatch):
     _apply(tmp_path, collection, shrink_policy="count")
     after = set(Path(tempfile.gettempdir()).glob("graphify-mesh-sync-snapshot-*"))
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# rebuild on producer upgrade (graphify, graphify-php)
+# ---------------------------------------------------------------------------
+
+PHP_V1 = {"graphify_php": "0.1.0", "graphify": "0.9.89"}
+PHP_V2 = {"graphify_php": "0.2.0", "graphify": "0.9.89"}
+
+
+@pytest.mark.parametrize(
+    ("prior", "versions", "changed"),
+    [
+        ({"producer": "php-update", "producer_versions": PHP_V1}, PHP_V1, False),
+        ({"producer": "php-update", "producer_versions": PHP_V1}, PHP_V2, True),
+        ({"producer": "php-update"}, PHP_V2, False),
+        ({"producer": "php-update", "producer_versions": PHP_V1}, {"graphify_php": None}, False),
+        ({"producer": "php-update", "producer_versions": PHP_V1}, None, False),
+        ({"producer": "php-update", "producer_versions": "junk"}, PHP_V2, False),
+    ],
+    ids=["same", "different", "prior-absent", "current-unknown", "no-current", "prior-garbage"],
+)
+def test_producer_changed_compares_producer_versions(prior, versions, changed):
+    assert _producer_changed(prior, "php-update", None, versions) is changed
+
+
+@pytest.mark.parametrize(
+    ("prior", "graphify", "versions", "upgraded"),
+    [
+        ({"graphify_version": "0.9.66"}, "0.9.89", None, True),
+        ({"graphify_version": "0.9.89"}, "0.9.89", None, False),
+        ({}, "0.9.89", None, False),
+        ({"graphify_version": "0.9.66"}, None, None, False),
+        ({"producer": "extract", "graphify_version": "0.9.89"}, "0.9.89", None, False),
+        ({"producer_versions": PHP_V1, "graphify_version": "0.9.89"}, "0.9.89", PHP_V2, True),
+        ({"graphify_version": "0.9.89"}, "0.9.89", PHP_V2, False),
+        (None, "0.9.89", PHP_V2, False),
+    ],
+    ids=[
+        "graphify-upgrade",
+        "same",
+        "prior-unrecorded",
+        "current-unknown",
+        "label-only",
+        "plugin-upgrade",
+        "plugin-prior-absent",
+        "no-state",
+    ],
+)
+def test_producer_upgraded(prior, graphify, versions, upgraded):
+    """Narrower than _producer_changed: only two known, different versions rebuild."""
+    assert _producer_upgraded(prior, graphify, versions) is upgraded
+
+
+UNCHANGED = SourceDigest("c0", "s0", 1)
+
+
+def test_unchanged_source_with_producer_upgrade_updates():
+    assert decide_action(PRIOR, UNCHANGED, True) == ACTION_SKIP
+    assert decide_action(PRIOR, UNCHANGED, True, producer_changed=True) == ACTION_UPDATE
+    assert decide_action(None, UNCHANGED, False, producer_changed=True) != ACTION_SKIP
+
+
+def test_producer_upgrade_update_is_held_by_its_refusal_key():
+    prior = dict(PRIOR, refused_key=_key(UNCHANGED), refusal_streak=1)
+    kwargs = {"refusal_key": _key(UNCHANGED), "producer_changed": True}
+    assert decide_action(prior, UNCHANGED, True, **kwargs) == ACTION_SKIP
+    assert decide_action(prior, UNCHANGED, True, allow_shrink=True, **kwargs) == ACTION_UPDATE
+
+
+def _probe_with(monkeypatch, result: graphify_cli.CliResult, seen: dict | None = None):
+    def fake_run(argv, cwd, env, timeout=None):
+        if seen is not None:
+            seen.update(argv=argv, cwd=cwd, timeout=timeout, empty=not any(Path(cwd).iterdir()))
+        return result
+
+    monkeypatch.setattr(graphify_cli, "_run", fake_run)
+    return probe_php_build_version("/opt/pb")
+
+
+def test_probe_parses_the_version_line(monkeypatch):
+    seen: dict = {}
+    out = graphify_cli.CliResult(0, "graphify-php 0.1.0 (graphify 0.9.89)\n", "")
+    assert _probe_with(monkeypatch, out, seen) == {"graphify_php": "0.1.0", "graphify": "0.9.89"}
+    assert seen["argv"] == ["/opt/pb", "--version"]
+    assert seen["empty"], "the probe must run in an empty scratch cwd"
+    assert seen["timeout"] == graphify_cli.PHP_VERSION_PROBE_TIMEOUT_SECONDS
+
+
+def test_probe_maps_unknown_to_none(monkeypatch):
+    out = graphify_cli.CliResult(0, "graphify-php unknown (graphify 0.9.89)\n", "")
+    assert _probe_with(monkeypatch, out) == {"graphify_php": None, "graphify": "0.9.89"}
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        graphify_cli.CliResult(1, "graphify-php 0.1.0 (graphify 0.9.89)\n", ""),
+        graphify_cli.CliResult(124, "", "timeout: ..."),
+        graphify_cli.CliResult(127, "", "exec error: ..."),
+        graphify_cli.CliResult(0, "graphify 0.9.89\n", ""),
+        graphify_cli.CliResult(0, "graphify-php 0.1.0 (graphify 0.9.89)\nextra\n", ""),
+        graphify_cli.CliResult(0, "graphify-php $(x) (graphify 0.9.89)\n", ""),
+        graphify_cli.CliResult(0, "", ""),
+    ],
+    ids=["non-zero", "timeout", "missing", "old-wrapper", "two-lines", "garbage", "empty"],
+)
+def test_probe_returns_none_on_failure(monkeypatch, result):
+    assert _probe_with(monkeypatch, result) is None
+
+
+def test_probe_empty_binary_runs_nothing(monkeypatch):
+    monkeypatch.setattr(graphify_cli, "_run", lambda *a, **k: pytest.fail("ran"))
+    assert probe_php_build_version("  ") is None
+
+
+def test_probe_runs_a_real_stub_and_times_out(tmp_path, monkeypatch):
+    ok = _executable(tmp_path / "pb-ok", "#!/bin/sh\necho 'graphify-php 1.2.3 (graphify 4.5.6)'\n")
+    assert probe_php_build_version(str(ok)) == {"graphify_php": "1.2.3", "graphify": "4.5.6"}
+
+    slow = _executable(tmp_path / "pb-slow", "#!/bin/sh\nsleep 5\n")
+    monkeypatch.setattr(graphify_cli, "PHP_VERSION_PROBE_TIMEOUT_SECONDS", 1)
+    assert probe_php_build_version(str(slow)) is None
+
+
+def _probe_returns(monkeypatch, versions, calls: list | None = None):
+    def fake(php_build_bin):
+        if calls is not None:
+            calls.append(php_build_bin)
+        return versions
+
+    monkeypatch.setattr(graphify_cli, "probe_php_build_version", fake)
+
+
+def test_pipeline_unchanged_source_rebuilds_on_graphify_upgrade(php_repo, monkeypatch):
+    env, _ = php_repo
+    calls: list = []
+    probes: list = []
+    _probe_returns(monkeypatch, PHP_V1, probes)
+    monkeypatch.setattr("graphify_mesh.sync.pipeline.apply_action", _recording_apply(calls))
+    monkeypatch.setattr(repo_tags, "_in_process_graphify_version", lambda: "0.9.66")
+    run(env.settings(shrink_policy="count"))
+    run(env.settings(shrink_policy="count"))
+    assert len(calls) == 1, "precondition: an unchanged source is skipped"
+    assert probes == [], "no graphify-php repo, so no probe"
+    assert "producer_versions" not in _state(env)
+
+    monkeypatch.setattr(repo_tags, "_in_process_graphify_version", lambda: "0.9.89")
+    report = run(env.settings(shrink_policy="count"))
+    assert len(calls) == 2
+    assert calls[-1]["action"] == ACTION_UPDATE
+    assert {a["repo_id"]: a for a in report.project_actions}[REPO_ID]["action"] == ACTION_UPDATE
+    assert _state(env)["graphify_version"] == "0.9.89"
+
+    run(env.settings(shrink_policy="count"))
+    assert len(calls) == 2, "the upgrade rebuilds once, not every run"
+
+
+def test_pipeline_unchanged_source_rebuilds_on_plugin_upgrade(php_repo, monkeypatch):
+    env, _ = php_repo
+    _set_builder(env, "graphify-php")
+    calls: list = []
+    monkeypatch.setattr("graphify_mesh.sync.pipeline.apply_action", _recording_apply(calls))
+    monkeypatch.setattr(repo_tags, "_in_process_graphify_version", lambda: "0.9.66")
+    _probe_returns(monkeypatch, PHP_V1)
+    run(env.settings(shrink_policy="count"))
+    state = _state(env)
+    assert state["producer_versions"] == PHP_V1
+    assert state["graphify_version"] == "0.9.89", "the wrapper's graphify, not this process's"
+    run(env.settings(shrink_policy="count"))
+    assert len(calls) == 1, "precondition: same plugin, unchanged source is skipped"
+
+    _probe_returns(monkeypatch, PHP_V2)
+    run(env.settings(shrink_policy="count"))
+    assert len(calls) == 2
+    assert calls[-1]["action"] == ACTION_UPDATE
+    assert calls[-1]["producer_changed"] is True
+    assert _state(env)["producer_versions"] == PHP_V2
+
+
+def test_pipeline_without_plugin_info_skips_as_today(php_repo, monkeypatch):
+    env, _ = php_repo
+    _set_builder(env, "graphify-php")
+    calls: list = []
+    monkeypatch.setattr("graphify_mesh.sync.pipeline.apply_action", _recording_apply(calls))
+    monkeypatch.setattr(repo_tags, "_in_process_graphify_version", lambda: "0.9.89")
+    run(env.settings(shrink_policy="count"))  # conftest stub: probe failed
+    state = _state(env)
+    assert "producer_versions" not in state
+    assert state["graphify_version"] == "0.9.89"
+
+    run(env.settings(shrink_policy="count"))
+    assert len(calls) == 1
+
+    _probe_returns(monkeypatch, PHP_V2)
+    run(env.settings(shrink_policy="count"))
+    assert len(calls) == 1, "state without producer_versions must not rebuild once"
+
+
+def test_pipeline_held_plugin_upgrade_retries_on_the_next_plugin(php_repo, monkeypatch):
+    env, _ = php_repo
+    _set_builder(env, "graphify-php")
+    calls: list = []
+    monkeypatch.setattr("graphify_mesh.sync.pipeline.apply_action", _recording_apply(calls))
+    monkeypatch.setattr(repo_tags, "_in_process_graphify_version", lambda: None)
+    _probe_returns(monkeypatch, PHP_V1)
+    run(env.settings(shrink_policy="attributed"))
+
+    monkeypatch.setattr(
+        "graphify_mesh.sync.pipeline.apply_action",
+        _recording_apply(calls, status=STATUS_SHRINK_REFUSED),
+    )
+    _probe_returns(monkeypatch, PHP_V2)
+    run(env.settings(shrink_policy="attributed"))
+    assert len(calls) == 2
+    assert _state(env)["refused_key"].endswith(":php-update@0.9.89+graphify-php-0.2.0:attributed")
+    run(env.settings(shrink_policy="attributed"))
+    assert len(calls) == 2, "the refused upgrade update is held"
+
+    _probe_returns(monkeypatch, {"graphify_php": "0.3.0", "graphify": "0.9.89"})
+    run(env.settings(shrink_policy="attributed"))
+    assert len(calls) == 3, "a further plugin upgrade retries the held update"
+
+
+def test_producer_change_update_keeps_manifest_semantics(tmp_path, monkeypatch):
+    """No manifest is moved aside for a producer-change update: `graphify update`
+    re-extracts every file without reading it. A refusal still restores both files."""
+    collection = _collection(tmp_path)
+    old_manifest = (collection / "manifest.json").read_bytes()
+    seen: list = []
+
+    def invoker(graphify_bin, root, collection_path, staging_home, **kwargs):
+        seen.append((collection_path / "manifest.json").read_bytes())
+        _write_json(collection_path / "graph.json", _graph(2, 2))
+        _write_json(collection_path / "manifest.json", {"files": {}})
+        return graphify_cli.CliResult(0, "", "")
+
+    monkeypatch.setitem(sync_project._INVOKERS, ACTION_UPDATE, invoker)
+    outcome = _apply(tmp_path, collection, shrink_policy="count", producer_changed=True)
+
+    assert seen == [old_manifest]
+    assert outcome.status == STATUS_SHRINK_REFUSED
+    assert (collection / "manifest.json").read_bytes() == old_manifest
+
+
+# ---------------------------------------------------------------------------
+# fix round 1: probe failure and "unknown" keep the last recorded versions
+# ---------------------------------------------------------------------------
+
+
+ACCEPTED_V1 = {"producer_versions": PHP_V1, "graphify_version": "0.9.89"}
+REFUSED_V2 = {
+    **ACCEPTED_V1,
+    "refused_producer_versions": PHP_V2,
+    "refused_graphify_version": "0.9.91",
+}
+
+
+@pytest.mark.parametrize(
+    ("builder", "probed", "prior", "expected"),
+    [
+        ("graphify", PHP_V2, ACCEPTED_V1, ("0.9.66", None, "0.9.66", None)),
+        ("graphify-php", PHP_V2, ACCEPTED_V1, ("0.9.89", PHP_V2, "0.9.89", PHP_V2)),
+        ("graphify-php", None, None, ("0.9.66", None, "0.9.66", None)),
+        ("graphify-php", None, ACCEPTED_V1, ("0.9.89", PHP_V1, "0.9.89", PHP_V1)),
+        ("graphify-php", None, REFUSED_V2, ("0.9.89", PHP_V1, "0.9.91", PHP_V2)),
+        ("graphify-php", PHP_V2, REFUSED_V2, ("0.9.89", PHP_V2, "0.9.89", PHP_V2)),
+        (
+            "graphify-php",
+            {"graphify_php": "0.2.0", "graphify": None},
+            {"graphify_version": "0.9.89"},
+            ("0.9.89", {"graphify_php": "0.2.0"}, "0.9.89", {"graphify_php": "0.2.0"}),
+        ),
+        (
+            "graphify-php",
+            {"graphify_php": "0.2.0", "graphify": None},
+            {},
+            (None, {"graphify_php": "0.2.0"}, None, {"graphify_php": "0.2.0"}),
+        ),
+        (
+            "graphify-php",
+            None,
+            {"producer_versions": {"graphify_php": 7}},
+            ("0.9.66", None, "0.9.66", None),
+        ),
+    ],
+    ids=[
+        "plain-builder",
+        "probed",
+        "probe-failed-no-state",
+        "probe-failed-keeps-accepted",
+        "probe-failed-key-keeps-refused",
+        "probe-ok-overrides-refused",
+        "graphify-unknown-keeps-recorded",
+        "graphify-unknown-records-none",
+        "garbage-prior",
+    ],
+)
+def test_repo_versions(builder, probed, prior, expected):
+    """Recorded versions never take a refused overlay; key versions prefer it."""
+    assert tuple(_repo_versions(builder, "0.9.66", probed, prior)) == expected
+
+
+def test_pipeline_held_refusal_survives_a_probe_failure(php_repo, monkeypatch):
+    env, root = php_repo
+    calls: list = []
+    held = _refuse_under_v2(env, root, monkeypatch, calls)
+    assert held["refused_producer_versions"] == PHP_V2
+
+    _probe_returns(monkeypatch, None)
+    report = run(env.settings(ast_only=True, shrink_policy="attributed"))
+    assert len(calls) == 2, "a probe failure released the held refusal"
+    assert {a["repo_id"]: a for a in report.project_actions}[REPO_ID]["action"] == ACTION_SKIP
+    assert _state(env)["refused_key"] == held["refused_key"]
+
+    _probe_returns(monkeypatch, PHP_V2)
+    run(env.settings(ast_only=True, shrink_policy="attributed"))
+    assert len(calls) == 2, "the probe recovering must not release it either"
+
+
+def test_pipeline_warns_once_when_the_probe_fails(php_repo, monkeypatch, caplog):
+    env, _ = php_repo
+    monkeypatch.setattr("graphify_mesh.sync.pipeline.apply_action", _recording_apply([]))
+    caplog.set_level(logging.WARNING, logger="graphify_mesh.sync")
+    run(env.settings(shrink_policy="count"))
+    assert not [r for r in caplog.records if "--version gave no usable answer" in r.message]
+
+    _set_builder(env, "graphify-php")
+    caplog.clear()
+    run(env.settings(shrink_policy="count", php_build_bin="/opt/pb"))
+    warned = [r for r in caplog.records if "--version gave no usable answer" in r.message]
+    assert len(warned) == 1
+    assert warned[0].message.startswith("/opt/pb ")
+
+
+def test_pipeline_graphify_unknown_keeps_the_recorded_version(php_repo, monkeypatch):
+    env, root = php_repo
+    _set_builder(env, "graphify-php")
+    calls: list = []
+    monkeypatch.setattr("graphify_mesh.sync.pipeline.apply_action", _recording_apply(calls))
+    monkeypatch.setattr(repo_tags, "_in_process_graphify_version", lambda: "0.9.66")
+    _probe_returns(monkeypatch, PHP_V1)
+    run(env.settings(shrink_policy="count"))
+    assert _state(env)["graphify_version"] == "0.9.89"
+
+    _probe_returns(monkeypatch, {"graphify_php": "0.1.0", "graphify": None})
+    (root / "app.php").write_text("<?php\n", encoding="utf-8")
+    run(env.settings(shrink_policy="count"))
+    assert len(calls) == 2
+    assert _state(env)["graphify_version"] == "0.9.89", "this process's graphify was recorded"
+
+    _probe_returns(monkeypatch, PHP_V1)
+    run(env.settings(shrink_policy="count"))
+    assert len(calls) == 2, "the recovered probe read as a graphify upgrade"
+
+
+# ---------------------------------------------------------------------------
+# fix round 2: key graphify from state, accepted versions without refused overlay
+# ---------------------------------------------------------------------------
+
+
+def _refuse_under_v2(env, root, monkeypatch, calls: list) -> dict:
+    """Accept under PHP_V1, then refuse a code-change update under PHP_V2.
+
+    A code change, so the next run reaches the refusal hold: an unchanged
+    source with no probed upgrade is skipped before the key is consulted.
+    """
+    _set_builder(env, "graphify-php")
+    monkeypatch.setattr("graphify_mesh.sync.pipeline.apply_action", _recording_apply(calls))
+    monkeypatch.setattr(repo_tags, "_in_process_graphify_version", lambda: "0.9.66")
+    _probe_returns(monkeypatch, PHP_V1)
+    run(env.settings(ast_only=True, shrink_policy="attributed"))
+    monkeypatch.setattr(
+        "graphify_mesh.sync.pipeline.apply_action",
+        _recording_apply(calls, status=STATUS_SHRINK_REFUSED),
+    )
+    _probe_returns(monkeypatch, PHP_V2)
+    (root / "app.php").write_text("<?php\n// refused\n", encoding="utf-8")
+    run(env.settings(ast_only=True, shrink_policy="attributed"))
+    assert len(calls) == 2
+    return _state(env)
+
+
+def test_held_refusal_survives_total_probe_failure_with_another_graphify(php_repo, monkeypatch):
+    """In-process graphify 0.9.66, wrapper's 0.9.89: the key must not take 0.9.66."""
+    env, root = php_repo
+    calls: list = []
+    held = _refuse_under_v2(env, root, monkeypatch, calls)
+    assert held["refused_graphify_version"] == "0.9.89"
+    assert held["refused_key"].endswith(":php-update@0.9.89+graphify-php-0.2.0:attributed")
+
+    _probe_returns(monkeypatch, None)
+    report = run(env.settings(ast_only=True, shrink_policy="attributed"))
+    assert len(calls) == 2, "a total probe failure released the held refusal"
+    assert {a["repo_id"]: a for a in report.project_actions}[REPO_ID]["action"] == ACTION_SKIP
+    assert _state(env)["refused_key"] == held["refused_key"]
+
+
+def test_unchanged_repo_is_not_rebuilt_by_a_total_probe_failure(php_repo, monkeypatch):
+    env, _ = php_repo
+    _set_builder(env, "graphify-php")
+    calls: list = []
+    monkeypatch.setattr("graphify_mesh.sync.pipeline.apply_action", _recording_apply(calls))
+    monkeypatch.setattr(repo_tags, "_in_process_graphify_version", lambda: "0.9.66")
+    _probe_returns(monkeypatch, PHP_V1)
+    run(env.settings(shrink_policy="count"))
+    _probe_returns(monkeypatch, None)
+    run(env.settings(shrink_policy="count"))
+    _probe_returns(monkeypatch, PHP_V1)
+    run(env.settings(shrink_policy="count"))
+    assert len(calls) == 1
+    assert _state(env)["graphify_version"] == "0.9.89"
+
+
+def test_accept_during_probe_outage_records_no_refused_overlay(php_repo, monkeypatch):
+    env, root = php_repo
+    calls: list = []
+    _refuse_under_v2(env, root, monkeypatch, calls)
+
+    monkeypatch.setattr("graphify_mesh.sync.pipeline.apply_action", _recording_apply(calls))
+    _probe_returns(monkeypatch, None)
+    (root / "app.php").write_text("<?php\n// accepted\n", encoding="utf-8")
+    run(env.settings(ast_only=True, shrink_policy="attributed"))
+    assert len(calls) == 3
+    state = _state(env)
+    assert state["producer_versions"] == PHP_V1, "the refused attempt's versions were recorded"
+    assert state["graphify_version"] == "0.9.89"
+    assert "refused_producer_versions" not in state
+    assert "refused_graphify_version" not in state

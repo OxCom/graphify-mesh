@@ -205,14 +205,17 @@ unless the 2000-node cap truncated the result (`truncated`). The cap counts
 seeds and nodes together: a label matching more than 2000 nodes returns the
 first 2000 seeds by key, no nodes, and `truncated: true`.
 `frontier_exhausted` says the walk ran out of new nodes before the depth limit.
+The complete-set note is emitted only then; otherwise `notes` says the result
+is exact only within `depth`.
 Nodes without a durable key are skipped and counted in `skipped_unkeyed`.
 
 `reliability` is `exact` unless the request followed `calls`,
 `indirect_call`, or non-EXTRACTED edges; then it is `partial` and `notes` says why.
-Call edges are incomplete: the extractor does not resolve method calls
-through typed properties, which is how dependency injection calls look. On
-cem.hub only 554 of 2797 PHP methods have any incoming call edge. A missing
-call edge is not evidence that no call exists.
+Call edges are incomplete: which calls are resolved depends on the extractor
+that built the repo. When a traversed call edge carries a `_resolver`
+attribute, `notes` names that resolver and says untyped receivers, chained and
+dynamic calls remain unresolved. A missing call edge is not evidence that no
+call exists.
 
 ### `context_pack`
 Evidence cards (citations, snippets, confidence) for a goal, truncated to a

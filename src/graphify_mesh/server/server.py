@@ -554,11 +554,14 @@ class GraphifyMeshServer:
                     "registered repo: every node reachable over the indexed edges of those "
                     "relations within `depth`, not a ranked top-k like search. Use it for "
                     "'all subclasses of X' (relation=inherits, direction=in) or 'everything "
-                    "that imports M' (relation=imports, direction=in). `complete` is false "
-                    "only when the node cap truncated the result. calls/indirect_call edges "
-                    "are incomplete (calls through typed properties / DI are not extracted), "
-                    "so a missing call edge is not evidence of no call; those results come "
-                    "back with reliability='partial'."
+                    "that imports M' (relation=imports, direction=in) or route handlers "
+                    "(relation=handled_by). `depth` defaults to 1; pass up to 16 for a "
+                    "hierarchy. `complete` is false only when the node cap truncated the "
+                    "result; a walk cut by `depth` reports frontier_exhausted=false. INFERRED "
+                    "edges are followed only with include_inferred=true. calls/indirect_call "
+                    "edges are incomplete (which calls are resolved depends on the extractor "
+                    "that built the repo), so a missing call edge is not evidence of no call; "
+                    "those results come back with reliability='partial'."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -584,7 +587,8 @@ class GraphifyMeshServer:
                             ],
                             "description": (
                                 "Relation name(s), e.g. inherits, implements, imports, "
-                                "calls. An unknown name is an error listing the known ones."
+                                "calls, handled_by. An unknown name is an error listing the "
+                                "known ones."
                             ),
                         },
                         "direction": {
