@@ -107,6 +107,7 @@ def test_stdio_initialize_and_tools_list_over_real_subprocess(tmp_path):
             "project_map",
             "context_pack",
             "neighbors",
+            "list_repos",
         }
     finally:
         proc.stdin.close()
@@ -211,6 +212,7 @@ def test_unparseable_json_line_gets_parse_error(tmp_path):
             "project_map",
             "context_pack",
             "neighbors",
+            "list_repos",
         }
     finally:
         proc.stdin.close()

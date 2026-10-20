@@ -192,8 +192,10 @@ There are two MCP servers in play, and they are complementary:
   `list_prs`, `triage_prs`. Repointing is a config change, not a rewrite.
 - **graphify-mesh's server** (`graphify-mesh-server`) owns everything
   hybrid / cross-project / evidence-oriented: `search`, `cross_project`,
-  `find_similar`, `project_map`, `context_pack`, `neighbors`. These need scope resolution,
-  the lexical index, the embedding index, and the cross-project overlay.
+  `find_similar`, `project_map`, `context_pack`, `neighbors`. These need scope
+  resolution, the lexical index, the embedding index, and the cross-project
+  overlay. `list_repos` reads only `registry.json` and the served manifest, and
+  answers before the first publish.
 
 ### Two transports, one tool surface
 

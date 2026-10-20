@@ -106,7 +106,7 @@ the daemon's.
 
 If no consistent generation has been published yet, tool calls fail closed
 (an error result) on either transport, rather than serving a partial or stale
-graph.
+graph. The one exception is `list_repos`, which still serves the registry part.
 
 ## Concurrency (HTTP mode)
 
@@ -117,7 +117,31 @@ cache in `server/scope.py` and the per-generation index cache in
 `server/similar.py` — are each guarded by their own lock, with the fast hit
 path lock-free.
 
-## The 6 tools
+## The 7 tools
+
+### `list_repos`
+Lists the registered, enabled repositories with their roots, and the repo a directory belongs to. Start here to find valid `repo_id`s for `scope="repo:<id>"`, `repos`/`exclude_repos`, `project_map` and `neighbors`.
+
+| Arg | Type | Default | Notes |
+|-----|------|---------|-------|
+| `cwd` | string | process directory (stdio), none (HTTP) | Absolute path of a directory; `current` in the result is the registered repo containing it. |
+
+| Result field | Notes |
+|--------------|-------|
+| `repos[].repo_id` | Enabled repos only, sorted by id. |
+| `repos[].root` | Absolute path on the server's filesystem. |
+| `repos[].in_generation` | Whether the served generation contains the repo. `null` with no generation. |
+| `repos[].node_count` | Nodes of the repo in the served generation. `null` with no generation. |
+| `repos[].stale` | See below. `null` with no generation. |
+| `current` | `repo_id` containing `cwd`, or `null`. |
+| `generation` | `{id, created_at}` of the served generation, or `null`. |
+| `degraded` | Reduced-quality modes, see below. |
+
+- `root` is an absolute path on the server's filesystem. The HTTP daemon returns it to any client that holds the bearer token.
+- It is the one tool that answers without a published generation: the graph fields are `null` and `degraded` carries `no_generation_published`.
+- `stale` means the last sync of that repo failed or was refused and its last-good graph was carried forward. It does not mean the repo is behind HEAD.
+- `degraded` carries `registry_changed_since_generation` when `registry.json` was edited after the served generation was published.
+- Without `cwd`, stdio uses the process directory. HTTP returns `current: null`.
 
 ### `search`
 Hybrid lexical + vector + structural search within a **scope**. Scope defaults

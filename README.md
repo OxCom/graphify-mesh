@@ -142,7 +142,7 @@ Full walkthrough: [`docs/setup.md`](docs/setup.md).
 | [`docs/keeping-sync-up-to-date.md`](docs/keeping-sync-up-to-date.md) | Scheduled re-indexing: step-by-step systemd timer setup (env file, units, cadence, reaper), cron alternative, adding/removing repos, troubleshooting. |
 | [`docs/configuration.md`](docs/configuration.md) | Every `GRAPHIFY_MESH_*` env var, every `Settings` field, the `registry.json` and `manual-relations.json` schemas. |
 | [`docs/architecture.md`](docs/architecture.md) | Pipeline stages, the two-MCP-server concept, and the structural-vs-overlay / rebuild-from-empty invariants. |
-| [`docs/mcp-server.md`](docs/mcp-server.md) | The 6 tools, both transports (stdio and shared HTTP), how to register the server. |
+| [`docs/mcp-server.md`](docs/mcp-server.md) | The 7 tools, both transports (stdio and shared HTTP), how to register the server. |
 | [`docs/publishing.md`](docs/publishing.md) | Why GitHub Packages does **not** host Python, and how the gh-pages PEP 503 "simple" index substitutes for it. |
 
 ## License

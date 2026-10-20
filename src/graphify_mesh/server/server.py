@@ -1,8 +1,8 @@
-"""`graphify-mesh` stdio MCP server (WS5 deliverable 2): wires the 6 hybrid/
-cross-project/evidence/traversal tools (`search`, `cross_project`,
-`find_similar`, `project_map`, `context_pack`, `neighbors`) onto the MCP SDK's stdio transport
-(`mcp.server.stdio.stdio_server`), wrapped by `stdio_guard.capped_stdin` for
-the line-size cap the SDK's own reader does not provide.
+"""`graphify-mesh` stdio MCP server (WS5 deliverable 2): wires the 7 hybrid/
+cross-project/evidence/traversal/discovery tools (`search`, `cross_project`,
+`find_similar`, `project_map`, `context_pack`, `neighbors`, `list_repos`) onto
+the MCP SDK's stdio transport (`mcp.server.stdio.stdio_server`), wrapped by
+`stdio_guard.capped_stdin` for the line-size cap the SDK's own reader does not provide.
 
 Scope resolution (`scope.py`) runs fresh on every `search`/`context_pack`
 call against `registry.json`. `scope='current'` resolves the CLIENT's cwd:
@@ -39,11 +39,13 @@ from graphify_mesh.server.retrieval import Hit, rank
 from graphify_mesh.server.scope import (
     ScopeResolutionError,
     load_registry_entries,
+    match_cwd,
     resolve_repo_list,
     resolve_scope,
 )
 from graphify_mesh.server.store import Generation, GenerationStore, GenerationUnavailableError
 from graphify_mesh.sync.perms import audit_config_permissions
+from graphify_mesh.sync.registry import registry_hash
 
 log = logging.getLogger("graphify_mesh.server.server")
 
@@ -399,6 +401,50 @@ class GraphifyMeshServer:
             node, repo, relations, direction, depth, include_inferred, generation
         ).as_dict()
 
+    def tool_list_repos(self, arguments: dict) -> dict:
+        cwd = _validate_cwd(arguments)
+        entries = self._registry_entries()
+        if cwd is None and self.config.transport != "http":
+            cwd = self.cwd
+        current = match_cwd(cwd, entries) if cwd is not None else None
+        generation = self._optional_generation()
+        degraded: list[str] = []
+        hashes: dict = {}
+        stale: set[str] = set()
+        summary = None
+        if generation is not None:
+            manifest = generation.manifest
+            hashes = manifest.get("repo_input_hashes") or {}
+            stale = set(manifest.get("stale_repos") or [])
+            summary = {"id": generation.generation_id, "created_at": manifest.get("created_at")}
+            published = manifest.get("registry_hash")
+            if published is not None and published != registry_hash(self.config.registry_path):
+                degraded.append("registry_changed_since_generation")
+        repos = []
+        for entry in sorted((e for e in entries if e.enabled), key=lambda e: e.repo_id):
+            repos.append(
+                {
+                    "repo_id": entry.repo_id,
+                    "root": str(entry.root),
+                    "in_generation": (entry.repo_id in hashes if generation is not None else None),
+                    "node_count": (
+                        len(generation.nodes_by_repo.get(entry.repo_id, []))
+                        if generation is not None
+                        else None
+                    ),
+                    "stale": entry.repo_id in stale if generation is not None else None,
+                }
+            )
+        return {"repos": repos, "current": current, "generation": summary, "degraded": degraded}
+
+    def _optional_generation(self) -> Generation | None:
+        # `store.generation` runs ensure_fresh(), which records
+        # "no_generation_published" in store.degraded for call_tool to merge.
+        try:
+            return self.store.generation
+        except GenerationUnavailableError:
+            return None
+
     def _generation(self) -> Generation:
         try:
             return self.store.generation
@@ -427,6 +473,7 @@ class GraphifyMeshServer:
         "project_map": "tool_project_map",
         "context_pack": "tool_context_pack",
         "neighbors": "tool_neighbors",
+        "list_repos": "tool_list_repos",
     }
 
     def tool_schemas(self) -> list[dict]:
@@ -623,6 +670,30 @@ class GraphifyMeshServer:
                         },
                     },
                     "required": ["node", "repo", "relation", "direction"],
+                },
+            },
+            {
+                "name": "list_repos",
+                "description": (
+                    "List the registered, enabled repositories with their absolute root on "
+                    "the server's filesystem. Use it to find valid repo_ids for `scope: "
+                    "repo:<id>`, `repos`/`exclude_repos`, `project_map` and `neighbors`, and "
+                    "to learn which repo a directory (`cwd`) belongs to. `stale` means the "
+                    "last sync of that repo failed or was refused and its last-good graph "
+                    "was carried forward, not that it is behind HEAD. Answers even before "
+                    "the first generation is published."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cwd": {
+                            "type": "string",
+                            "description": (
+                                "Absolute path of a directory; `current` in the result is "
+                                "the registered repo containing it."
+                            ),
+                        },
+                    },
                 },
             },
         ]

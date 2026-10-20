@@ -8,6 +8,7 @@ from conftest import registry_repo, write_registry
 from graphify_mesh.server.scope import (
     ScopeResolutionError,
     load_registry_entries,
+    match_cwd,
     resolve_repo_list,
     resolve_scope,
 )
@@ -176,3 +177,69 @@ def test_resolve_repo_list_raises_on_an_empty_registry(tmp_path):
 
     with pytest.raises(ScopeResolutionError):
         resolve_repo_list(None, entries)
+
+
+def test_unmatched_cwd_error_lists_enabled_ids_not_disabled(tmp_path):
+    live, dead = tmp_path / "live", tmp_path / "dead"
+    live.mkdir()
+    dead.mkdir()
+    write_registry(
+        tmp_path / "registry.json",
+        [registry_repo("live.repo", live), registry_repo("dead.repo", dead, enabled=False)],
+    )
+    entries = load_registry_entries(tmp_path / "registry.json")
+
+    with pytest.raises(ScopeResolutionError) as exc:
+        resolve_scope(None, tmp_path / "elsewhere", entries)
+    assert "enabled repo_ids: live.repo" in str(exc.value)
+    assert "dead.repo" not in str(exc.value)
+
+
+def test_unknown_repo_scope_error_lists_enabled_ids(tmp_path):
+    live = tmp_path / "live"
+    live.mkdir()
+    write_registry(tmp_path / "registry.json", [registry_repo("live.repo", live)])
+    entries = load_registry_entries(tmp_path / "registry.json")
+
+    with pytest.raises(ScopeResolutionError) as exc:
+        resolve_scope("repo:nope", tmp_path, entries)
+    assert "enabled repo_ids: live.repo" in str(exc.value)
+
+
+def test_scope_error_hint_truncates_to_20_ids(tmp_path):
+    repos = []
+    for i in range(25):
+        root = tmp_path / f"r{i:02d}"
+        root.mkdir()
+        repos.append(registry_repo(f"repo.{i:02d}", root))
+    write_registry(tmp_path / "registry.json", repos)
+    entries = load_registry_entries(tmp_path / "registry.json")
+
+    with pytest.raises(ScopeResolutionError) as exc:
+        resolve_scope("repo:nope", tmp_path, entries)
+    message = str(exc.value)
+    assert "repo.19" in message
+    assert "repo.20" not in message
+    assert message.endswith(", +5 more")
+
+
+def test_scope_error_hint_when_no_repo_enabled(tmp_path):
+    entries = load_registry_entries(tmp_path / "does-not-exist.json")
+    with pytest.raises(ScopeResolutionError) as exc:
+        resolve_scope("repo:nope", tmp_path, entries)
+    assert str(exc.value).endswith(" — registry lists no enabled repo")
+
+
+def test_match_cwd_returns_longest_matching_root(tmp_path):
+    outer = tmp_path / "outer"
+    inner = outer / "inner"
+    cwd = inner / "src"
+    cwd.mkdir(parents=True)
+    write_registry(
+        tmp_path / "registry.json",
+        [registry_repo("outer.repo", outer), registry_repo("inner.repo", inner)],
+    )
+    entries = load_registry_entries(tmp_path / "registry.json")
+
+    assert match_cwd(cwd, entries) == "inner.repo"
+    assert match_cwd(tmp_path / "elsewhere", entries) is None

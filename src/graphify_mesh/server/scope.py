@@ -90,7 +90,7 @@ def load_registry_entries(registry_path: Path) -> list[RegistryEntry]:
         return entries
 
 
-def _match_cwd(cwd: Path, entries: list[RegistryEntry]) -> str | None:
+def match_cwd(cwd: Path, entries: list[RegistryEntry]) -> str | None:
     """Longest-matching (most specific) registered repo root that is an
     ancestor of (or equal to) `cwd`. Deterministic tie-break: if two roots
     tie on path length (should not happen with well-formed registry data),
@@ -115,6 +115,21 @@ def _enabled_repo_ids(entries: list[RegistryEntry]) -> frozenset[str]:
     return frozenset(e.repo_id for e in entries if e.enabled)
 
 
+_HINT_MAX_IDS = 20
+
+
+def _enabled_ids_hint(entries: list[RegistryEntry]) -> str:
+    """Error-message suffix naming the valid repo_ids, so a caller that
+    guessed wrong can retry without a separate discovery call."""
+    ids = sorted(_enabled_repo_ids(entries))
+    if not ids:
+        return " — registry lists no enabled repo"
+    listed = ", ".join(ids[:_HINT_MAX_IDS])
+    if len(ids) > _HINT_MAX_IDS:
+        listed += f", +{len(ids) - _HINT_MAX_IDS} more"
+    return f" — enabled repo_ids: {listed}"
+
+
 def resolve_scope(scope: str | None, cwd: Path, entries: list[RegistryEntry]) -> ScopeDecision:
     """Fail-closed scope resolution. `scope` is the raw tool argument:
     None/""/"current" -> resolve cwd; "all" -> every enabled repo; "repo:<id>"
@@ -122,12 +137,13 @@ def resolve_scope(scope: str | None, cwd: Path, entries: list[RegistryEntry]) ->
     raises. "all" with no enabled repo raises rather than resolving to an
     unfiltered search."""
     if scope is None or scope in ("", "current"):
-        repo_id = _match_cwd(cwd, entries)
+        repo_id = match_cwd(cwd, entries)
         if repo_id is None:
             raise ScopeResolutionError(
                 f"cannot resolve implicit scope: cwd {cwd} does not match any registered, "
                 "enabled repo root in registry.json — pass scope='all' or scope='repo:<id>' "
                 "explicitly (fail-closed: never silently falls back to a global search)"
+                + _enabled_ids_hint(entries)
             )
         return ScopeDecision(mode="repo", repo_ids=frozenset({repo_id}))
 
@@ -146,6 +162,7 @@ def resolve_scope(scope: str | None, cwd: Path, entries: list[RegistryEntry]) ->
         if repo_id not in known:
             raise ScopeResolutionError(
                 f"unknown or disabled repo_id {repo_id!r} in scope={scope!r}"
+                + _enabled_ids_hint(entries)
             )
         return ScopeDecision(mode="repo", repo_ids=frozenset({repo_id}))
 
