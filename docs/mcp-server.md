@@ -153,7 +153,12 @@ Explicit cross-repo hybrid search, optionally restricted to a list of repos.
 |-----|------|---------|-------|
 | `q` | string | — (required) | Query text. |
 | `repos` | string[] | all enabled repos | Restrict to these `repo_id`s. Omitted means every enabled repo, never an unfiltered search; an unknown or disabled id is a hard error, and a registry with no enabled repo at all is an error too rather than an empty result. |
+| `exclude_repos` | string[] | none | Drop these `repo_id`s from the search, after `repos` is applied (`repos` minus `exclude_repos`). Same shape rules as `repos`; an unknown or disabled id is a hard error, and an empty remainder is an error ("exclude_repos leaves no repo to search"). |
 | `k` | integer | ranking default | Max results. |
+
+`degraded` in the result lists reduced-quality modes. `embeddings_unavailable:*`
+means lexical-only ranking: scores are low and order is weak, so treat the hits
+as candidates to open, not a ranked answer.
 
 ### `find_similar`
 Structurally / semantically similar nodes to a given node or label; can be

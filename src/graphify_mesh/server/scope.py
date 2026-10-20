@@ -154,7 +154,9 @@ def resolve_scope(scope: str | None, cwd: Path, entries: list[RegistryEntry]) ->
     )
 
 
-def resolve_repo_list(repos: list[str] | None, entries: list[RegistryEntry]) -> frozenset[str]:
+def resolve_repo_list(
+    repos: list[str] | None, entries: list[RegistryEntry], arg: str = "repos"
+) -> frozenset[str]:
     """For `cross_project(repos=...)`: an explicit repo list is validated
     against the registry (unknown repo_id is a hard error, per fail-closed
     convention); `None`/empty means "all registered, enabled repos" — the
@@ -183,6 +185,6 @@ def resolve_repo_list(repos: list[str] | None, entries: list[RegistryEntry]) -> 
     unknown = set(repos) - known
     if unknown:
         raise ScopeResolutionError(
-            f"unknown or disabled repo_id(s) in cross_project repos=: {sorted(unknown)}"
+            f"unknown or disabled repo_id(s) in cross_project {arg}=: {sorted(unknown)}"
         )
     return frozenset(repos)

@@ -129,16 +129,15 @@ def _validate_cwd(arguments: dict) -> Path | None:
     return path
 
 
-def _validate_repos(arguments: dict) -> list[str] | None:
-    """`repos` is optional; when present it must be a list of strings — the
-    repo_ids themselves are validated against the registry downstream."""
-    repos = arguments.get("repos")
+def _validate_repos(arguments: dict, key: str = "repos") -> list[str] | None:
+    """`repos` / `exclude_repos` are optional; when present they must be a list
+    of strings — the repo_ids themselves are validated against the registry
+    downstream."""
+    repos = arguments.get(key)
     if repos is None:
         return None
-    if not isinstance(repos, list):
-        raise ToolError("'repos' must be a list of strings (registered repo_ids)")
-    if any(not isinstance(repo, str) for repo in repos):
-        raise ToolError("'repos' must be a list of strings (registered repo_ids)")
+    if not isinstance(repos, list) or any(not isinstance(repo, str) for repo in repos):
+        raise ToolError(f"'{key}' must be a list of strings (registered repo_ids)")
     return repos
 
 
@@ -257,11 +256,16 @@ class GraphifyMeshServer:
         query = _validate_str(arguments, "q")
         k = _validate_k(arguments)
         repos = _validate_repos(arguments)
+        exclude = _validate_repos(arguments, "exclude_repos")
         entries = self._registry_entries()
         try:
             repo_filter = resolve_repo_list(repos, entries)
+            if exclude:
+                repo_filter = repo_filter - resolve_repo_list(exclude, entries, "exclude_repos")
         except ScopeResolutionError as exc:
             raise ToolError(str(exc)) from exc
+        if not repo_filter:
+            raise ToolError("exclude_repos leaves no repo to search")
         generation = self._generation()
         ranked = rank(query, generation, repo_filter, k, self.embed_query_fn)
         return {
@@ -471,13 +475,18 @@ class GraphifyMeshServer:
                     "service is deployed, what else implements a pattern. Searches every "
                     "indexed repository at once, so it reaches code outside the working "
                     "directory that no local search can see. Returns candidate repositories "
-                    "and places to open, not a final roster."
+                    "and places to open, not a final roster. `exclude_repos` drops "
+                    "repo_ids from the search (e.g. the repo you already have open). "
+                    "`degraded` lists reduced-quality modes (e.g. `embeddings_unavailable:*` "
+                    "means lexical-only ranking, so scores are low and order is weak); "
+                    "treat such hits as candidates to open, not a ranked answer."
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "q": {"type": "string"},
                         "repos": {"type": "array", "items": {"type": "string"}},
+                        "exclude_repos": {"type": "array", "items": {"type": "string"}},
                         "k": {"type": "integer", "default": ranking.DEFAULT_K},
                     },
                     "required": ["q"],
