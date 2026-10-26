@@ -57,6 +57,10 @@ pip install \
   graphify-mesh==0.1.0
 ```
 
+The same release workflow also uploads that wheel and sdist to PyPI through
+trusted publishing in the `pypi` environment, so a release published there
+installs with plain `pip install graphify-mesh`.
+
 The exact URL scheme is:
 
 - **Index root:** `https://oxcom.github.io/graphify-mesh/simple/`
