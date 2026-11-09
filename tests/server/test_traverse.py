@@ -374,3 +374,134 @@ def test_neighbors_listed_in_tool_schemas(server):
 def test_generation_relations_index():
     generation = build_generation(NODES, LINKS)
     assert generation.relations == frozenset({"inherits", "imports"})
+
+
+def _scored(src, dst, confidence, score, relation="inherits", also_seen=None):
+    link = make_link(src, dst, confidence=confidence, relation=relation)
+    link["confidence_score"] = score
+    if also_seen is not None:
+        link["also_seen"] = also_seen
+    return link
+
+
+def test_via_carries_confidence_score_and_also_seen_count(tmp_path):
+    links = [
+        _scored("mid", "base", "INFERRED", 0.75, also_seen=[{"x": 1}, {"x": 2}]),
+        # Parallel link, same via key, lower score: max score is kept.
+        _scored("mid", "base", "INFERRED", 0.5),
+        _scored("leaf1", "base", "EXTRACTED", 1.0, also_seen=[]),
+        _scored("leaf2", "base", "EXTRACTED", float("nan")),
+    ]
+    server = _server(tmp_path, build_generation([BASE, MID, LEAF1, LEAF2], links))
+    payload = _call(
+        server, node="Base", repo=REPO, relation="inherits", direction="in", include_inferred=True
+    )
+    by_label = {n["label"]: n for n in payload["nodes"]}
+    base_key = key_for(REPO, BASE)
+    assert by_label["Mid"]["via"] == [
+        {
+            "relation": "inherits",
+            "from": base_key,
+            "confidence": "INFERRED",
+            "confidence_score": 0.75,
+            "also_seen": 2,
+        }
+    ]
+    # Empty also_seen is omitted; a non-finite score is omitted.
+    assert by_label["Leaf1"]["via"] == [
+        {
+            "relation": "inherits",
+            "from": base_key,
+            "confidence": "EXTRACTED",
+            "confidence_score": 1.0,
+        }
+    ]
+    assert by_label["Leaf2"]["via"] == [
+        {"relation": "inherits", "from": base_key, "confidence": "EXTRACTED"}
+    ]
+    assert payload["min_confidence_score"] is None
+
+
+def test_via_is_independent_of_parallel_link_order(tmp_path):
+    a = _scored("mid", "base", "INFERRED", 0.4, also_seen=[1])
+    b = _scored("mid", "base", "INFERRED", 0.9)
+    payloads = []
+    for links in ([a, b], [b, a]):
+        server = _server(tmp_path, build_generation([BASE, MID], links))
+        payloads.append(
+            _call(
+                server,
+                node="Base",
+                repo=REPO,
+                relation="inherits",
+                direction="in",
+                include_inferred=True,
+            )["nodes"]
+        )
+    assert payloads[0] == payloads[1]
+    assert payloads[0][0]["via"][0]["confidence_score"] == 0.9
+    assert payloads[0][0]["via"][0]["also_seen"] == 1
+
+
+def test_min_confidence_score_filters_inferred_keeps_extracted(tmp_path):
+    links = [
+        _scored("mid", "base", "INFERRED", 0.4),
+        _scored("leaf1", "base", "INFERRED", 0.8),
+        _scored("leaf2", "base", "EXTRACTED", 0.1),
+        make_link("deep", "base", confidence="AMBIGUOUS", relation="inherits"),  # unscored
+    ]
+    server = _server(tmp_path, build_generation([BASE, MID, LEAF1, LEAF2, DEEP], links))
+    arguments = {
+        "node": "Base",
+        "repo": REPO,
+        "relation": "inherits",
+        "direction": "in",
+        "include_inferred": True,
+    }
+    unfiltered = _call(server, **arguments)
+    assert _labels(unfiltered) == ["Deep", "Leaf1", "Leaf2", "Mid"]
+    filtered = _call(server, **arguments, min_confidence_score=0.5)
+    assert _labels(filtered) == ["Leaf1", "Leaf2"]
+    assert filtered["min_confidence_score"] == 0.5
+    # Boundary is inclusive.
+    assert "Mid" in _labels(_call(server, **arguments, min_confidence_score=0.4))
+    assert any("below 0.5" in note for note in filtered["notes"])
+    assert not any("below" in note for note in unfiltered["notes"])
+    assert filtered["include_inferred"] is True
+    # A floor without include_inferred is an error.
+    no_inferred = dict(arguments, include_inferred=False)
+    _error(server, **no_inferred, min_confidence_score=0.0)
+
+
+@pytest.mark.parametrize(("value", "echoed"), [(None, None), (0, 0.0), (1, 1.0), (0.5, 0.5)])
+def test_min_confidence_score_accepted_values_echoed(server, value, echoed):
+    payload = _call(
+        server,
+        node="Base",
+        repo=REPO,
+        relation="inherits",
+        direction="in",
+        include_inferred=True,
+        min_confidence_score=value,
+    )
+    assert payload["min_confidence_score"] == echoed
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.5, "x", float("nan"), float("inf"), True, [0.5]])
+def test_min_confidence_score_invalid_values_rejected(server, value):
+    _error(
+        server,
+        node="Base",
+        repo=REPO,
+        relation="inherits",
+        direction="in",
+        include_inferred=True,
+        min_confidence_score=value,
+    )
+
+
+def test_min_confidence_score_in_schema(server):
+    schema = next(s for s in server.tool_schemas() if s["name"] == "neighbors")
+    prop = schema["inputSchema"]["properties"]["min_confidence_score"]
+    assert prop["type"] == ["number", "null"]
+    assert (prop["minimum"], prop["maximum"]) == (0, 1)

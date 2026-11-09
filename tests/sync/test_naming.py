@@ -14,6 +14,13 @@ FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 FAKE_GRAPHIFY = FIXTURES_DIR / "fake_graphify" / "graphify"
 
 
+@pytest.fixture(autouse=True)
+def _accept_every_label(monkeypatch):
+    """Stub labels here ("Named 0") share no word with their members; the
+    grounding check is covered in test_naming_repo_scope.py."""
+    monkeypatch.setattr(naming, "_is_grounded", lambda label, members: True)
+
+
 def _merged_graph() -> dict:
     return {
         "directed": False,
@@ -430,7 +437,7 @@ def test_llm_names_are_requested_only_for_communities_without_a_name(tmp_path, m
         tmp_path / "naming",
         tmp_path / "home",
         graph,
-        _settings(tmp_path, ollama_model="test-model"),
+        _settings(tmp_path, ollama_model="test-model", cluster_scope="global"),
         health_check=lambda *a, **k: True,
     )
     assert first.labeling == naming.LABELING_OK
@@ -465,7 +472,9 @@ def test_llm_names_are_requested_only_for_communities_without_a_name(tmp_path, m
         tmp_path / "naming",
         tmp_path / "home",
         changed,
-        _settings(tmp_path, ollama_model="test-model"),
+        # Global scope: under the repo scope the grown community keeps its name
+        # by majority overlap (test_repo_scope_* below).
+        _settings(tmp_path, ollama_model="test-model", cluster_scope="global"),
         health_check=lambda *a, **k: True,
     )
     assert calls, "a changed community must be relabeled"

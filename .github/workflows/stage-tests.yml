@@ -76,7 +76,7 @@ jobs:
     # in-process `graphify.build.distinct_repo_tags` import (sync/repo_tags.py)
     # and the `merge-graphs ... --out` argv (sync/graphify_cli.py) — against
     # every pinned graphifyy version, including the declared floor
-    # (graphifyy>=0.9.20 in pyproject.toml). The rest of the suite fakes the
+    # (graphifyy>=0.9.95 in pyproject.toml). The rest of the suite fakes the
     # CLI, so a breaking upstream change would otherwise land unnoticed.
     runs-on: ubuntu-latest
     permissions:
@@ -88,7 +88,7 @@ jobs:
       # the break is ours or theirs.
       fail-fast: false
       matrix:
-        graphifyy: ["0.9.20", "0.9.56", ""]
+        graphifyy: ["0.9.95", "0.9.104", ""]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

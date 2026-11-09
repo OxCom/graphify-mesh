@@ -1,7 +1,7 @@
 """Repo-tag normalization after `graphify merge-graphs` (WS5 prerequisite).
 
 Verified against the installed graphify 0.9.56 package
-(`graphify/cli.py:1902`, `graphify/build.py:distinct_repo_tags`): the real
+(the `merge-graphs` branch of `graphify.cli.main`, `graphify/build.py:distinct_repo_tags`): the real
 `merge-graphs` CLI has no flag to pin an explicit per-input repo tag. It
 derives each merged node's id-prefix/`repo` attribute purely from
 `graph_paths[i].parent.parent.name` (widening on collision by walking up
@@ -269,7 +269,7 @@ def rewrite_repo_tags(graph_data: dict, tag_to_repo_id: dict[str, str]) -> dict:
             link["target"] = id_remap[link["target"]]
 
     # Upstream writes hyperedges into BOTH the top-level key and the nested
-    # graph.hyperedges slot (graphify/build.py:885-894 folds the nested one onto
+    # graph.hyperedges slot (graphify.build.build_from_json folds the nested one onto
     # the top-level key when the latter is missing). Remapping only the
     # top-level slot leaves the nested copy dangling: measured on the live
     # merged graph, 39/39 members resolved in the top-level slot and 0/39 in the

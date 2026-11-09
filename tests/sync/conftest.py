@@ -31,6 +31,7 @@ class Env:
         self.registry_path = self.mesh_root / "bin" / "registry.json"
         self.control_path = tmp_path / "fake-graphify-control.json"
         self.call_log_path = tmp_path / "fake-graphify-call-log.jsonl"
+        self.argv_log_path = tmp_path / "fake-graphify-argv-log.jsonl"
         (self.mesh_root / "bin").mkdir(parents=True, exist_ok=True)
         self.scan_root.mkdir(parents=True, exist_ok=True)
         self._repos: list[dict] = []
@@ -105,6 +106,17 @@ class Env:
             if line
         ]
 
+    def read_argv_log(self) -> list[dict]:
+        """Every update/extract invocation of the fake graphify stub, in call
+        order. See FAKE_GRAPHIFY_ARGV_LOG."""
+        if not self.argv_log_path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.argv_log_path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+
     def settings(self, **overrides):
         from graphify_mesh.sync.config import Settings
 
@@ -150,7 +162,8 @@ def _fake_graphify_env_passthrough(monkeypatch):
     by. Declare them through the documented extension point so the fake still
     sees its control file and writes its call log."""
     monkeypatch.setenv(
-        "GRAPHIFY_MESH_CHILD_ENV_EXTRA", "FAKE_GRAPHIFY_CONTROL,FAKE_GRAPHIFY_CALL_LOG"
+        "GRAPHIFY_MESH_CHILD_ENV_EXTRA",
+        "FAKE_GRAPHIFY_CONTROL,FAKE_GRAPHIFY_CALL_LOG,FAKE_GRAPHIFY_ARGV_LOG",
     )
 
 
@@ -188,5 +201,6 @@ def env(tmp_path, monkeypatch) -> Env:
     e = Env(tmp_path)
     monkeypatch.setenv("FAKE_GRAPHIFY_CONTROL", str(e.control_path))
     monkeypatch.setenv("FAKE_GRAPHIFY_CALL_LOG", str(e.call_log_path))
+    monkeypatch.setenv("FAKE_GRAPHIFY_ARGV_LOG", str(e.argv_log_path))
     monkeypatch.setenv("GRAPHIFY_BIN", str(FAKE_GRAPHIFY))
     yield e

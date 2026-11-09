@@ -29,6 +29,24 @@ class CommunityEntry:
     sig: str
     name: str
     provisional: bool = False
+    # The LLM label the grounding check refused for this membership signature
+    # (no word of it occurs in the members). `name` is then a provisional hub
+    # name. The model repeats the label for the same members, so it is not asked
+    # again until the signature or the labeling recipe changes.
+    ungrounded: str = ""
+
+
+@dataclass
+class RepoEntry:
+    """One repo's partition under `cluster_scope=repo`, in repo-local ids.
+
+    `fingerprint` covers the repo's nodes and its internal edges — everything
+    its clustering and labeling read — so an equal fingerprint lets the next
+    run reuse the partition and names without clustering or an LLM call."""
+
+    fingerprint: str
+    assignments: dict[str, int] = field(default_factory=dict)
+    communities: dict[str, CommunityEntry] = field(default_factory=dict)
 
 
 @dataclass
@@ -38,6 +56,35 @@ class NamingState:
     labeling: dict = field(default_factory=dict)
     communities: dict[str, CommunityEntry] = field(default_factory=dict)
     assignments: dict[str, int] = field(default_factory=dict)
+    # Absent (empty) under cluster_scope=global and in files written before it.
+    # The schema version stays 1: older code ignores the key and still loads.
+    repos: dict[str, RepoEntry] = field(default_factory=dict)
+
+
+def _entries(raw: dict | None) -> dict[str, CommunityEntry]:
+    return {
+        str(cid): CommunityEntry(
+            sig=str(entry["sig"]),
+            name=str(entry["name"]),
+            # `rejected` came from the retired cross-repo uniqueness rule, which
+            # refused legitimately shared names: such a hub name is asked again.
+            provisional=bool(entry.get("provisional", False) or entry.get("rejected", False)),
+            ungrounded=str(entry.get("ungrounded") or ""),
+        )
+        for cid, entry in (raw or {}).items()
+    }
+
+
+def _dump_entries(entries: dict[str, CommunityEntry]) -> dict:
+    return {
+        cid: {
+            "sig": e.sig,
+            "name": e.name,
+            "provisional": e.provisional,
+            **({"ungrounded": e.ungrounded} if e.ungrounded else {}),
+        }
+        for cid, e in entries.items()
+    }
 
 
 def load(naming_dir: Path) -> NamingState | None:
@@ -52,20 +99,21 @@ def load(naming_dir: Path) -> NamingState | None:
     if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
         return None
     try:
-        communities = {
-            str(cid): CommunityEntry(
-                sig=str(entry["sig"]),
-                name=str(entry["name"]),
-                provisional=bool(entry.get("provisional", False)),
+        repos = {
+            str(repo): RepoEntry(
+                fingerprint=str(entry["fingerprint"]),
+                assignments={str(k): int(v) for k, v in (entry.get("assignments") or {}).items()},
+                communities=_entries(entry.get("communities")),
             )
-            for cid, entry in (raw.get("communities") or {}).items()
+            for repo, entry in (raw.get("repos") or {}).items()
         }
         return NamingState(
             merged_fingerprint=str(raw.get("merged_fingerprint", "")),
             clustering=dict(raw.get("clustering") or {}),
             labeling=dict(raw.get("labeling") or {}),
-            communities=communities,
+            communities=_entries(raw.get("communities")),
             assignments={str(k): int(v) for k, v in (raw.get("assignments") or {}).items()},
+            repos=repos,
         )
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
@@ -80,12 +128,18 @@ def save(naming_dir: Path, state: NamingState) -> None:
         "merged_fingerprint": state.merged_fingerprint,
         "clustering": state.clustering,
         "labeling": state.labeling,
-        "communities": {
-            cid: {"sig": e.sig, "name": e.name, "provisional": e.provisional}
-            for cid, e in state.communities.items()
-        },
+        "communities": _dump_entries(state.communities),
         "assignments": state.assignments,
     }
+    if state.repos:
+        payload["repos"] = {
+            repo: {
+                "fingerprint": entry.fingerprint,
+                "assignments": entry.assignments,
+                "communities": _dump_entries(entry.communities),
+            }
+            for repo, entry in state.repos.items()
+        }
     fd, tmp_name = tempfile.mkstemp(dir=str(naming_dir), prefix=".naming-state-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:

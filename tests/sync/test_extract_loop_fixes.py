@@ -85,7 +85,9 @@ class TestContentDigest:
 
     def test_unreadable_file_degrades_that_entry_not_the_manifest(self, repo):
         # A file that vanishes or cannot be read must not abort the walk.
-        blocked = repo / "secret.md"
+        # Not "secret.md": graphify skips that name as sensitive, so the digest
+        # would never try to read it.
+        blocked = repo / "blocked.md"
         blocked.write_text("x", encoding="utf-8")
         blocked.chmod(0o000)
         try:

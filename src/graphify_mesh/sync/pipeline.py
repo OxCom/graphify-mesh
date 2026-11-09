@@ -28,6 +28,7 @@ from __future__ import annotations
 import copy
 import fcntl
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ from graphify_mesh.sync import (
     graphify_cli,
     lexical_index,
     naming,
+    naming_state,
     overlay,
     progress,
     publish,
@@ -58,9 +60,14 @@ from graphify_mesh.sync import (
 )
 from graphify_mesh.sync.backend import assert_pinned_backend
 from graphify_mesh.sync.config import (
+    CLASSIFICATION_TABLES,
+    CLASSIFICATION_VERSION,
     CODE_EXTENSIONS,
+    CODE_FILENAMES,
     FORBIDDEN_OVERLAY_RELATION_TYPES,
+    IGNORED_FILENAMES,
     SEMANTIC_EXTENSIONS,
+    ClassificationTable,
     Settings,
     is_valid_http_base_url,
 )
@@ -77,9 +84,10 @@ from graphify_mesh.sync.registry import (
 from graphify_mesh.sync.state import (
     CLOCK_STATE_KEY,
     SourceDigest,
-    compute_source_manifest,
+    compute_source_manifests,
     file_content_hash,
     load_state,
+    read_build_ignore_rules,
     save_state,
 )
 from graphify_mesh.sync.sync_project import (
@@ -87,16 +95,26 @@ from graphify_mesh.sync.sync_project import (
     ACTION_EXTRACT,
     ACTION_SKIP,
     ACTION_UPDATE,
+    CLASSIFICATION_VERSION_KEY,
+    DIGEST_RECIPE_KEY,
     STATUS_BOOTSTRAP_FAILED,
     STATUS_FAILED,
     STATUS_INFRA_FAILED,
     STATUS_INFRA_SKIPPED,
     STATUS_SHRINK_REFUSED,
+    UNSTAMPED_DOCUMENTS_KEY,
     ProjectOutcome,
     apply_action,
     decide_action,
+    digest_recipe,
+    digest_recipe_changed,
+    effective_shrink_grant,
+    needs_classification_migration,
     producer_for,
+    recorded_classification_version,
+    refusal_held,
     refusal_key,
+    stored_hashes_match,
 )
 from graphify_mesh.sync.tls import ssl_context
 from graphify_mesh.sync.vectors import RepoVectors
@@ -357,6 +375,8 @@ def _guarded_apply_action(
     sandbox_policy: graphify_cli.SandboxPolicy | None = None,
     builder: str = BUILDER_GRAPHIFY,
     producer_changed: bool = False,
+    force_rebuild: bool = False,
+    retried_documents: frozenset[str] = frozenset(),
 ) -> ProjectOutcome:
     """apply_action wrapped in the extract-backend infra guard.
 
@@ -401,6 +421,8 @@ def _guarded_apply_action(
         shrink_policy=settings.shrink_policy,
         shrink_check_bin=settings.shrink_check_bin,
         producer_changed=producer_changed,
+        force_rebuild=force_rebuild,
+        retried_documents=retried_documents,
     )
     if not guarded:
         return outcome
@@ -421,6 +443,24 @@ PRODUCER_VERSIONS_KEY = "producer_versions"
 # build, and the refusal key must not flip when a later probe fails.
 REFUSED_PRODUCER_VERSIONS_KEY = "refused_producer_versions"
 REFUSED_GRAPHIFY_VERSION_KEY = "refused_graphify_version"
+# Extractor capability entry in producer_versions: whether graphify can parse
+# .sql (the `sql` extra, tree-sitter-sql). Installing it changes no source
+# digest, so without this entry no repo with .sql files would ever rebuild.
+SQL_CAPABILITY_KEY = "tree_sitter_sql"
+SQL_PRESENT = "present"
+SQL_ABSENT = "absent"
+# Value assumed for state written before an entry existed. The sql extra was
+# never installed before the stamp, so old state was built without it.
+_PRODUCER_VERSION_DEFAULTS = {SQL_CAPABILITY_KEY: SQL_ABSENT}
+
+
+def _sql_capability() -> str | None:
+    """Whether this interpreter's graphify can load the SQL grammar; None if unknown."""
+    try:
+        found = importlib.util.find_spec("tree_sitter_sql") is not None
+    except (ImportError, ValueError):
+        return None
+    return SQL_PRESENT if found else SQL_ABSENT
 
 
 def _producer_changed(
@@ -430,6 +470,11 @@ def _producer_changed(
     producer_versions: dict | None = None,
 ) -> bool:
     """Whether this run's producer differs from the one of the accepted graph.
+
+    Gates graphify-shrink-check's `--producer-changed` only, which lets the
+    check attribute count moves to the producer. It never forces a rebuild:
+    a label switch (extract -> update) is an ordinary source change, and
+    `--force` there would disable graphify's own guards. See `_producer_upgraded`.
 
     A different producer label, or a graphify version other than the recorded
     one: an upgrade changes the extractor without changing the label. State
@@ -454,13 +499,16 @@ def _producer_versions_differ(prior_state: dict, producer_versions: dict | None)
 
     A name missing on either side, or a None value, is unknown, not changed:
     state written before these versions were recorded must not rebuild every
-    graphify-php repo once.
+    graphify-php repo once. A name in _PRODUCER_VERSION_DEFAULTS is the
+    exception: a missing record means its default.
     """
     recorded = prior_state.get(PRODUCER_VERSIONS_KEY)
-    if not producer_versions or not isinstance(recorded, dict):
+    if not producer_versions:
         return False
+    if not isinstance(recorded, dict):
+        recorded = {}
     return any(
-        value and recorded.get(name) and recorded.get(name) != value
+        value and (old := recorded.get(name, _PRODUCER_VERSION_DEFAULTS.get(name))) and old != value
         for name, value in producer_versions.items()
     )
 
@@ -470,14 +518,21 @@ def _producer_upgraded(
 ) -> bool:
     """Whether the program that builds a repo was upgraded since its accepted graph.
 
-    The rebuild trigger for an unchanged source, so narrower than
-    `_producer_changed`: a producer label switch (extract -> update) and a
-    version never recorded are not upgrades. Only two known, different versions.
+    Gates two things: decide_action updates an unchanged source instead of
+    skipping it, and apply_action runs that update with `--force`
+    (`force_rebuild`), because incremental `update` would keep every unchanged
+    file's old extraction. Narrower than `_producer_changed`: a producer label
+    switch (extract -> update) is not an upgrade. True for two known, different
+    versions, and for accepted state with no graphify version recorded (state
+    older than version recording): that rebuilds once, then the accepted run
+    records the version. An unknown current version is never an upgrade.
     """
     if not prior_state:
         return False
     recorded = prior_state.get("graphify_version")
     if graphify_version and recorded and recorded != graphify_version:
+        return True
+    if graphify_version and not recorded and prior_state.get("semantic_hash"):
         return True
     return _producer_versions_differ(prior_state, producer_versions)
 
@@ -510,6 +565,7 @@ def _repo_versions(
     graphify_version: str | None,
     php_versions: dict | None,
     prior_state: dict | None = None,
+    capabilities: dict | None = None,
 ) -> RepoVersions:
     """Versions of the program that builds a repo built by `builder`.
 
@@ -518,9 +574,15 @@ def _repo_versions(
     probe did not report keeps the last recorded one: a probe that fails now
     and recovers later neither rebuilds nor releases a held refusal. This
     process's graphify is used only when the probe failed and nothing is recorded.
+
+    `capabilities` are this interpreter's extractor capabilities (the SQL
+    grammar), passed only for a repo whose digest holds a file they affect.
+    They describe the graphify that builds plain repos only: graphify-php's
+    interpreter is another environment, which the probe does not report on.
     """
     if builder != BUILDER_GRAPHIFY_PHP:
-        return RepoVersions(graphify_version, None, graphify_version, None)
+        own = dict(capabilities) if capabilities else None
+        return RepoVersions(graphify_version, own, graphify_version, own)
     prior = prior_state or {}
     probed = {name: value for name, value in (php_versions or {}).items() if value}
     accepted = _recorded_versions(prior, PRODUCER_VERSIONS_KEY)
@@ -539,11 +601,15 @@ def _repo_versions(
 
 def _key_version(graphify_version: str | None, producer_versions: dict | None) -> str | None:
     """Version part of a refusal key. The graphify-php version is in it, so a
-    plugin upgrade retries a held update once, as a graphify upgrade does."""
-    php = (producer_versions or {}).get("graphify_php")
-    if not php:
-        return graphify_version
-    return f"{graphify_version or ''}+graphify-php-{php}"
+    plugin upgrade retries a held update once, as a graphify upgrade does. A
+    present SQL grammar is in it too; absent leaves the key as it was before
+    the stamp existed, so the stamp itself releases no hold."""
+    versions = producer_versions or {}
+    php = versions.get("graphify_php")
+    key = graphify_version if not php else f"{graphify_version or ''}+graphify-php-{php}"
+    if versions.get(SQL_CAPABILITY_KEY) == SQL_PRESENT:
+        key = f"{key or ''}+sql"
+    return key
 
 
 def _explained_shrink_total(outcomes: Iterable[ProjectOutcome]) -> tuple[int, int]:
@@ -581,6 +647,41 @@ def _unpublished_shrink_total(state: dict, repo_ids: Iterable[str]) -> tuple[int
 
 def _add_shrink(a: tuple[int, int], b: tuple[int, int]) -> tuple[int, int]:
     return a[0] + b[0], a[1] + b[1]
+
+
+def _dry_run_no_labeling(_base_url: str, _api_key: str, _timeout: float) -> bool:
+    """Naming health check for dry runs: unhealthy, so no LLM label call is made."""
+    return False
+
+
+def _legacy_table(
+    prior_state: dict | None, repo_id: str, active_version: int = CLASSIFICATION_VERSION
+) -> ClassificationTable | None:
+    """The classification table `prior_state` hashes were taken under, when it differs.
+
+    None when no migration is due, or when the recorded version names no table
+    this build knows or does not parse: then decide_action compares the raw hashes.
+    """
+    if prior_state is None or not needs_classification_migration(prior_state, active_version):
+        return None
+    version = recorded_classification_version(prior_state)
+    if version is None:
+        log.warning(
+            "%s: state %s %r is not an integer; comparing raw hashes this run",
+            repo_id,
+            CLASSIFICATION_VERSION_KEY,
+            prior_state.get(CLASSIFICATION_VERSION_KEY),
+        )
+        return None
+    return CLASSIFICATION_TABLES.get(version)
+
+
+def _retried_documents(prior_state: dict | None) -> frozenset[str]:
+    """UNSTAMPED_DOCUMENTS_KEY from `prior_state`; empty when absent or malformed."""
+    raw = (prior_state or {}).get(UNSTAMPED_DOCUMENTS_KEY)
+    if not isinstance(raw, list):
+        return frozenset()
+    return frozenset(p for p in raw if isinstance(p, str))
 
 
 def _shrink_grant_for(entry: RepoEntry, prior_state: dict | None) -> str | None:
@@ -711,11 +812,14 @@ def _sweep_stale_staging(
     return removed
 
 
-def config_hash() -> str:
+def config_hash(classification_version: int = CLASSIFICATION_VERSION) -> str:
     payload = {
         "forbidden_relations": sorted(FORBIDDEN_OVERLAY_RELATION_TYPES),
         "code_extensions": sorted(CODE_EXTENSIONS),
         "semantic_extensions": sorted(SEMANTIC_EXTENSIONS),
+        "code_filenames": sorted(CODE_FILENAMES),
+        "ignored_filenames": sorted(IGNORED_FILENAMES),
+        "classification_version": classification_version,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
@@ -726,7 +830,8 @@ def config_hash() -> str:
 # `relation="same_type_as"` / `context="cross_repo"` links between type
 # declarations sharing a namespace and name across two repos, and
 # `cross_repo_calls.link_cross_repo_member_calls`, which adds cross-repo
-# `calls` edges (verified against graphify 0.9.63, `graphify/cli.py:2719-2727`).
+# `calls` edges (verified against graphify 0.9.103, the `merge-graphs` branch
+# of `graphify.cli.main`).
 # Invariant 1 forbids every one of them in the structural graph, so the
 # pipeline removes them by construction. Leaving that to validate would turn
 # the first type shared between two repos into a permanent publish outage with
@@ -805,6 +910,10 @@ class RunReport:
     skipped_stages: list[str] = field(default_factory=list)
     auto_add_failed: list[str] = field(default_factory=list)
     labeling: str = ""
+    # Why names were kept or made provisional, e.g. a label sharing no word
+    # with its own members' labels or paths, replaced by a provisional hub
+    # name. Empty when naming has nothing to explain.
+    labeling_reason: str = ""
     clustering_backend: str = ""
     overlay_edge_counts: dict = field(default_factory=dict)
     overlay_manual_relation_count: int = 0
@@ -1062,6 +1171,14 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # Per-repo, single-use shrink authorizations, resolved once against prior
     # state so the decision and the invocation see the same token.
     shrink_grants: dict[str, str | None] = {}
+    # The registry token behind each grant above, which may be translated from
+    # the old classification table; this is what state records as spent.
+    registry_grants: dict[str, str | None] = {}
+    # Per-repo `update --force` decision for apply_action.
+    force_rebuilds: dict[str, bool] = {}
+    # Digests under the old table for repos still migrating. Refusals are
+    # recorded against these, so a held refusal keeps matching until accepted.
+    legacy_manifests: dict[str, SourceDigest] = {}
     # graphify-php repos build via graphify-php-build, which imports the user-site
     # graphify; this records the mesh's version, so upgrade both installs together.
     graphify_version = repo_tags._in_process_graphify_version()
@@ -1077,46 +1194,92 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             settings.php_build_bin,
         )
     repo_versions: dict[str, RepoVersions] = {}
+    # The digest's ignore rules come from this process's graphify.
+    active_version = settings.classification_version
+    active_table = settings.classification_table
+    recipe = digest_recipe(graphify_version, active_version)
+    sql_capability = _sql_capability()
     misconfig_once = _MisconfigLogOnce()
     sandbox_policy = child_sandbox_policy(settings, staging_root)
     with ThreadPoolExecutor(max_workers=settings.extract_concurrency) as pool:
         # Per-repo source-manifest computation (a full stat-walk of every
         # repo tree) is pure read-only work, independent per repo — submit it
         # all up front on the same bounded pool instead of walking each tree
-        # sequentially before any decision can be made.
-        manifest_futures = {
-            entry.repo_id: pool.submit(
-                compute_source_manifest, _root_for(entry, reconciliation_dict)
+        # sequentially before any decision can be made. A migrating repo also
+        # needs its digest under the table its state was written with; both
+        # come from one walk so they describe the same file snapshot. That
+        # repeats on every run until the migration is accepted, dry runs too.
+        manifest_futures = {}
+        for entry in active_repos:
+            tables: tuple[ClassificationTable, ...] = (active_table,)
+            legacy_table = _legacy_table(state.get(entry.repo_id), entry.repo_id, active_version)
+            if legacy_table is not None and (entry.collection_path / "graph.json").exists():
+                tables = (active_table, legacy_table)
+            manifest_futures[entry.repo_id] = pool.submit(
+                compute_source_manifests,
+                _root_for(entry, reconciliation_dict),
+                tables,
+                read_build_ignore_rules(entry.collection_path),
             )
-            for entry in active_repos
-        }
         for i, entry in enumerate(active_repos, start=1):
             root = _root_for(entry, reconciliation_dict)
             repo_roots_by_id[entry.repo_id] = root
             graph_path = entry.collection_path / "graph.json"
             has_graph = graph_path.exists()
-            current_manifest = manifest_futures[entry.repo_id].result()
+            manifests = manifest_futures[entry.repo_id].result()
+            current_manifest = manifests[0]
             prior_state = state.get(entry.repo_id)
-            shrink_grant = _shrink_grant_for(entry, prior_state)
-            shrink_grants[entry.repo_id] = shrink_grant
-            versions = _repo_versions(entry.builder, graphify_version, php_versions, prior_state)
+            capabilities = (
+                {SQL_CAPABILITY_KEY: sql_capability}
+                if sql_capability and current_manifest.has_sql
+                else None
+            )
+            versions = _repo_versions(
+                entry.builder, graphify_version, php_versions, prior_state, capabilities
+            )
             repo_versions[entry.repo_id] = versions
+            recipe_changed = has_graph and digest_recipe_changed(
+                prior_state, recipe, active_version
+            )
+            migrating = has_graph and needs_classification_migration(prior_state, active_version)
+            legacy_manifest = manifests[1] if len(manifests) > 1 else None
+            if legacy_manifest is not None:
+                legacy_manifests[entry.repo_id] = legacy_manifest
+            registry_grant = _shrink_grant_for(entry, prior_state)
+            registry_grants[entry.repo_id] = registry_grant
+            shrink_grant = effective_shrink_grant(registry_grant, current_manifest, legacy_manifest)
+            shrink_grants[entry.repo_id] = shrink_grant
+            # Built from the digest the refusal fields were recorded under, so
+            # a refusal held before a classification migration stays held.
+            hold_key = refusal_key(
+                legacy_manifest or current_manifest,
+                producer_for(ACTION_UPDATE, entry.builder),
+                settings.shrink_policy,
+                _key_version(versions.key_graphify, versions.key_versions),
+            )
+            upgraded = _producer_upgraded(
+                prior_state, versions.graphify, versions.producer_versions
+            )
+            # --allow-shrink forces only the update it releases: the one held on
+            # this key. Forcing every update in the run disabled graphify's own
+            # guards for repos the operator never looked at.
+            force_rebuilds[entry.repo_id] = upgraded or (
+                settings.allow_shrink
+                and prior_state is not None
+                and refusal_held(prior_state, hold_key)
+            )
             action = decide_action(
                 prior_state,
                 current_manifest,
                 has_graph,
                 shrink_grant,
                 ast_only=settings.ast_only,
-                refusal_key=refusal_key(
-                    current_manifest,
-                    producer_for(ACTION_UPDATE, entry.builder),
-                    settings.shrink_policy,
-                    _key_version(versions.key_graphify, versions.key_versions),
-                ),
+                refusal_key=hold_key,
                 allow_shrink=settings.allow_shrink,
-                producer_changed=_producer_upgraded(
-                    prior_state, versions.graphify, versions.producer_versions
-                ),
+                producer_changed=upgraded,
+                legacy_manifest=legacy_manifest,
+                recipe_changed=recipe_changed,
+                active_version=active_version,
             )
             log.info("[%d/%d] %s: %s ...", i, total_active, entry.repo_id, action)
             bar.tick(i - 1, f"{entry.repo_id}: {action} ...")
@@ -1134,6 +1297,20 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 continue
 
             if action == ACTION_SKIP:
+                if (
+                    (migrating or recipe_changed)
+                    and prior_state is not None
+                    and stored_hashes_match(prior_state, current_manifest)
+                ):
+                    # No file in this repo changed category: the stored hashes
+                    # are already valid under the current table and recipe. A
+                    # held skip never matches here, so it keeps retrying.
+                    state[entry.repo_id] = {
+                        **prior_state,
+                        CLASSIFICATION_VERSION_KEY: active_version,
+                    }
+                    if recipe:
+                        state[entry.repo_id][DIGEST_RECIPE_KEY] = recipe
                 report.project_actions.append(
                     {"repo_id": entry.repo_id, "action": action, "status": "unchanged"}
                 )
@@ -1185,6 +1362,8 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                     repo_versions[entry.repo_id].graphify,
                     repo_versions[entry.repo_id].producer_versions,
                 ),
+                force_rebuild=force_rebuilds[entry.repo_id],
+                retried_documents=_retried_documents(state.get(entry.repo_id)),
             )
             for (i, entry, root, action, current_manifest) in actionable
         }
@@ -1271,7 +1450,10 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 # decide_action stop re-extracting an unchanged source forever.
                 prior = state.get(entry.repo_id) or {}
                 versions = repo_versions[entry.repo_id]
-                refused_hash = outcome.refused_manifest.semantic_hash
+                # A refusal keeps the prior classification version, so its
+                # fields are recorded under that table too (see decide_action).
+                refused_digest = legacy_manifests.get(entry.repo_id) or outcome.refused_manifest
+                refused_hash = refused_digest.semantic_hash
                 streak = int(prior.get("refusal_streak") or 0)
                 streak = streak + 1 if prior.get("refused_semantic_hash") == refused_hash else 1
                 state[entry.repo_id] = {
@@ -1281,7 +1463,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                     # decide_action holds a refused update on this key; the
                     # semantic hash above only holds a refused extract.
                     "refused_key": refusal_key(
-                        outcome.refused_manifest,
+                        refused_digest,
                         producer_for(action, entry.builder),
                         settings.shrink_policy,
                         _key_version(versions.key_graphify, versions.key_versions),
@@ -1305,6 +1487,12 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 # second shrink, and one spent earlier must stay spent through
                 # every later run that rewrites this entry wholesale.
                 accepted = outcome.new_manifest.to_dict()
+                # new_manifest is the current-table digest, so the accepted
+                # hashes are current-version hashes. Refusal and failure paths
+                # above keep the prior version, and the migration retries.
+                accepted[CLASSIFICATION_VERSION_KEY] = active_version
+                if recipe:
+                    accepted[DIGEST_RECIPE_KEY] = recipe
                 accepted["producer"] = producer_for(action, entry.builder)
                 versions = repo_versions[entry.repo_id]
                 if versions.graphify:
@@ -1312,7 +1500,21 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 if versions.producer_versions:
                     accepted[PRODUCER_VERSIONS_KEY] = dict(versions.producer_versions)
                 prior = state.get(entry.repo_id) or {}
-                spent = outcome.consumed_shrink_grant or prior.get("consumed_shrink_grant")
+                # An update never checks documents, so the retries stay counted.
+                unstamped = (
+                    outcome.unstamped_documents
+                    if outcome.unstamped_documents is not None
+                    else tuple(_retried_documents(prior))
+                )
+                if unstamped:
+                    accepted[UNSTAMPED_DOCUMENTS_KEY] = sorted(unstamped)
+                # The registry token, not the attempt id it was translated to:
+                # `_shrink_grant_for` compares the registry value against it.
+                spent = (
+                    registry_grants.get(entry.repo_id) or outcome.consumed_shrink_grant
+                    if outcome.consumed_shrink_grant
+                    else prior.get("consumed_shrink_grant")
+                )
                 if spent:
                     accepted["consumed_shrink_grant"] = spent
                 # Accepted loss stays on record until a publish includes it. The
@@ -1330,6 +1532,13 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                     # the spend now or the token authorizes a second shrink.
                     disk_state[entry.repo_id] = accepted
                     save_state(settings.state_path, disk_state)
+            elif outcome.unstamped_documents:
+                # Held for a partial extract: accepted state stays, these
+                # paths have had their retry and are accepted next time.
+                state[entry.repo_id] = {
+                    **(state.get(entry.repo_id) or {}),
+                    UNSTAMPED_DOCUMENTS_KEY: list(outcome.unstamped_documents),
+                }
         if graph_path.exists():
             graph_paths_by_repo[entry.repo_id] = graph_path
     bar.finish()
@@ -1474,6 +1683,17 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         report.labeling = "skipped (--skip-labeling)"
         report.clustering_backend = backend_check.backend
     else:
+        health_check = settings.ollama_health_check
+        if settings.dry_run:
+            # A dry run publishes nothing, so LLM labels would be thrown away
+            # (77 s observed). Degraded naming gives deterministic hub names
+            # instead. The real naming state seeds the staging copy, so only
+            # communities a real run would send to the LLM are counted.
+            real_state = settings.naming_dir / naming_state.STATE_FILENAME
+            if real_state.is_file():
+                shutil.copyfile(real_state, naming_dir / naming_state.STATE_FILENAME)
+            health_check = _dry_run_no_labeling
+            log.info("naming: dry run — LLM labeling disabled, the unhealthy warning is expected")
         log.info("naming: reclustering + labeling communities ...")
         naming_result = naming.run_naming(
             settings.graphify_bin,
@@ -1481,11 +1701,19 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             naming_staging_home,
             stripped_graph_data,
             settings,
-            health_check=settings.ollama_health_check,
+            health_check=health_check,
         )
         report.labeling = naming_result.labeling
+        report.labeling_reason = naming_result.reason
         report.clustering_backend = naming_result.backend
-        log.info("naming: %s (backend=%s)", naming_result.labeling, naming_result.backend)
+        log.info(
+            "naming: %s (backend=%s)%s",
+            naming_result.labeling,
+            naming_result.backend,
+            f": {naming_result.reason}" if naming_result.reason else "",
+        )
+        if settings.dry_run:
+            log.info("naming: would label %d communities", len(naming_result.changed_cids))
         # No restore-from-last-published step: the naming state file carries
         # names across an outage, and a degraded run now returns real names
         # (carried, or hub fallbacks marked provisional). Overwriting them from
@@ -1512,6 +1740,22 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     if embed_skip_reason:
         report.embedding_status = embed_skip_reason
         log.info("embedding: %s", embed_skip_reason)
+    if embed_skip_reason and not settings.dry_run:
+        # Restage the published shards under this generation, no embed call.
+        # Persisting nothing left embeddings/current on the previous generation
+        # id, and the server drops the whole vector channel on that mismatch.
+        # The overlay still gets no vectors: the manifest says model "none".
+        carried_stage = embedding.carry_forward_stage(
+            graphs_by_repo, settings, report.embedding_status, embed_skip_reason
+        )
+        report.embedding_vectors_dropped_repos = carried_stage.vectors_dropped_repos
+        # No file for an empty shard, so the next embedding run reports the
+        # repo as having no published shard rather than a recipe change.
+        embeddings_staged_dir = embedding.stage_embeddings(
+            staging_root,
+            {r: s for r, s in carried_stage.shards_by_repo.items() if s.entries},
+            carried_stage.id_map,
+        )
     if not embed_skip_reason:
         unchanged_repo_ids = {
             a["repo_id"] for a in report.project_actions if a.get("status") == "unchanged"
@@ -1526,21 +1770,29 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         # CLI work is added. Their graphs are already in `graphs_by_repo`,
         # which loads every repo in the merge regardless of action, so a run
         # whose recipe did not change reads nothing extra.
-        stale_recipe_repos = embedding.stale_recipe_repo_ids(
+        embeddings_current = (
             settings.embeddings_current_symlink
             if settings.embeddings_current_symlink.exists()
-            else None,
-            unchanged_repo_ids,
-            settings.ollama_embed_model,
+            else None
         )
-        if stale_recipe_repos:
+        stale_recipe_repos = embedding.stale_recipe_repo_ids(
+            embeddings_current, unchanged_repo_ids, settings.ollama_embed_model
+        )
+        no_shard_repos = embedding.missing_shard_repo_ids(embeddings_current, stale_recipe_repos)
+        if no_shard_repos:
+            log.info(
+                "embedding: %d unchanged repo(s) embedded — no published shard exists: %s",
+                len(no_shard_repos),
+                ", ".join(sorted(no_shard_repos)),
+            )
+        if stale_recipe_repos - no_shard_repos:
             log.info(
                 "embedding: %d unchanged repo(s) re-embedded — published shard recipe differs "
                 "from the configured one: %s",
-                len(stale_recipe_repos),
-                ", ".join(sorted(stale_recipe_repos)),
+                len(stale_recipe_repos - no_shard_repos),
+                ", ".join(sorted(stale_recipe_repos - no_shard_repos)),
             )
-            unchanged_repo_ids -= stale_recipe_repos
+        unchanged_repo_ids -= stale_recipe_repos
         # Provisional id used only for this run's staged id-map bookkeeping
         # (tombstoned_at/generation_id) — the real, durable generation_id is
         # not known until after validate/publish below (see
@@ -1601,7 +1853,9 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # overlay.py already loaded above; nothing here is incremental/cached
     # across runs, matching the "bundle artifact built once per generation"
     # contract (WS5 deliverable 2) rather than a per-MCP-session rebuild.
-    lexical_result = lexical_index.build_lexical_index(graphs_by_repo, repo_roots_by_id)
+    lexical_result = lexical_index.build_lexical_index(
+        graphs_by_repo, repo_roots_by_id, graph_paths_by_repo=graph_paths_by_repo
+    )
     report.lexical_index_stats = lexical_result.stats.to_dict()
     # Last consumer of the per-repo raw graphs (embed -> overlay -> lexical
     # all share this one load). Drop the full per-repo graph contents now
@@ -1716,7 +1970,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         "sync_started_at": sync_started_at,
         "repo_input_hashes": repo_input_hashes,
         "registry_hash": registry_hash(settings.registry_path),
-        "config_hash": config_hash(),
+        "config_hash": config_hash(settings.classification_version),
         "output_node_count": len(graph_data.get("nodes", [])),
         "output_edge_count": len(graph_data.get("links", graph_data.get("edges", []))),
         "output_hash": graph_output_hash,
@@ -1772,8 +2026,8 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # and the next run's gc_old_generations collects it (it pins only whatever
     # `current` points at). Nothing persists at all unless the run reaches
     # here — the dry-run, validation-failed and stale-blocked paths returned
-    # earlier. Nothing to persist if the embed stage was skipped or degraded
-    # with nothing new.
+    # earlier. A skipped or degraded embed stage persists the carried-forward
+    # shards (embedding.carry_forward_stage), so the ids still match.
     if embeddings_staged_dir is not None:
         embedding.persist_generation(settings.embeddings_dir, generation_id, embeddings_staged_dir)
 

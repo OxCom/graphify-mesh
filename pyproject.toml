@@ -47,7 +47,17 @@ dependencies = [
     #   client is silent: every community would publish under a hub fallback.
     #   Verified in graphifyy-0.9.63.dist-info/METADATA:
     #   `Requires-Dist: openai; extra == "ollama"`.
-    "graphifyy[ollama]>=0.9.63,<1.0",
+    #   Floor 0.9.95: from that release yaml/yml moved from the document
+    #   set to the code set in graphify's detect.py. Classification table v2
+    #   (sync/config.py) routes them to the AST `update` path and assumes it;
+    #   below 0.9.95 an edit would trigger an update that never reads them.
+    # graphifyy[sql]: declares tree-sitter-sql. Without it graphify's SQL
+    #   extractor (graphify/extractors/sql.py) skips every .sql file, so a
+    #   repo's migrations contribute no nodes. Measured on the gateway's 16
+    #   SQLite migrations: 0 -> 114 nodes and 186 edges. The pipeline stamps
+    #   its presence per repo with .sql files (producer_versions
+    #   "tree_sitter_sql"), so installing or removing it rebuilds those repos once.
+    "graphifyy[ollama,sql]>=0.9.95,<1.0",
     # openai floor is 1.55.3: httpx 0.28 removed `proxies=`, which openai
     #   passed until that release, so an older client raises TypeError when the
     #   client is CONSTRUCTED — swallowed by generate_community_labels into

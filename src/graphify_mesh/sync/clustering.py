@@ -48,7 +48,8 @@ def cluster_graph(
 
     `previous_assignments` is last run's `{node_id: community_id}`. graphify's
     own `cluster-only` remaps ids onto the previous assignment
-    (`graphify/cli.py:2117`); without it community ids renumber on every run and
+    (`graphify.cluster.remap_communities_to_previous`, called from
+    `graphify/cli.py`); without it community ids renumber on every run and
     anything that recorded an id points at a different community.
     """
     from graphify.cluster import cluster, remap_communities_to_previous
@@ -71,6 +72,58 @@ def hub_names(G: nx.Graph, communities: dict[int, list[str]]) -> dict[int, str]:
     from graphify.cluster import label_communities_by_hub
 
     return label_communities_by_hub(G, communities)
+
+
+UNATTRIBUTED_GROUP = ""
+
+
+def repo_groups(G: nx.Graph) -> dict[str, list[str]]:
+    """`{repo_id: sorted node ids}` covering every node of `G` exactly once.
+
+    A node without a `repo` (a stub or sourceless reference) joins the smallest
+    repo_id among its attributed neighbours. The pass repeats so a stub reached
+    only through other stubs is placed too; each pass reads only the previous
+    pass's assignments, so the result does not depend on node order. A node no
+    attributed node reaches lands in `UNATTRIBUTED_GROUP`.
+    """
+    owner: dict[str, str] = {}
+    pending: list[str] = []
+    for node, attrs in G.nodes(data=True):
+        repo = attrs.get("repo")
+        if isinstance(repo, str) and repo:
+            owner[node] = repo
+        else:
+            pending.append(node)
+    while pending:
+        placed: dict[str, str] = {}
+        for node in pending:
+            candidates = [owner[nb] for nb in G.neighbors(node) if nb in owner]
+            if candidates:
+                placed[node] = min(candidates)
+        if not placed:
+            break
+        owner.update(placed)
+        pending = [node for node in pending if node not in placed]
+    for node in pending:
+        owner[node] = UNATTRIBUTED_GROUP
+    groups: dict[str, list[str]] = {}
+    for node, repo in owner.items():
+        groups.setdefault(repo, []).append(node)
+    return {repo: sorted(nodes, key=str) for repo, nodes in sorted(groups.items())}
+
+
+def label_still_applies(
+    cid: int,
+    members: list[str],
+    previous_assignments: dict[str, int],
+    saved_sig: str | None,
+    current_sig: str | None,
+) -> bool:
+    """graphify's carry rule: same signature, or a strict majority overlap with
+    the previous community of the same id in both directions."""
+    from graphify.cluster import label_still_applies as upstream
+
+    return upstream(cid, members, previous_assignments, saved_sig, current_sig)
 
 
 _LABEL_BATCH_SIZE_DEFAULT = 50
@@ -107,9 +160,10 @@ def llm_names(
     """
     from graphify.llm import generate_community_labels
 
-    # max_concurrency=1, against upstream's default of 4 (graphify/llm.py:3500).
-    # Communities are labeled in batches of 100 (_LABEL_BATCH_SIZE, llm.py:3233),
-    # so the batch count grows with the graph but a single call does not. What
+    # max_concurrency=1, against upstream's default of 4
+    # (`generate_community_labels` in graphify/llm.py).
+    # Communities are labeled in batches of 100 (_LABEL_BATCH_SIZE in
+    # graphify/llm.py), so the batch count grows with the graph but a single call does not. What
     # upstream's 4-way fan-out does instead is inflate the latency of each call,
     # and the backend behind this endpoint serves one request at a time.
     # Measured 2026-09-21, one 100-community batch: 12.2 s alone; four in

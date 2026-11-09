@@ -26,6 +26,7 @@ from typing import TypeVar
 from graphify_mesh.server import lexical_read, ranking
 from graphify_mesh.server.retrieval import Hit, _hit_from_key
 from graphify_mesh.server.store import Generation
+from graphify_mesh.sync.embedding import key_to_ref
 from graphify_mesh.sync.lexical_index import normalize_alias_query
 from graphify_mesh.sync.overlay_refs import LogicalRef
 from graphify_mesh.sync.overlay_similar import normalize_label
@@ -127,7 +128,7 @@ def _build_label_community_index(
         node_key = generation.key_by_node_id.get(node_id)
         if not node_key:
             continue
-        norm = normalize_label(node.get("label", ""))
+        norm = normalize_label(key_to_ref(node_key).qualified_label)
         index.setdefault((community, norm), []).append((node_id, node.get("repo"), node_key))
     return index
 
@@ -186,7 +187,10 @@ def fallback_exact_match(
     repo's match never consumes one of the returned slots."""
     node_id = generation.node_id_by_key.get(key)
     node = generation.node_by_id.get(node_id, {}) if node_id else {}
-    label, community, repo = node.get("label"), node.get("community_name"), node.get("repo")
+    # The key's label, not the bare node label: sync buckets config keys by
+    # dotted path (v4), so `ingress.enabled` never matches `tls.enabled` here.
+    label = key_to_ref(key).qualified_label if node_id else None
+    community, repo = node.get("community_name"), node.get("repo")
     if not label or not community:
         return []
     target_norm = normalize_label(label)

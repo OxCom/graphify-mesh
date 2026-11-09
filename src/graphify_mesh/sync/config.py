@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import urllib.parse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -194,6 +195,32 @@ def _read_shrink_policy() -> str:
     return raw
 
 
+# "repo" clusters each repo's subgraph on its own, so an edit in one repo cannot
+# reshape another repo's communities; "global" is the old whole-graph clustering,
+# kept as the rollback switch. Recorded in the naming recipe, so a flip relabels once.
+CLUSTER_SCOPES = frozenset({"repo", "global"})
+CLUSTER_SCOPE_DEFAULT = "repo"
+
+
+def _read_cluster_scope() -> str:
+    """GRAPHIFY_MESH_CLUSTER_SCOPE, or the default for an unset or unknown value.
+
+    An unknown value warns instead of raising: both scopes publish a valid graph.
+    """
+    raw = (os.environ.get("GRAPHIFY_MESH_CLUSTER_SCOPE") or "").strip().lower()
+    if not raw:
+        return CLUSTER_SCOPE_DEFAULT
+    if raw not in CLUSTER_SCOPES:
+        logging.getLogger("graphify_mesh.sync").warning(
+            "GRAPHIFY_MESH_CLUSTER_SCOPE=%r is not one of %s — using %r",
+            raw,
+            sorted(CLUSTER_SCOPES),
+            CLUSTER_SCOPE_DEFAULT,
+        )
+        return CLUSTER_SCOPE_DEFAULT
+    return raw
+
+
 # WS3 embedding-stage defaults (C9): the NATIVE Ollama `/api/embed` endpoint,
 # NOT the OpenAI-compat `/v1` surface used by OLLAMA_DEFAULT_BASE_URL above
 # for the WS2 naming/labeling LLM calls — different contract, different base
@@ -210,6 +237,9 @@ EMBED_DEFAULT_BASE_URL = "http://localhost:11434"
 EMBED_DEFAULT_MODEL = "qwen3-embedding:0.6b"
 EMBED_DEFAULT_DIM = 1024
 EMBED_DEFAULT_HEALTH_TIMEOUT = 3.0
+# Bounds one /api/embed batch request. Measured 2026-11-06 on the real backend:
+# 34.7 s for 1 input, 78 s for 128, so the old 30 s failed the stage every run.
+EMBED_DEFAULT_REQUEST_TIMEOUT = 120.0
 
 # Extract-backend health-probe defaults. The probe guards the per-repo
 # `graphify extract --backend ollama` children (NOT the AST-only `update`
@@ -463,26 +493,133 @@ def _approved_roots_from_env(scan_roots: Sequence[Path]) -> list[Path]:
 
 # File extension -> source category, for manifest-diff decisions (WS1 item 2).
 # dict-dispatch instead of if/elif chains per project code style.
+#
+# Table v2 follows upstream graphify routing (detect.classify_file), unevenly:
+# the code side equals upstream CODE_EXTENSIONS as of graphify 0.9.103
+# (lowercased, hand-copied, never imported at runtime so a pip upgrade cannot
+# change the digest); the semantic side is a deliberate subset of the upstream
+# document/paper/image routing, with the rest listed in DELIBERATELY_EXCLUDED_DOC.
+# tests/compat/test_classification_drift.py compares both sides against the
+# installed graphify and fails on any upstream change.
+# Table v3 keeps the v2 categories and also drops every file graphify's own
+# ignore rules exclude (.gitignore, .graphifyignore, persisted --exclude, noise
+# dirs; see state.graphify_ignore_rules). Those rules come from the installed
+# graphify at runtime, so the per-repo digest recipe records its version.
+# v3 also drops files graphify skips as likely secrets (is_sensitive_path, a
+# hand copy of detect._is_sensitive checked by tests/compat).
+# Bump CLASSIFICATION_VERSION on any change; decide_action migrates per repo.
+CLASSIFICATION_VERSION = 3
 CODE_EXTENSIONS = frozenset(
     {
-        ".py",
+        ".asd",
+        ".astro",
+        ".bash",
+        ".c",
+        ".cbl",
+        ".cc",
+        ".cjs",
+        ".cl",
+        ".cls",
+        ".cob",
+        ".cobol",
+        ".cpp",
+        ".cpy",
+        ".cs",
+        ".cshtml",
+        ".csproj",
+        ".cts",
+        ".cu",
+        ".cuh",
+        ".cxx",
+        ".dart",
+        ".dfm",
+        ".dm",
+        ".dme",
+        ".dmf",
+        ".dmi",
+        ".dmm",
+        ".dpk",
+        ".dpr",
+        ".ejs",
+        ".erl",
+        ".escript",
+        ".ets",
+        ".ex",
+        ".exs",
+        ".f",
+        ".f03",
+        ".f08",
+        ".f90",
+        ".f95",
+        ".fsproj",
+        ".go",
+        ".gradle",
+        ".groovy",
+        ".h",
+        ".hcl",
+        ".hpp",
+        ".hrl",
+        ".inc",
+        ".java",
+        ".jl",
+        ".js",
+        ".json",
+        ".jsx",
+        ".kt",
+        ".kts",
+        ".lfm",
+        ".lisp",
+        ".lpk",
+        ".lpr",
+        ".lsp",
+        ".lua",
+        ".luau",
+        ".m",
+        ".metal",
+        ".mjs",
+        ".ml",
+        ".mli",
+        ".mm",
+        ".mts",
+        ".pas",
         ".php",
+        ".pp",
+        ".ps1",
+        ".psd1",
+        ".psm1",
+        ".py",
+        ".r",
+        ".rake",
+        ".razor",
+        ".rb",
+        ".resource",
+        ".robot",
+        ".rs",
+        ".scala",
+        ".sh",
+        ".sln",
+        ".slnx",
+        ".sol",
+        ".sql",
+        ".sv",
+        ".svelte",
+        ".svh",
+        ".swift",
+        ".tf",
+        ".tfvars",
+        ".toc",
+        ".trigger",
         ".ts",
         ".tsx",
-        ".js",
-        ".jsx",
-        ".go",
-        ".rs",
-        ".java",
-        ".rb",
-        ".c",
-        ".h",
-        ".cpp",
-        ".hpp",
-        ".cs",
-        ".kt",
-        ".swift",
+        ".v",
+        ".vb",
+        ".vbproj",
+        ".vh",
         ".vue",
+        ".xaml",
+        ".yaml",
+        ".yml",
+        ".zig",
     }
 )
 SEMANTIC_EXTENSIONS = frozenset(
@@ -491,16 +628,78 @@ SEMANTIC_EXTENSIONS = frozenset(
         ".mdx",
         ".rst",
         ".txt",
-        ".yaml",
-        ".yml",
-        ".json",
-        ".toml",
-        ".ini",
-        ".cfg",
-        ".conf",
-        ".env.example",
     }
 )
+# Upstream document, paper, image, office, video and Google Workspace suffixes
+# the mesh does not treat as semantic. Each one would send a repo to an LLM
+# extract (GPU cost) for little graph value. Table v3 honours .graphifyignore
+# (state.GraphifyIgnoreRules), which keeps them out only in a repo that lists
+# them there. Measured
+# 2026-11-06: 944 .html files across the 25 registered roots yield 51 nodes.
+# Adding a suffix here to semantic_extensions is a table change: bump
+# CLASSIFICATION_VERSION. tests/compat checks this set against upstream.
+DELIBERATELY_EXCLUDED_DOC = frozenset(
+    {
+        ".avi",
+        ".docx",
+        ".gdoc",
+        ".gif",
+        ".gsheet",
+        ".gslides",
+        ".html",
+        ".j2",
+        ".jinja",
+        ".jinja2",
+        ".jpeg",
+        ".jpg",
+        ".m4a",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp3",
+        ".mp4",
+        ".ogg",
+        ".pdf",
+        ".png",
+        ".qmd",
+        ".skill",
+        ".svg",
+        ".wav",
+        ".webm",
+        ".webp",
+        ".xlsx",
+    }
+)
+# Upstream manifest_ingest.PACKAGE_MANIFEST_NAMES: parsed as code whatever the
+# suffix. Matched on the lowercased file name, as upstream does.
+CODE_FILENAMES = frozenset(
+    {
+        "apm.yml",
+        "apm.yaml",
+        "pyproject.toml",
+        "cargo.toml",
+        "go.mod",
+        "pom.xml",
+    }
+)
+# Upstream detect._SKIP_FILES: never read by graphify. Matched case-sensitively,
+# as upstream does. Wins over the extension tables.
+IGNORED_FILENAMES = frozenset(
+    {
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "Cargo.lock",
+        "poetry.lock",
+        "Gemfile.lock",
+        "composer.lock",
+        "go.sum",
+        "go.work.sum",
+        ".graphifyinclude",
+    }
+)
+
+
 IGNORED_DIR_NAMES = frozenset(
     # Second consumer beyond file-categorization: sync/discovery.py's
     # `_iter_candidate_dirs` also prunes the filesystem walk on this same
@@ -530,20 +729,304 @@ IGNORED_DIR_NAMES = frozenset(
         ".vscode",
     }
 )
+# Fixed-name entries of upstream detect._SKIP_DIRS: graphify never reads these,
+# so their files must not move the source digest. Hand-copied like the suffix
+# tables; tests/compat/test_classification_drift.py notices an upstream change.
+# Upstream's evidence-gated names (env, out, coverage) are left out: a bare name
+# match would prune real source dirs that upstream keeps.
+UPSTREAM_SKIP_DIR_NAMES = frozenset(
+    {
+        "venv",
+        ".venv",
+        "node_modules",
+        "__pycache__",
+        ".git",
+        "dist",
+        "build",
+        "target",
+        "site-packages",
+        "lib64",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".nox",
+        ".eggs",
+        "graphify-out",
+        "lcov-report",
+        "visual-tests",
+        "visual-test",
+        "__snapshots__",
+        "storybook-static",
+        "dist-protected",
+        ".next",
+        ".nuxt",
+        ".turbo",
+        ".angular",
+        ".idea",
+        ".cache",
+        ".parcel-cache",
+        ".svelte-kit",
+        ".terraform",
+        ".serverless",
+        ".graphify",
+        ".obsidian",
+        ".smart-env",
+        ".worktrees",
+    }
+)
+# Upstream's one glob entry, "*.egg-info", as a name suffix.
+UPSTREAM_SKIP_DIR_SUFFIXES = (".egg-info",)
 
 
-def categorize_file(path: Path) -> str:
-    """Classify a source file as 'code', 'semantic', or 'ignore'.
+@dataclass(frozen=True)
+class ClassificationTable:
+    """One versioned file -> category mapping (see categorize_file).
+
+    The pruned dir names belong to the table because they decide which files
+    reach the digest at all: changing them changes stored hashes, exactly like
+    an extension edit, and needs the same version bump.
+    """
+
+    version: int
+    code_extensions: frozenset[str]
+    semantic_extensions: frozenset[str]
+    code_filenames: frozenset[str] = frozenset()
+    ignored_filenames: frozenset[str] = frozenset()
+    pruned_dir_names: frozenset[str] = IGNORED_DIR_NAMES
+    pruned_dir_suffixes: tuple[str, ...] = ()
+    # Whether files graphify's ignore rules exclude stay out of the digest.
+    honours_ignore_rules: bool = False
+    # Whether files graphify drops as likely secrets stay out (is_sensitive_path).
+    drops_sensitive_paths: bool = False
+
+    def prunes(self, name: str) -> bool:
+        """Whether a path component `name` keeps its subtree out of the digest."""
+        return name in self.pruned_dir_names or name.endswith(self.pruned_dir_suffixes)
+
+
+CURRENT_CLASSIFICATION = ClassificationTable(
+    version=CLASSIFICATION_VERSION,
+    code_extensions=CODE_EXTENSIONS,
+    semantic_extensions=SEMANTIC_EXTENSIONS,
+    code_filenames=CODE_FILENAMES,
+    ignored_filenames=IGNORED_FILENAMES,
+    pruned_dir_names=IGNORED_DIR_NAMES | UPSTREAM_SKIP_DIR_NAMES,
+    pruned_dir_suffixes=UPSTREAM_SKIP_DIR_SUFFIXES,
+    honours_ignore_rules=True,
+    drops_sensitive_paths=True,
+)
+# Frozen v2 table: the v3 categories without graphify's ignore rules. Never edit it.
+LEGACY_CLASSIFICATION_V2 = ClassificationTable(
+    version=2,
+    code_extensions=CODE_EXTENSIONS,
+    semantic_extensions=SEMANTIC_EXTENSIONS,
+    code_filenames=CODE_FILENAMES,
+    ignored_filenames=IGNORED_FILENAMES,
+    pruned_dir_names=IGNORED_DIR_NAMES | UPSTREAM_SKIP_DIR_NAMES,
+    pruned_dir_suffixes=UPSTREAM_SKIP_DIR_SUFFIXES,
+)
+# Frozen v1 table. State written before CLASSIFICATION_VERSION existed carries
+# hashes under it; decide_action recomputes a repo's digest with it once to tell
+# a real document edit from files that only changed category. Never edit it.
+LEGACY_CLASSIFICATION_V1 = ClassificationTable(
+    version=1,
+    code_extensions=frozenset(
+        {
+            ".py",
+            ".php",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".go",
+            ".rs",
+            ".java",
+            ".rb",
+            ".c",
+            ".h",
+            ".cpp",
+            ".hpp",
+            ".cs",
+            ".kt",
+            ".swift",
+            ".vue",
+        }
+    ),
+    semantic_extensions=frozenset(
+        {
+            ".md",
+            ".mdx",
+            ".rst",
+            ".txt",
+            ".yaml",
+            ".yml",
+            ".json",
+            ".toml",
+            ".ini",
+            ".cfg",
+            ".conf",
+            ".env.example",
+        }
+    ),
+)
+# Version-keyed registry: migration looks up the table a repo's state was written
+# under instead of hardcoding v1. Add the new entry when CLASSIFICATION_VERSION
+# bumps; never drop an old one while state under it can still exist.
+CLASSIFICATION_TABLES: dict[int, ClassificationTable] = {
+    1: LEGACY_CLASSIFICATION_V1,
+    2: LEGACY_CLASSIFICATION_V2,
+    3: CURRENT_CLASSIFICATION,
+}
+
+
+def _classification_version_from_env(var_name: str) -> int:
+    """The classification table the digest uses, CLASSIFICATION_VERSION when unset.
+
+    An older version is a rollback switch: state records it, so selecting
+    CLASSIFICATION_VERSION again migrates each repo once. Fails at startup on a
+    version with no table, like the other settings parsers."""
+    raw = os.environ.get(var_name)
+    if raw is None:
+        return CLASSIFICATION_VERSION
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"{var_name} must be one of {sorted(CLASSIFICATION_TABLES)}, got {raw!r}"
+        ) from exc
+    if value not in CLASSIFICATION_TABLES:
+        raise ValueError(f"{var_name} must be one of {sorted(CLASSIFICATION_TABLES)}, got {raw!r}")
+    return value
+
+
+def categorize_file(path: Path, table: ClassificationTable = CURRENT_CLASSIFICATION) -> str:
+    """Classify a source file as 'code', 'semantic', or 'ignore' under `table`.
 
     dict-dispatch (via frozenset membership) rather than an if/elif chain,
-    per project code style rules.
+    per project code style rules. File-name rules win over the suffix.
     """
-    suffix = path.suffix.lower()
-    if suffix in CODE_EXTENSIONS:
+    if path.name in table.ignored_filenames:
+        return "ignore"
+    if path.name.lower() in table.code_filenames:
         return "code"
-    if suffix in SEMANTIC_EXTENSIONS:
+    suffix = path.suffix.lower()
+    if suffix in table.code_extensions:
+        return "code"
+    if suffix in table.semantic_extensions:
         return "semantic"
     return "ignore"
+
+
+# Hand copy of graphify 0.9.103 detect._is_sensitive and its helpers
+# (_CREDENTIAL_STORE_DIRS, _AMBIGUOUS_SENSITIVE_DIRS, _SENSITIVE_PATTERNS,
+# _ENV_TEMPLATE_SUFFIXES, _GENERIC_KEYWORD_PATTERNS, _PROSE_EXTS,
+# _BARE_PLURAL_TOKENS, _SECRET_PRONE_DATA_EXTS, _WORD_SPLIT). detect() drops
+# these files before classification, so the v3 digest must not count them.
+# Never imported at runtime; tests/compat/test_sensitive_paths_drift.py
+# compares it with the installed graphify. Editing it is a table change.
+SENSITIVE_CREDENTIAL_STORE_DIRS = frozenset({".ssh", ".gnupg", ".aws", ".gcloud"})
+SENSITIVE_AMBIGUOUS_DIRS = frozenset({"secrets", ".secrets", "credentials"})
+SENSITIVE_NAME_PATTERNS = (
+    re.compile(r"(^|[\\/])\.(env|envrc)(\.|$)", re.IGNORECASE),
+    re.compile(r"\.(pem|key|p12|pfx|cert|crt|der|p8)$", re.IGNORECASE),
+    re.compile(r"(^|[^A-Za-z0-9])(id_rsa|id_dsa|id_ecdsa|id_ed25519)(\.pub)?$", re.IGNORECASE),
+    re.compile(r"^secring(\.(gpg|pgp))?$", re.IGNORECASE),
+    re.compile(
+        r"(\.netrc|\.pgpass|\.htpasswd|\.npmrc|\.pypirc|\.git-credentials|\.boto)$",
+        re.IGNORECASE,
+    ),
+)
+SENSITIVE_ENV_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".dist")
+SENSITIVE_KEYWORD_PATTERNS = (
+    re.compile(
+        r"(?<![a-zA-Z0-9])(credential|secret|passwd|password|private_key)s?(?![a-zA-Z])",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?<![a-zA-Z0-9])tokens?(?![a-zA-Z])", re.IGNORECASE),
+    re.compile(r"(?<![a-zA-Z0-9])service[._-]?account(?![a-zA-Z])", re.IGNORECASE),
+)
+SENSITIVE_PROSE_EXTS = frozenset({".md", ".markdown", ".rst", ".org", ".adoc", ".tex"})
+SENSITIVE_BARE_PLURAL_TOKENS = re.compile(r"(?<![a-zA-Z0-9])tokens(?![a-zA-Z])", re.IGNORECASE)
+SECRET_PRONE_DATA_EXTS = frozenset(
+    {
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".config",
+        ".xml",
+        ".properties",
+        ".env",
+        ".txt",
+        ".tfvars",
+    }
+)
+_SENSITIVE_WORD_SPLIT = re.compile(r"[-_\s.]+")
+
+
+def _is_env_template(name: str) -> bool:
+    lower = name.lower()
+    if not lower.endswith(SENSITIVE_ENV_TEMPLATE_SUFFIXES):
+        return False
+    return bool(re.match(r"\.(env|envrc)\.", lower))
+
+
+def _is_graphable_source(path: Path) -> bool:
+    """Upstream: classify_file is CODE and the suffix is not a data format.
+
+    Uses the mesh code tables, which equal upstream CODE_EXTENSIONS and the
+    manifest names (test_classification_drift.py). Upstream's shebang and
+    .graphifyrc language routing for extensionless or redeclared files is not
+    copied: those files are not code in the mesh digest either."""
+    suffix = path.suffix.lower()
+    is_code = suffix in CODE_EXTENSIONS or path.name.lower() in CODE_FILENAMES
+    return is_code and suffix not in SECRET_PRONE_DATA_EXTS
+
+
+def _is_prose_note(path: Path) -> bool:
+    if path.suffix.lower() not in SENSITIVE_PROSE_EXTS:
+        return False
+    stem = Path(path.name).stem.lstrip(".") or Path(path.name).stem
+    if SENSITIVE_BARE_PLURAL_TOKENS.fullmatch(stem):
+        return True
+    return not any(p.fullmatch(stem) for p in SENSITIVE_KEYWORD_PATTERNS)
+
+
+def _generic_keyword_hit(name: str) -> bool:
+    stem = Path(name).stem.lstrip(".") or Path(name).stem
+    for pattern in SENSITIVE_KEYWORD_PATTERNS:
+        hit = False
+        for match in pattern.finditer(stem):
+            hit = True
+            if match.end() == len(stem):
+                return True
+        if hit and len([w for w in _SENSITIVE_WORD_SPLIT.split(stem) if w]) <= 2:
+            return True
+    return False
+
+
+def is_sensitive_path(path: Path) -> bool:
+    """Whether graphify skips `path` as a likely secret (detect._is_sensitive).
+
+    Pass the absolute, resolved path: upstream checks every parent directory
+    of the scanned path, the ones above the scan root included."""
+    parents = path.parts[:-1]
+    if any(part.lower() in SENSITIVE_CREDENTIAL_STORE_DIRS for part in parents):
+        return True
+    if any(
+        part.lower() in SENSITIVE_AMBIGUOUS_DIRS for part in parents
+    ) and not _is_graphable_source(path):
+        return True
+    name = path.name
+    if any(p.search(name) for p in SENSITIVE_NAME_PATTERNS) and not _is_env_template(name):
+        return True
+    if _generic_keyword_hit(name):
+        return not (_is_graphable_source(path) or _is_prose_note(path))
+    return False
 
 
 @dataclass
@@ -571,7 +1054,16 @@ class Settings:
     relabel_all: bool = field(
         default_factory=lambda: os.environ.get("GRAPHIFY_MESH_RELABEL_ALL", "0") == "1"
     )
+    # "repo" (default) or "global". Env GRAPHIFY_MESH_CLUSTER_SCOPE.
+    cluster_scope: str = field(default_factory=lambda: _read_cluster_scope())
     skip_embedding: bool = False
+    # Key of CLASSIFICATION_TABLES the source digest is taken with. Env
+    # GRAPHIFY_MESH_CLASSIFICATION_VERSION; an older value rolls the digest back.
+    classification_version: int = field(
+        default_factory=lambda: _classification_version_from_env(
+            "GRAPHIFY_MESH_CLASSIFICATION_VERSION"
+        )
+    )
     # Changed repos get local `graphify update` instead of LLM `extract`: measured
     # 2026-10-12, 0 of 100 search hits came from LLM-extracted nodes (1-2% of a graph).
     # Bootstrap is unaffected. Env GRAPHIFY_MESH_AST_ONLY=1 or CLI --ast-only.
@@ -637,6 +1129,11 @@ class Settings:
     ollama_embed_health_timeout: float = field(
         default_factory=lambda: _health_timeout_from_env(
             "GRAPHIFY_MESH_OLLAMA_EMBED_HEALTH_TIMEOUT", EMBED_DEFAULT_HEALTH_TIMEOUT
+        )
+    )
+    embed_request_timeout: float = field(
+        default_factory=lambda: _api_timeout_from_env(
+            "GRAPHIFY_MESH_EMBED_TIMEOUT", EMBED_DEFAULT_REQUEST_TIMEOUT
         )
     )
     # Test-only dependency injection, mirrors ollama_health_check above but
@@ -710,6 +1207,15 @@ class Settings:
             self.scan_depth = SCAN_MIN_DEPTH
         if self.scan_depth > SCAN_MAX_DEPTH:
             self.scan_depth = SCAN_MAX_DEPTH
+        if self.classification_version not in CLASSIFICATION_TABLES:
+            raise ValueError(
+                f"classification_version must be one of {sorted(CLASSIFICATION_TABLES)}, "
+                f"got {self.classification_version!r}"
+            )
+
+    @property
+    def classification_table(self) -> ClassificationTable:
+        return CLASSIFICATION_TABLES[self.classification_version]
 
     @property
     def global_dir(self) -> Path:

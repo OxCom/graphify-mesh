@@ -35,15 +35,20 @@ from pathlib import Path
 
 import numpy as np
 
+from graphify_mesh.server import lexical_read
 from graphify_mesh.server.config import ServerConfig
 from graphify_mesh.server.rwlock import ReadWriteLock
 from graphify_mesh.sync.embedding import (
     SHARD_MATRIX_SUFFIX,
     SHARD_META_SUFFIX,
     _validate_v2_shard,
+    graph_node_keys,
     node_key,
 )
-from graphify_mesh.sync.lexical_index import SUPPORTED_LEXICAL_SCHEMA_VERSIONS
+from graphify_mesh.sync.lexical_index import (
+    SUPPORTED_LEXICAL_SCHEMA_VERSIONS,
+    uses_qualified_config_keys,
+)
 from graphify_mesh.sync.lexical_index import TOKENIZER_VERSION as EXPECTED_TOKENIZER_VERSION
 from graphify_mesh.sync.publish import output_hash
 from graphify_mesh.sync.validate import validate_generation_manifest
@@ -76,9 +81,21 @@ class Generation:
     # reject a misspelt relation without a full link scan per call. Assigned
     # once, as a frozenset, at the end of `build_indexes`.
     relations: frozenset[str] = field(default_factory=frozenset)
+    # Durable keys of semantic nodes flagged stale by the sync (ranking demotes
+    # them, hits carry `stale`). Empty for a generation built before the flag.
+    stale_keys: frozenset[str] = field(default_factory=frozenset)
 
     def build_indexes(self) -> None:
         relations: set[str] = set()
+        self.stale_keys = lexical_read.stale_semantic_keys(self.lexical)
+        # Keys must match the ones sync wrote into this generation's lexical
+        # index and embedding shards: dotted config-key paths from lexical
+        # schema v4 on, bare labels before it.
+        qualified_keys = (
+            graph_node_keys(None, self.graph)
+            if uses_qualified_config_keys(self.manifest, self.lexical)
+            else None
+        )
         for node in self.graph.get("nodes", []):
             if not isinstance(node, dict) or "id" not in node:
                 continue
@@ -86,7 +103,11 @@ class Generation:
             repo_id = node.get("repo")
             self.nodes_by_repo.setdefault(repo_id, []).append(node["id"])
             if repo_id:
-                key = node_key(repo_id, node)
+                key = (
+                    qualified_keys.get(node["id"])
+                    if qualified_keys is not None
+                    else node_key(repo_id, node)
+                )
                 if key is not None:
                     self.key_by_node_id[node["id"]] = key
                     self.node_id_by_key[key] = node["id"]

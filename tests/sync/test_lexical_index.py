@@ -72,7 +72,8 @@ def test_build_lexical_index_v3_shape_and_field_boosts():
     assert result1.stats.documents == 2
 
     data = result1.data
-    assert data["schema_version"] == 3
+    # v4 keeps the v3 container shape; only what a config-key document key names changed.
+    assert data["schema_version"] == 4
     assert data["fields"] == ["label", "path", "snippet"]
     assert "doc_freq" not in data
     assert isinstance(data["documents"], list)

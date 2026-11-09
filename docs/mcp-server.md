@@ -156,7 +156,8 @@ to the current project and only widens when asked. Fails closed if
 | `cwd` | string | — | "Absolute path of the project directory this call is about, used to resolve scope='current'. Pass it on every call — one session can move between projects. Omit it only with an explicit scope ('all' or 'repo:<id>'); a directory outside registry.json is refused." |
 
 Each `search` hit carries a `match_type`: `exact` when the whole query is an
-exact alias of the node (FQCN, label, bare method name, file basename), then
+exact alias of the node (FQCN, label, bare method name, and the file basename on
+the file node only; a YAML/JSON key node's label alias is its dotted key path), then
 `anchor`, then `fused` for the ranked hybrid results. A query token whose alias
 (`t` or `.t()`) names 1 to 10 nodes makes those nodes anchor candidates, each
 scored by the idf of the other query tokens found in its own fields and in its
@@ -165,6 +166,15 @@ scores at least 10 and at least twice the next candidate; otherwise no `anchor`
 hit appears and ranking is unchanged. The idf is corpus-wide, not per scope.
 `cross_project` and `context_pack` rank through the same code, so anchors apply
 to them as well.
+
+A hit with `stale: true` is an LLM-written (`_origin: semantic`) node on a file
+that graphify changed after the LLM pass: `update` keeps such nodes and `extract`
+never re-reads YAML, so they no longer match the file. The sync derives the flag
+from graphify's `manifest.json` (non-empty `ast_hash`, `semantic_hash == ""`) and
+lists the document ids under `stale_semantic` in `lexical-index.json` (additive,
+schema version unchanged). Ranking multiplies a stale node's fused score by
+`STALE_SEMANTIC_PENALTY` (`server/ranking.py`, 0.5; 1.0 disables). Stale nodes are
+demoted, never dropped, and an exact-alias hit is flagged but not demoted.
 
 Hits from `search`, `cross_project` and `find_similar`, and `context_pack`
 cards, carry no `community_name`: the labels proved unreliable and cost payload
@@ -227,15 +237,24 @@ an interface, all importers of a module. On cem.hub, subclasses of
 | `direction` | string | — (required) | `in`: edges whose target is the current node (subclasses for `inherits`, importers for `imports`). `out`: edges whose source is the current node (parents for `inherits`). `both`: either. |
 | `depth` | integer | `1` | 1 to 16 hops. |
 | `include_inferred` | boolean | `false` | Also follow non-EXTRACTED (INFERRED and AMBIGUOUS) edges. By default only EXTRACTED edges are followed. |
+| `min_confidence_score` | number or null | `null` | 0 to 1, finite. Requires `include_inferred`. An INFERRED or AMBIGUOUS edge is followed only when its `confidence_score` is at least this value; a non-EXTRACTED edge with no finite score is not followed. EXTRACTED edges are always followed. Setting it without `include_inferred=true` is an error. A bool, string, NaN, infinity or out-of-range value is an error. |
 
-The payload lists `seeds` and `nodes`. Each node carries `depth`, a citation,
-and `via`, the edges that reached it from the previous hop. `complete` is true
+The payload lists `seeds` and `nodes`, and echoes `include_inferred` and `min_confidence_score`.
+Each node carries `depth`, a citation, and `via`, the edges that reached it
+from the previous hop. A `via` entry is
+`{"relation", "from", "confidence"}`, plus `confidence_score` (float) when the
+edge carries a finite one and `also_seen` (int, the length of graphify's
+collapsed weaker-evidence list) when that list is non-empty. Parallel edges
+with the same `from`, `relation` and `confidence` collapse into one entry that
+keeps the highest score and the largest `also_seen` count. `complete` is true
 unless the 2000-node cap truncated the result (`truncated`). The cap counts
 seeds and nodes together: a label matching more than 2000 nodes returns the
 first 2000 seeds by key, no nodes, and `truncated: true`.
 `frontier_exhausted` says the walk ran out of new nodes before the depth limit.
 The complete-set note is emitted only then; otherwise `notes` says the result
 is exact only within `depth`.
+With `min_confidence_score` set, `notes` adds that non-EXTRACTED edges below the floor were not
+followed, so the set is complete only over edges at or above it; `complete` is unchanged.
 Nodes without a durable key are skipped and counted in `skipped_unkeyed`.
 
 `reliability` is `exact` unless the request followed `calls`,

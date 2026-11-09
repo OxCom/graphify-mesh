@@ -161,6 +161,19 @@ def doc_ids_by_key(lexical: object) -> dict[str, list[int]] | None:
     return by_key
 
 
+def stale_semantic_keys(lexical: object) -> frozenset[str]:
+    """Keys of documents the sync flagged `stale_semantic` (LLM-written nodes on
+    a file graphify changed since the LLM pass). Absent in v2 and in any index
+    built before the flag, which reads as no stale keys. Malformed ids are
+    skipped like every other malformed entry."""
+    keys: set[str] = set()
+    for doc_id in _get_list(lexical, "stale_semantic"):
+        ref = _doc_ref(lexical, doc_id)
+        if ref is not None:
+            keys.add(ref[1])
+    return frozenset(keys)
+
+
 def _is_packed(entry: object) -> bool:
     return isinstance(entry, int) and not isinstance(entry, bool)
 

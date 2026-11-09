@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections.abc import Callable
 from pathlib import Path
 
@@ -179,6 +180,21 @@ def _validate_depth(arguments: dict) -> int:
     return depth
 
 
+def _validate_min_confidence_score(arguments: dict) -> float | None:
+    """Optional real number (bools excluded) in [0, 1], finite. Absent or
+    null -> None (no score filter)."""
+    value = arguments.get("min_confidence_score")
+    if value is None:
+        return None
+    message = "'min_confidence_score' must be a number between 0 and 1"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ToolError(message)
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ToolError(message)
+    return value
+
+
 def _hit_to_dict(hit: Hit, generation: Generation) -> dict:
     node = generation.node_by_id.get(hit.node_id, {})
     return {
@@ -191,6 +207,7 @@ def _hit_to_dict(hit: Hit, generation: Generation) -> dict:
         "score": hit.score,
         "match_type": hit.match_type,
         "deprecated": hit.deprecated,
+        "stale": hit.stale,
     }
 
 
@@ -377,6 +394,9 @@ class GraphifyMeshServer:
         include_inferred = arguments.get("include_inferred", False)
         if not isinstance(include_inferred, bool):
             raise ToolError("'include_inferred' must be a boolean")
+        min_confidence_score = _validate_min_confidence_score(arguments)
+        if min_confidence_score is not None and not include_inferred:
+            raise ToolError("'min_confidence_score' requires include_inferred=true")
         # Same registered-and-enabled gate as project_map, checked before
         # the generation is touched.
         registered = {entry.repo_id for entry in self._registry_entries() if entry.enabled}
@@ -388,6 +408,7 @@ class GraphifyMeshServer:
                 direction=direction,
                 depth=depth,
                 include_inferred=include_inferred,
+                min_confidence_score=min_confidence_score,
                 degraded=["repo_not_registered"],
             ).as_dict()
         generation = self._generation()
@@ -398,7 +419,14 @@ class GraphifyMeshServer:
                 f"generation: {', '.join(sorted(generation.relations)) or '(none)'}"
             )
         return traverse_mod.neighbors(
-            node, repo, relations, direction, depth, include_inferred, generation
+            node,
+            repo,
+            relations,
+            direction,
+            depth,
+            include_inferred,
+            generation,
+            min_confidence_score=min_confidence_score,
         ).as_dict()
 
     def tool_list_repos(self, arguments: dict) -> dict:
@@ -614,7 +642,9 @@ class GraphifyMeshServer:
                     "(relation=handled_by). `depth` defaults to 1; pass up to 16 for a "
                     "hierarchy. `complete` is false only when the node cap truncated the "
                     "result; a walk cut by `depth` reports frontier_exhausted=false. INFERRED "
-                    "edges are followed only with include_inferred=true. calls/indirect_call "
+                    "edges are followed only with include_inferred=true, optionally floored by "
+                    "min_confidence_score; each `via` entry carries confidence_score and an "
+                    "also_seen count when the edge has them. calls/indirect_call "
                     "edges are incomplete (which calls are resolved depends on the extractor "
                     "that built the repo), so a missing call edge is not evidence of no call; "
                     "those results come back with reliability='partial'."
@@ -667,6 +697,18 @@ class GraphifyMeshServer:
                             "type": "boolean",
                             "default": False,
                             "description": "Also follow INFERRED-confidence edges.",
+                        },
+                        "min_confidence_score": {
+                            "type": ["number", "null"],
+                            "minimum": 0,
+                            "maximum": 1,
+                            "description": (
+                                "Requires include_inferred=true (an error otherwise). Follow "
+                                "an INFERRED/AMBIGUOUS edge only when its confidence_score "
+                                "is >= this value; an unscored non-EXTRACTED edge is not "
+                                "followed. EXTRACTED edges are always followed. null means "
+                                "no floor."
+                            ),
                         },
                     },
                     "required": ["node", "repo", "relation", "direction"],

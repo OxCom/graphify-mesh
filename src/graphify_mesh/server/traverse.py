@@ -74,6 +74,10 @@ NOTE_INFERRED = (
     "Non-EXTRACTED (INFERRED/AMBIGUOUS) edges were followed; they are extractor guesses, "
     "not resolved references."
 )
+NOTE_SCORE_FLOOR = (
+    "Non-EXTRACTED edges with confidence_score below {floor}, or without a finite score, "
+    "were not followed; the set is complete only over edges at or above the floor."
+)
 NOTE_TRUNCATED = (
     "Result was truncated at the node cap, which counts seeds and nodes together; the set "
     "is incomplete and must not be read as the full roster."
@@ -93,6 +97,7 @@ class NeighborsResult:
     direction: str
     depth: int
     include_inferred: bool
+    min_confidence_score: float | None = None
     generation_id: str | None = None
     seeds: list[dict] = field(default_factory=list)
     nodes: list[dict] = field(default_factory=list)
@@ -124,6 +129,8 @@ class NeighborsResult:
             notes.extend(NOTE_RESOLVER.format(name=name) for name in sorted(self.resolvers))
         if self.include_inferred:
             notes.append(NOTE_INFERRED)
+        if self.min_confidence_score is not None:
+            notes.append(NOTE_SCORE_FLOOR.format(floor=self.min_confidence_score))
         if self.skipped_unkeyed:
             notes.append(NOTE_UNKEYED_SKIPPED)
         return notes
@@ -135,6 +142,8 @@ class NeighborsResult:
             "relations": self.relations,
             "direction": self.direction,
             "depth": self.depth,
+            "include_inferred": self.include_inferred,
+            "min_confidence_score": self.min_confidence_score,
             "generation_id": self.generation_id,
             "seeds": self.seeds,
             "nodes": self.nodes,
@@ -191,11 +200,16 @@ def _node_card(node_id: str, key: str, repo: str, generation: Generation) -> dic
 
 
 def _edge_matches(
-    link: dict, current: str, direction: str, relations: frozenset[str], include_inferred: bool
+    link: dict,
+    current: str,
+    direction: str,
+    relations: frozenset[str],
+    include_inferred: bool,
+    min_confidence_score: float | None = None,
 ) -> bool:
     if link.get("relation") not in relations:
         return False
-    if not ranking.edge_followable(link, include_inferred):
+    if not ranking.edge_followable(link, include_inferred, min_confidence_score):
         return False
     # Adjacency is built undirected (each link listed under both endpoints),
     # so orientation is read back off the link itself.
@@ -206,6 +220,39 @@ def _edge_matches(
     return True
 
 
+def _also_seen_count(link: dict) -> int:
+    """Length of graphify's `also_seen` list (collapsed weaker duplicate
+    evidence), 0 when absent or not a list."""
+    also_seen = link.get("also_seen")
+    return len(also_seen) if isinstance(also_seen, list) else 0
+
+
+def _merge_evidence(
+    current: tuple[float | None, int] | None, score: float | None, also_seen: int
+) -> tuple[float | None, int]:
+    """Collapse parallel links sharing one (from, relation, confidence) via
+    key: keep the max score and the max also_seen count, so the result does
+    not depend on adjacency order."""
+    if current is None:
+        return score, also_seen
+    best_score, best_seen = current
+    if score is not None and (best_score is None or score > best_score):
+        best_score = score
+    return best_score, max(best_seen, also_seen)
+
+
+def _via_entry(
+    from_key: str, relation: str, confidence: str, evidence: tuple[float | None, int]
+) -> dict:
+    score, also_seen = evidence
+    entry: dict = {"relation": relation, "from": from_key, "confidence": confidence}
+    if score is not None:
+        entry["confidence_score"] = score
+    if also_seen:
+        entry["also_seen"] = also_seen
+    return entry
+
+
 def neighbors(
     node_arg: str,
     repo: str,
@@ -214,6 +261,7 @@ def neighbors(
     depth: int,
     include_inferred: bool,
     generation: Generation,
+    min_confidence_score: float | None = None,
 ) -> NeighborsResult:
     """Breadth-first traversal from every seed matching `node_arg` in `repo`.
     `relations` must already be sorted, deduplicated and known to exist in
@@ -225,6 +273,7 @@ def neighbors(
         direction=direction,
         depth=depth,
         include_inferred=include_inferred,
+        min_confidence_score=min_confidence_score,
         generation_id=generation.generation_id,
     )
     if not generation.nodes_by_repo.get(repo):
@@ -257,15 +306,18 @@ def neighbors(
     unkeyed: set[str] = set()
     frontier = seed_ids
     for level in range(1, depth + 1):
-        # node_id -> {(from_key, relation, confidence)}: every matching edge
-        # from the previous level into a newly reached node.
-        reached: dict[str, set[tuple[str, str, str]]] = {}
+        # node_id -> {(from_key, relation, confidence): (max score, max
+        # also_seen)}: every matching edge from the previous level into a
+        # newly reached node, parallel links collapsed per via key.
+        reached: dict[str, dict[tuple[str, str, str], tuple[float | None, int]]] = {}
         reached_resolvers: dict[str, set[str]] = {}
         for current in frontier:
             for neighbor_id, link in generation.adjacency.get(current, []):
                 if neighbor_id in visited:
                     continue
-                if not _edge_matches(link, current, direction, relation_set, include_inferred):
+                if not _edge_matches(
+                    link, current, direction, relation_set, include_inferred, min_confidence_score
+                ):
                     continue
                 neighbor = generation.node_by_id.get(neighbor_id)
                 if neighbor is None or neighbor.get("repo") != repo:
@@ -277,8 +329,12 @@ def neighbors(
                 if resolver and link["relation"] in PARTIAL_RELATIONS:
                     reached_resolvers.setdefault(neighbor_id, set()).add(str(resolver))
                 confidence = link.get("confidence", ranking.CONFIDENCE_EXTRACTED)
-                reached.setdefault(neighbor_id, set()).add(
-                    (key_of[current], link["relation"], confidence)
+                via_key = (key_of[current], link["relation"], confidence)
+                evidence = reached.setdefault(neighbor_id, {})
+                evidence[via_key] = _merge_evidence(
+                    evidence.get(via_key),
+                    ranking.edge_confidence_score(link),
+                    _also_seen_count(link),
                 )
         if not reached:
             result.frontier_exhausted = True
@@ -293,7 +349,7 @@ def neighbors(
             card = _node_card(nid, key_of[nid], repo, generation)
             card["depth"] = level
             card["via"] = [
-                {"relation": rel, "from": from_key, "confidence": conf}
+                _via_entry(from_key, rel, conf, reached[nid][(from_key, rel, conf)])
                 for from_key, rel, conf in sorted(reached[nid])
             ]
             result.nodes.append(card)

@@ -11,8 +11,20 @@ project's `graphify-out` target directory (i.e. the collection_path). Each
 entry looks like:
 
     {
-      "<collection_path>": {"mode": "normal|noop|shrink|fail|bootstrap_fail"}
+      "<collection_path>": {"mode": "normal|noop|shrink|fail|bootstrap_fail|
+                                     incremental|graphify_refuse"}
     }
+
+The last two model graphify 0.9.103's incremental `update`, where `--force`
+means a full rebuild that also skips graphify's own shrink guard:
+
+- `incremental`: `update` without `--force` sees no changed file and leaves
+  graph.json untouched; with `--force` it behaves like `normal`.
+- `graphify_refuse`: `update` without `--force` is refused by graphify's own
+  guard (exit 1, "Pass --force to override."); with `--force` it shrinks.
+
+Every `update`/`extract` call appends {"cmd", "argv", "out_dir",
+"graphify_force_env"} as a JSON line to FAKE_GRAPHIFY_ARGV_LOG, if set.
 
 merge-graphs performs a real (but tiny, deterministic) union-of-node_link_data
 merge, tagging node ids with a `<product>.<sub>::` prefix derived from each
@@ -69,13 +81,43 @@ def _write_graph(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-def cmd_update_or_extract(root_arg: str) -> int:
-    root = Path(root_arg).resolve()
+def cmd_update_or_extract(cmd: str, args: list[str]) -> int:
+    positional = [a for a in args if not a.startswith("--")]
+    if not positional:
+        print("error: missing root path", file=sys.stderr)
+        return 2
+    force = "--force" in args
+    root = Path(positional[0]).resolve()
     out_dir = _out_dir_for_root(root)
     graph_path = out_dir / "graph.json"
     control = _control()
     entry = control.get(str(out_dir), {})
     mode = entry.get("mode", "normal")
+    log_path = os.environ.get("FAKE_GRAPHIFY_ARGV_LOG")
+    if log_path:
+        with Path(log_path).open("a", encoding="utf-8") as fh:
+            record = {
+                "cmd": cmd,
+                "argv": [cmd, *args],
+                "out_dir": str(out_dir),
+                "graphify_force_env": os.environ.get("GRAPHIFY_FORCE"),
+            }
+            fh.write(json.dumps(record) + "\n")
+
+    if cmd == "update" and mode == "incremental" and not force:
+        print("[graphify watch] No relevant changes; graphify-out left untouched.")
+        return 0
+    if cmd == "update" and mode == "graphify_refuse":
+        if not force:
+            n = len(_read_graph(graph_path).get("nodes", []))
+            print(
+                f"[graphify] WARNING: new graph has {n - 1} nodes but existing graph.json "
+                f"has {n}. Refusing to overwrite — you may be missing chunk files from a "
+                "previous session. Pass --force to override.",
+                file=sys.stderr,
+            )
+            return 1
+        mode = "shrink"
 
     if mode == "fail":
         print("[fake-graphify] simulated failure", file=sys.stderr)
@@ -342,10 +384,7 @@ def main() -> int:
         return 2
     cmd, rest = argv[0], argv[1:]
     if cmd in ("update", "extract"):
-        if not rest:
-            print("error: missing root path", file=sys.stderr)
-            return 2
-        return cmd_update_or_extract(rest[0])
+        return cmd_update_or_extract(cmd, rest)
     if cmd == "merge-graphs":
         return cmd_merge_graphs(rest)
     if cmd in ("cluster-only", "label"):

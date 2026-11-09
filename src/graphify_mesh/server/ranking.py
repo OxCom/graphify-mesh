@@ -25,6 +25,9 @@ Fusion contract (plan WS5 bullet 3):
 
 from __future__ import annotations
 
+import math
+from collections.abc import Set as AbstractSet
+
 # --- RRF (Reciprocal Rank Fusion) ------------------------------------------
 
 # Standard RRF smoothing constant (Cormack et al. 2009's k=60 is the
@@ -55,6 +58,13 @@ HUB_PENALTY_FACTOR = 0.5
 DEPRECATED_PATH_MARKER = "/DEPRECATED/"
 DEPRECATED_PENALTY_FACTOR = 0.3
 
+# Stale-semantic down-weight: an LLM-written node on a file graphify changed
+# since the LLM pass (manifest `semantic_hash == ""`). `update` keeps such nodes
+# and `extract` never re-reads YAML, so they freeze. Demoted, never dropped:
+# Helm templates with Go syntax have no AST nodes, so they stay findable.
+# 1.0 disables the demotion.
+STALE_SEMANTIC_PENALTY = 0.5
+
 # Confidence handling is an allowlist: only EXTRACTED edges are followed by
 # default in traversal (structural candidates, similar, neighbors). graphify
 # also emits AMBIGUOUS, scored below INFERRED, so a denylist of INFERRED alone
@@ -79,10 +89,32 @@ DEFAULT_K = 10
 PAGE_SIZE = 20
 
 
-def edge_followable(edge: dict, include_inferred: bool) -> bool:
+def edge_followable(
+    edge: dict, include_inferred: bool, min_confidence_score: float | None = None
+) -> bool:
     """True when traversal may follow `edge`: EXTRACTED (the default when the
-    edge carries no `confidence`), or any confidence once the caller opted in."""
-    return include_inferred or edge.get("confidence", CONFIDENCE_EXTRACTED) == CONFIDENCE_EXTRACTED
+    edge carries no `confidence`), or any confidence once the caller opted in.
+    With `min_confidence_score`, a non-EXTRACTED edge must also carry a finite
+    `confidence_score` at or above it; an unscored guess fails closed."""
+    confidence = edge.get("confidence", CONFIDENCE_EXTRACTED)
+    if confidence == CONFIDENCE_EXTRACTED:
+        return True
+    if not include_inferred:
+        return False
+    if min_confidence_score is None:
+        return True
+    score = edge_confidence_score(edge)
+    return score is not None and score >= min_confidence_score
+
+
+def edge_confidence_score(edge: dict) -> float | None:
+    """The edge's `confidence_score` as a float, or None when it is absent,
+    not a number (bools excluded), or not finite."""
+    score = edge.get("confidence_score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return None
+    score = float(score)
+    return score if math.isfinite(score) else None
 
 
 def rrf_contribution(rank: int) -> float:
@@ -106,11 +138,14 @@ def apply_penalties(
     base_score: float,
     degree_by_key: dict[str, int],
     path_by_key: dict[str, str],
+    stale_keys: AbstractSet[str] = frozenset(),
 ) -> float:
-    """Multiplicative hub-degree + DEPRECATED-path penalties. Never applied
-    to exact-alias bypass hits (those skip this function entirely — see
-    `retrieval.rank_candidates`)."""
+    """Multiplicative hub-degree + DEPRECATED-path + stale-semantic penalties.
+    Never applied to exact-alias bypass hits (those skip this function
+    entirely — see `retrieval.rank_candidates`)."""
     score = base_score
+    if doc_key in stale_keys:
+        score *= STALE_SEMANTIC_PENALTY
     if degree_by_key.get(doc_key, 0) > HUB_DEGREE_THRESHOLD:
         score *= HUB_PENALTY_FACTOR
     path = path_by_key.get(doc_key, "") or ""

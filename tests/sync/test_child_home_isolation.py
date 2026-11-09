@@ -84,15 +84,13 @@ def test_run_extract_uses_staging_home(captured, tmp_path, monkeypatch):
     assert staging_home.is_dir()
 
 
-def test_merge_cluster_label_isolation_unchanged(captured, tmp_path):
+def test_merge_graphs_isolation_unchanged(captured, tmp_path):
     staging_home = tmp_path / "merge-home"
     graphify_cli.run_merge_graphs(
         "graphify", [tmp_path / "a.json"], tmp_path / "out.json", staging_home
     )
-    graphify_cli.run_cluster_only("graphify", tmp_path, staging_home)
-    graphify_cli.run_label("graphify", tmp_path, staging_home, "ollama", "m")
 
-    assert [c["env"]["HOME"] for c in captured] == [str(staging_home)] * 3
+    assert [c["env"]["HOME"] for c in captured] == [str(staging_home)]
 
 
 def test_project_staging_home_is_unique_per_repo(tmp_path):

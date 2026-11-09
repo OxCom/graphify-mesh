@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from graphify_mesh.sync import graphify_cli
+from graphify_mesh.sync.config import CLASSIFICATION_VERSION, CURRENT_CLASSIFICATION
 from graphify_mesh.sync.registry import BUILDER_GRAPHIFY, BUILDER_GRAPHIFY_PHP
 from graphify_mesh.sync.state import (
     SourceDigest,
@@ -72,6 +73,48 @@ _UPDATE_PRODUCERS = {
 
 SHRINK_POLICY_COUNT = "count"
 
+# Per-repo state key: the classification table version the accepted hashes were
+# taken under. Written only with accepted state, so a refused or failed
+# migration keeps the old version and retries next run.
+CLASSIFICATION_VERSION_KEY = "classification_version"
+# Per-repo state key: what produced the accepted hashes beyond the table. The
+# current table reads graphify's ignore rules from the installed graphify, so a
+# graphify upgrade can move files in or out of the digest with no source edit.
+DIGEST_RECIPE_KEY = "digest_recipe"
+# Per-repo state key: documents an extract left unstamped that already had
+# their one retry. A partial new document and a document graphify never reads
+# look the same in its manifest (no row), so the bound lives here.
+UNSTAMPED_DOCUMENTS_KEY = "unstamped_documents"
+
+
+def digest_recipe(
+    graphify_version: str | None, version: int = CLASSIFICATION_VERSION
+) -> str | None:
+    """The digest recipe for table `version`; None when the graphify version is unknown."""
+    if not graphify_version:
+        return None
+    return f"v{version}+graphify-ignore-{graphify_version}"
+
+
+def digest_recipe_changed(
+    prior_state: dict | None,
+    recipe: str | None,
+    active_version: int = CLASSIFICATION_VERSION,
+) -> bool:
+    """Whether accepted hashes under the active table came from another recipe.
+
+    Only for state already on the active table: a classification migration
+    has its own exact check (legacy digest) and stamps the recipe on accept. An
+    unknown current recipe is not a change.
+    """
+    if (
+        prior_state is None
+        or recipe is None
+        or needs_classification_migration(prior_state, active_version)
+    ):
+        return False
+    return prior_state.get(DIGEST_RECIPE_KEY) != recipe
+
 
 def producer_for(action: str, builder: str = BUILDER_GRAPHIFY) -> str:
     """The producer `action` runs for a repo built by `builder`."""
@@ -93,6 +136,58 @@ def refusal_key(
     if graphify_version:
         producer = f"{producer}@{graphify_version}"
     return f"{digest.attempt_id}:{producer}:{policy}"
+
+
+def recorded_classification_version(prior_state: dict) -> int | None:
+    """The classification version `prior_state` hashes were taken under.
+
+    State written before the version was recorded counts as version 1. None when
+    the stored value is not an integer (hand-edited or corrupt state): no table
+    is known for it, so the caller compares raw hashes as for an unknown version.
+    """
+    raw = prior_state.get(CLASSIFICATION_VERSION_KEY, 1)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def needs_classification_migration(
+    prior_state: dict | None, active_version: int = CLASSIFICATION_VERSION
+) -> bool:
+    """Whether `prior_state` hashes were taken under another table than `active_version`.
+
+    `active_version` is Settings.classification_version, so a rollback to an
+    older table and the later switch back each migrate once. State written
+    before the version was recorded counts as version 1. An unparseable version
+    also counts: the accepted run stamps the active one.
+    """
+    if prior_state is None:
+        return False
+    return recorded_classification_version(prior_state) != active_version
+
+
+def stored_hashes_match(prior_state: dict, digest: SourceDigest) -> bool:
+    """Whether the accepted hashes in `prior_state` equal `digest`."""
+    return (
+        prior_state.get("code_hash") == digest.code_hash
+        and prior_state.get("semantic_hash") == digest.semantic_hash
+    )
+
+
+def effective_shrink_grant(
+    grant: str | None, current: SourceDigest, legacy: SourceDigest | None
+) -> str | None:
+    """The `allow_shrink_once` token as this run's attempt id sees it.
+
+    A token issued before a classification migration names the attempt id under
+    the old table. While migrating (`legacy` given), that token authorizes the
+    same source state, so it is translated to the current attempt id that
+    decide_action and apply_action compare against. Any other token passes as is.
+    """
+    if grant is not None and legacy is not None and grant == legacy.attempt_id:
+        return current.attempt_id
+    return grant
 
 
 @dataclass
@@ -126,6 +221,10 @@ class ProjectOutcome:
     # from the previous generation's counts, so a deletion one repo's guard
     # accepted on evidence is not refused again by the count-only global floor.
     explained_shrink: tuple[int, int] = (0, 0)
+    # Documents this extract left unstamped, for UNSTAMPED_DOCUMENTS_KEY. On a
+    # held outcome (no new_manifest) every one of them has now had its retry;
+    # on an accepted one, the ones accepted unstamped. None: not checked.
+    unstamped_documents: tuple[str, ...] | None = None
 
 
 # How many consecutive refusals of the SAME source digest before the repo stops
@@ -145,21 +244,43 @@ def decide_action(
     refusal_key: str | None = None,
     allow_shrink: bool = False,
     producer_changed: bool = False,
+    legacy_manifest: SourceDigest | None = None,
+    recipe_changed: bool = False,
+    active_version: int = CLASSIFICATION_VERSION,
 ) -> str:
     """Pick the action for one repo.
 
-    `refusal_key` is `refusal_key(current_manifest, <update producer>, policy)`.
-    It holds a refused `update` the way `refused_semantic_hash` holds a refused
-    extract; None disables that hold (direct callers keep the old contract).
+    `refusal_key` holds a refused `update` the way `refused_semantic_hash` holds
+    a refused extract; None disables that hold (direct callers keep the old
+    contract). It must be built from the digest the refusal fields in
+    `prior_state` were recorded under: `refusal_key(current_manifest, ...)`
+    normally, `refusal_key(legacy_manifest, ...)` while migrating.
 
     `allow_shrink` is the run-level --allow-shrink. It releases both holds: the
     guard would accept the held attempt this run, and holding it instead left
     the flag with nothing to act on for exactly the repos it was passed for.
 
-    `producer_changed` means the program that builds this repo was upgraded
-    since its accepted graph. An unchanged source is then updated, not
-    skipped, under the same refusal hold. `graphify update` re-extracts every
-    code file and re-runs every resolver, so no manifest has to be cleared.
+    `producer_changed` is the pipeline's `_producer_upgraded`: a known version
+    change of the program that builds this repo, or accepted state with no
+    graphify version recorded. It only makes an unchanged source update instead
+    of skip, under the same refusal hold. It does not pick `--force`; the
+    pipeline passes that to `apply_action` as `force_rebuild`.
+
+    `legacy_manifest` is the repo's digest under the classification table that
+    `prior_state` was written with, passed when `needs_classification_migration`.
+    Its semantic hash matching the stored one means no document changed, only
+    file categories moved (e.g. YAML to code), so the repo is updated, never
+    extracted. A mismatch is a real document edit and takes the normal path.
+    Refusal fields were recorded under the same old table, so the extract hold
+    compares `refused_semantic_hash` against the legacy digest while migrating.
+
+    `recipe_changed` is `digest_recipe_changed`: the hashes were taken with
+    another graphify's ignore rules, whose digest cannot be recomputed. Any
+    difference is adopted with an update, never an extract, so a document
+    edited in that same run is extracted only on its next change.
+
+    `active_version` is the table `current_manifest` was taken under
+    (Settings.classification_version). A switch in either direction migrates.
     """
     if not has_graph:
         return ACTION_BOOTSTRAP
@@ -168,6 +289,22 @@ def decide_action(
         # exists on disk (e.g. pre-existing curated graph). Seed state with a
         # cheap AST refresh rather than forcing an LLM extract every run.
         return ACTION_UPDATE
+    migrating = legacy_manifest is not None and needs_classification_migration(
+        prior_state, active_version
+    )
+    hold_digest = legacy_manifest if migrating and legacy_manifest is not None else current_manifest
+    if (
+        migrating
+        and hold_digest.semantic_hash == prior_state.get("semantic_hash")
+        and not stored_hashes_match(prior_state, current_manifest)
+    ):
+        return _update_unless_held(
+            prior_state, current_manifest, shrink_grant, refusal_key, allow_shrink
+        )
+    if recipe_changed and not stored_hashes_match(prior_state, current_manifest):
+        return _update_unless_held(
+            prior_state, current_manifest, shrink_grant, refusal_key, allow_shrink
+        )
     if current_manifest.semantic_hash != prior_state.get("semantic_hash"):
         if ast_only:
             # An AST update is deterministic, so an identical source refused once
@@ -186,7 +323,7 @@ def decide_action(
         # way to honour it is to re-run the extract and let the guard accept the
         # result this time.
         if (
-            current_manifest.semantic_hash == prior_state.get("refused_semantic_hash")
+            hold_digest.semantic_hash == prior_state.get("refused_semantic_hash")
             and int(prior_state.get("refusal_streak") or 0) >= REFUSAL_RETRY_LIMIT
             and shrink_grant != current_manifest.attempt_id
             and not allow_shrink
@@ -198,6 +335,18 @@ def decide_action(
             prior_state, current_manifest, shrink_grant, refusal_key, allow_shrink
         )
     return ACTION_SKIP
+
+
+def refusal_held(prior_state: dict, key: str | None) -> bool:
+    """True when this exact update was refused often enough that it is held.
+
+    Shared with the pipeline so --allow-shrink forces exactly what it releases.
+    """
+    return (
+        key is not None
+        and prior_state.get("refused_key") == key
+        and int(prior_state.get("refusal_streak") or 0) >= REFUSAL_RETRY_LIMIT
+    )
 
 
 def _update_unless_held(
@@ -214,9 +363,7 @@ def _update_unless_held(
     guard can accept it.
     """
     if (
-        key is not None
-        and prior_state.get("refused_key") == key
-        and int(prior_state.get("refusal_streak") or 0) >= REFUSAL_RETRY_LIMIT
+        refusal_held(prior_state, key)
         and shrink_grant != current_manifest.attempt_id
         and not allow_shrink
     ):
@@ -246,8 +393,8 @@ def _classify_shrink(
 ) -> str:
     """C21 shrink-guard defense: never trust CLI exit code alone.
 
-    Mirrors the real CLI's own shrink-guard semantics (export.py:270-286,
-    "new graph has N nodes but existing graph.json has M") — compare
+    Mirrors the real CLI's own shrink-guard semantics (graphify/export.py
+    `to_json`, "new graph has N nodes but existing graph.json has M") — compare
     structural node/edge counts, not raw file byte size (byte size is
     sensitive to incidental re-serialization/formatting differences and is
     not a reliable growth signal on its own).
@@ -288,11 +435,17 @@ _PHP_INVOKERS: dict[str, Callable[..., graphify_cli.CliResult]] = {
     ACTION_UPDATE: graphify_cli.run_php_update,
 }
 
-# graphify-php-build exit codes that mean "an expected resolver failed". The
-# wrapper has already restored graph.json; the note says so in the reason.
+# graphify-php-build exit codes that fail a PHP update; the wrapper has already
+# restored graph.json. 2 and 3: an expected resolver failed. 4: its own shrink
+# guard refused although GRAPHIFY_MESH_MANAGED=1 disables it, so the env did not
+# reach the child. That stays failed, never held: a hold would hide the fault.
 _PHP_EXIT_NOTES = {
     2: "graphify-php-build: an expected resolver failed, graph.json left as before",
     3: "graphify-php-build: an expected resolver failed, graph.json left as before",
+    4: (
+        "graphify-php-build: its own shrink guard refused although GRAPHIFY_MESH_MANAGED=1 "
+        "should disable it; wiring fault (env not reaching the child), graph.json left as before"
+    ),
 }
 
 # graphify-shrink-check exit codes. Anything else, and any report that does not
@@ -300,6 +453,11 @@ _PHP_EXIT_NOTES = {
 _SHRINK_CHECK_VERDICTS = {0: "accept", 1: "refuse"}
 SHRINK_CHECK_TIMEOUT_SECONDS = 300
 SHRINK_CHECK_TOP_FILES = 5
+
+# All four refusals of graphify's shrink guard (watch.py `_check_shrink`, 0.9.103)
+# carry this; two lack "Pass --force". The unreadable-graph refusal uses ";" and
+# --force does not bypass it. `update` exits 1; graphify-php-build passes it on.
+GRAPHIFY_SHRINK_REFUSAL_MARKER = "Refusing to overwrite —"
 
 # How much of a failing child's stderr reaches the log line, and where the rest
 # goes. The log line used to carry `stderr[:300]`, which is the wrong end of the
@@ -357,7 +515,27 @@ def apply_action(
     shrink_policy: str = SHRINK_POLICY_COUNT,
     shrink_check_bin: str = "graphify-shrink-check",
     producer_changed: bool = False,
+    force_rebuild: bool = False,
+    retried_documents: frozenset[str] = frozenset(),
 ) -> ProjectOutcome:
+    """Run `action` for one repo and judge the result with the shrink guard.
+
+    `retried_documents` is UNSTAMPED_DOCUMENTS_KEY from prior state: documents
+    that already had their one retry, so an extract leaving them unstamped is
+    accepted with a warning instead of held again.
+
+    `producer_changed` (the pipeline's `_producer_changed`, label switch
+    included) only tells graphify-shrink-check `--producer-changed`.
+    `force_rebuild` (a producer upgrade, or a --allow-shrink release of this
+    repo's held refusal) and a `shrink_grant` naming this attempt are the only
+    causes of `update --force`.
+
+    That decision matters only for builder graphify. graphify-php-build appends
+    `--force` to every `update` itself, because an incremental update cannot
+    re-resolve PHP calls from unchanged files. A graphify-php update is always a
+    full rebuild with graphify's own shrink guard waived; this function's guard
+    and graphify-shrink-check still judge it.
+    """
     graph_path = collection_path / "graph.json"
     manifest_path = collection_path / "manifest.json"
     dirty = is_worktree_dirty(root)
@@ -384,6 +562,15 @@ def apply_action(
         _cleanup_snapshot(snapshot_path)
         _cleanup_snapshot(manifest_snapshot)
 
+    # A grant for exactly this attempt is spent by any accepted outcome, not only
+    # by an accepted shrink: under `--force` graphify's guard never refuses, so
+    # the mesh guard may accept without a shrink and leave the token reusable.
+    grant_matches = shrink_grant is not None and shrink_grant == current_manifest.attempt_id
+    spent_grant = shrink_grant if grant_matches else None
+    # Incremental `update` keeps unchanged files' old extraction, so a new producer
+    # needs graphify's full rebuild. An operator release needs it too: only
+    # `--force` gets past graphify's own shrink guard. The guard below still judges.
+    update_kwargs = {"force": force_rebuild or grant_matches} if action == ACTION_UPDATE else {}
     php_invoker = _PHP_INVOKERS.get(action) if builder == BUILDER_GRAPHIFY_PHP else None
     try:
         if php_invoker is not None:
@@ -394,10 +581,16 @@ def apply_action(
                 staging_home,
                 policy=sandbox_policy,
                 php_build_bin=php_build_bin,
+                **update_kwargs,
             )
         else:
             result = _INVOKERS[action](
-                graphify_bin, root, collection_path, staging_home, policy=sandbox_policy
+                graphify_bin,
+                root,
+                collection_path,
+                staging_home,
+                policy=sandbox_policy,
+                **update_kwargs,
             )
     except BaseException:
         # The invoker raises on a sandbox that is configured but unavailable and
@@ -412,6 +605,26 @@ def apply_action(
         status = STATUS_BOOTSTRAP_FAILED if action == ACTION_BOOTSTRAP else STATUS_FAILED
         cleanup()
         reason = _failure_reason(result.returncode, result.stderr, collection_path)
+        if (
+            action == ACTION_UPDATE
+            and result.returncode == 1
+            and GRAPHIFY_SHRINK_REFUSAL_MARKER in result.stderr
+        ):
+            # graphify's own guard refused. Held and released like the guard
+            # below, since the release re-runs this update with `--force`.
+            return ProjectOutcome(
+                repo_id,
+                action,
+                STATUS_SHRINK_REFUSED,
+                reason=(
+                    f"graphify refused to shrink the graph ({reason}); last-good graph.json "
+                    f"restored. If this shrink is intended, authorize this one attempt with "
+                    f'"allow_shrink_once": "{current_manifest.attempt_id}" '
+                    f"on this repo's registry entry"
+                ),
+                dirty_worktree=dirty,
+                refused_manifest=current_manifest,
+            )
         note = _PHP_EXIT_NOTES.get(result.returncode) if php_invoker is not None else None
         return ProjectOutcome(
             repo_id,
@@ -468,6 +681,7 @@ def apply_action(
             dirty_worktree=dirty,
             new_manifest=current_manifest,
             graph_content_hash=new_hash,
+            consumed_shrink_grant=spent_grant,
         )
 
     report: dict | None = None
@@ -506,10 +720,11 @@ def apply_action(
             dirty_worktree=dirty,
             new_manifest=current_manifest,
             graph_content_hash=new_hash,
+            consumed_shrink_grant=spent_grant,
             explained_shrink=_accepted_drop(old_counts, new_counts),
         )
 
-    if outcome_status == STATUS_SHRINK_REFUSED and shrink_grant == current_manifest.attempt_id:
+    if outcome_status == STATUS_SHRINK_REFUSED and grant_matches:
         # Per-repo, single-use authorization: the registry entry carries the
         # attempt id (code + semantic digests) of the attempt the operator
         # inspected and approved. Matching it exactly is the whole guarantee — a
@@ -563,7 +778,50 @@ def apply_action(
             refused_manifest=current_manifest,
         )
 
+    checked = action == ACTION_EXTRACT and spent_grant is None
+    unstamped = (
+        _unstamped_documents(
+            manifest_snapshot,
+            manifest_path,
+            root,
+            current_manifest.semantic_paths,
+            retried_documents,
+        )
+        if checked
+        else ([], [])
+    )
     cleanup()
+    newly_unstamped, still_unstamped = unstamped
+    if newly_unstamped:
+        # graphify exits 0 on a truncated or hollow LLM answer but leaves the
+        # document's semantic_hash "" (or writes no row for a new document) so
+        # its own next extract re-dispatches it. Keep the new graph and hold
+        # accepted state so the next run retries. The retry is bounded: the
+        # caller records these paths, so a second miss is accepted below.
+        reason = (
+            f"extract left {len(newly_unstamped)} new or edited document(s) unstamped "
+            f"(truncated or empty LLM result): {_path_list(newly_unstamped)}; "
+            f"graph kept, state held so the next run retries once"
+        )
+        log.warning("%s: %s", repo_id, reason)
+        return ProjectOutcome(
+            repo_id,
+            action,
+            outcome_status,
+            reason=reason,
+            dirty_worktree=dirty,
+            graph_content_hash=new_hash,
+            explained_shrink=_explained_shrink(report, old_counts, new_counts),
+            unstamped_documents=tuple(sorted({*newly_unstamped, *still_unstamped})),
+        )
+    retry_note = ""
+    if still_unstamped:
+        retry_note = (
+            f"{len(still_unstamped)} document(s) still unstamped after retry, accepted: "
+            f"{_path_list(still_unstamped)}; graphify re-dispatches any it reads "
+            f"on the next extract"
+        )
+        log.warning("%s: %s", repo_id, retry_note)
     # State advances to current_manifest for BOTH remaining statuses here
     # (STATUS_UPDATED and STATUS_NOOP): a NOOP means the source changed but
     # the CLI produced byte-identical output — the source digest must still
@@ -574,10 +832,13 @@ def apply_action(
         repo_id,
         action,
         outcome_status,
+        reason=retry_note,
         dirty_worktree=dirty,
         new_manifest=current_manifest,
         graph_content_hash=new_hash,
+        consumed_shrink_grant=spent_grant,
         explained_shrink=_explained_shrink(report, old_counts, new_counts),
+        unstamped_documents=tuple(still_unstamped) if checked else None,
     )
 
 
@@ -791,3 +1052,95 @@ def _restore_snapshot(snapshot_path: Path | None, graph_path: Path) -> None:
 def _cleanup_snapshot(snapshot_path: Path | None) -> None:
     if snapshot_path is not None and snapshot_path.exists():
         snapshot_path.unlink()
+
+
+_UNSTAMPED_LIST_MAX = 5
+
+
+def _path_list(paths: list[str]) -> str:
+    shown = ", ".join(paths[:_UNSTAMPED_LIST_MAX])
+    extra = len(paths) - _UNSTAMPED_LIST_MAX
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
+
+
+def _manifest_rows(path: Path | None) -> dict[str, dict] | None:
+    """graphify's manifest.json as {path: row}; None when absent or unreadable."""
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, dict)}
+
+
+def _unstamped_documents(
+    before_path: Path | None,
+    after_path: Path,
+    root: Path,
+    documents: tuple[str, ...] = (),
+    retried: frozenset[str] = frozenset(),
+) -> tuple[list[str], list[str]]:
+    """Documents an extract left unstamped in graphify's manifest.
+
+    Unstamped is a row with `semantic_hash` "" or, for a document in this
+    run's digest (`documents`), no row at all: graphify writes none for a new
+    document whose LLM result was partial. Returns (newly, still): `still`
+    already had its retry (in `retried`, or "" before this run) and is
+    accepted; `newly` holds state once. A document graphify never reads also
+    has no row; `retried` bounds it to one retry until it is stamped. Only the
+    mesh's semantic suffixes count, so code rows never qualify. Unreadable
+    manifests give ([], []): accept as before.
+    """
+    before = _manifest_rows(before_path)
+    after = _manifest_rows(after_path)
+    if before is None or after is None:
+        return [], []
+    before = _relative_rows(before, root)
+    after = _relative_rows(after, root)
+    suffixes = CURRENT_CLASSIFICATION.semantic_extensions
+    in_digest = {doc for doc in documents if Path(doc).suffix.lower() in suffixes}
+    candidates = {doc for doc in in_digest if doc not in after}
+    for key, row in after.items():
+        if Path(key).suffix.lower() not in suffixes or row.get("semantic_hash") != "":
+            continue
+        # A "" row with no earlier row and outside the digest is not a
+        # document this run asked graphify to read.
+        if key in before or key in in_digest:
+            candidates.add(key)
+    newly: list[str] = []
+    still: list[str] = []
+    for key in sorted(candidates):
+        prior = before.get(key)
+        if key in retried or (prior is not None and not prior.get("semantic_hash")):
+            still.append(key)
+        else:
+            newly.append(key)
+    return newly, still
+
+
+def _relative_rows(rows: dict[str, dict], root: Path) -> dict[str, dict]:
+    """`rows` keyed root-relative POSIX, the way graphify stores in-root files.
+
+    graphify writes absolute keys for out-of-root files and in legacy
+    manifests; an absolute key under `root` is relativized to match the digest.
+    """
+    anchors = {root}
+    try:
+        anchors.add(root.resolve())
+    except (OSError, RuntimeError):
+        pass
+    out: dict[str, dict] = {}
+    for key, row in rows.items():
+        path = Path(key)
+        if path.is_absolute():
+            for anchor in anchors:
+                try:
+                    key = path.relative_to(anchor).as_posix()
+                    break
+                except ValueError:
+                    continue
+        out[key] = row
+    return out

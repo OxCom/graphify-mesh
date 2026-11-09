@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 
+from graphify_mesh.sync.config_keys import config_key_paths
 from graphify_mesh.sync.embed_similarity import (
     CANDIDATE_FLOOR,
     CODE_EXTENSIONS,
@@ -93,15 +94,19 @@ def _fallback_exact_match_pairs(
     satisfied since candidacy here is symmetric and unranked."""
     buckets: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
     for repo_id, graph_data in graphs_by_repo.items():
+        # Config-key nodes are addressed by their dotted path, so the refs
+        # emitted below match the durable keys every other stage uses.
+        paths = config_key_paths(graph_data)
         for node in graph_data.get("nodes", []):
             if not isinstance(node, dict):
                 continue
-            label = node.get("label")
+            qualified = paths.get(node.get("id"))
+            label = qualified or node.get("label")
             community_name = node.get("community_name")
             source_file = node.get("source_file")
             if not label or not community_name or not source_file:
                 continue
-            key = node_key(repo_id, node)
+            key = node_key(repo_id, node, qualified)
             if key is not None and key in excluded_keys:
                 continue
             bucket_key = (_normalize_label(label), community_name)

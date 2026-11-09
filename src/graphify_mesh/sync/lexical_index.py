@@ -8,21 +8,19 @@ Runs as a new pipeline stage AFTER overlay-resolve and BEFORE validate/publish
 pipeline.py's `RunReport.skipped_stages`.
 
 Why this exists instead of reusing graphify's own query-time tokenizer
-(serve.py): verified against the installed graphify 0.9.56 package
-(`graphify/serve.py:86` and `:180`) — its tokenizer is a single
-`re.findall(r"\\w+", text.lower())`. That is Unicode-word-character-only: it
-never splits `Namespace\\Class::method` into (`Namespace`, `Class`, `method`),
-never splits camelCase/PascalCase/snake_case identifiers into subtokens, and
-treats a leading-backslash FQCN (`\\App\\Service\\Foo`) and its
-non-backslash-leading form (`App\\Service\\Foo`) as different token streams
-(the leading `\\` is simply dropped as non-word, but so is every other `\\`,
-so `\\Foo\\Bar` and `Foo\\Bar` both tokenize to `["foo","bar"]` today — the
-insufficiency the plan calls out is that this happens to work by accident for
-the *backslash* case but not for the camelCase/snake_case/`Class::method`
-pairing case, which `\\w+` cannot address at all since `:` is non-word and
-`getUserName`/`get_user_name` are each a single `\\w+` match with no subtoken
-split). This module fixes the subtoken gap and makes the alias/exact-id path
-an explicit O(1) table instead of substring scanning.
+(serve.py): verified against the installed graphify 0.9.103 package
+(`graphify.serve._search_tokens`) — its tokenizer is a single
+`re.findall(r"[^\\W_]+", _strip_diacritics(text).lower())`. That is
+alphanumeric-only and splits on `_` as well as on every other non-word
+character (so `Namespace\\Class::method` and `get_user_name` do split), but it
+lowercases BEFORE splitting and never splits camelCase/PascalCase identifiers
+into subtokens: `getUserName` is a single token. It also keeps no whole-segment
+token alongside the parts, and `\\Foo\\Bar` and `Foo\\Bar` both tokenize to
+`["foo","bar"]` — which works for the *backslash* case but not for the
+camelCase/`Class::method` pairing case the plan calls out. This module fixes
+the camelCase subtoken gap, keeps each whole segment as a token too, and
+makes the alias/exact-id path an explicit O(1) table instead of substring
+scanning.
 
 Normalization reuse (per plan instruction: "don't reinvent label
 normalization from scratch if it already exists"): the base
@@ -33,12 +31,21 @@ rewriting Unicode normalization here.
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from graphify_mesh.sync.config_keys import (
+    PATH_SEPARATOR,
+    config_key_paths,
+    is_file_node_label,
+)
 from graphify_mesh.sync.embedding import build_snippet, node_key, node_line
+
+log = logging.getLogger("graphify_mesh.sync.lexical_index")
 
 try:
     from graphify.export import _strip_diacritics as _graphify_strip_diacritics
@@ -70,11 +77,35 @@ TOKENIZER_VERSION = "gm-lex-v1"
 # distinct doc ids per term). Peak-RSS motivation: at ~38K nodes the v2
 # string-triple postings still peaked 3.6G against the 4G cgroup cap;
 # small-int packing removes per-entry string duplication entirely.
-LEXICAL_SCHEMA_VERSION = 3
+# v4 keeps the v3 container and changes what a document key names: a YAML/JSON
+# key node is keyed by its dotted path (`config_keys.config_key_paths`), and the
+# file-basename alias is emitted for the file node only. The server derives
+# node keys the same way for v4 and with bare labels for v2/v3
+# (`uses_qualified_config_keys`), so an older published generation stays
+# self-consistent after a deploy.
+LEXICAL_SCHEMA_VERSION = 4
 # Read-path compatibility set: the server keeps serving a published v2
 # generation after this package is deployed (publish can lag, e.g. behind
 # shrink-guard). Writer always emits LEXICAL_SCHEMA_VERSION.
-SUPPORTED_LEXICAL_SCHEMA_VERSIONS = frozenset({2, 3})
+SUPPORTED_LEXICAL_SCHEMA_VERSIONS = frozenset({2, 3, 4})
+# First schema whose document keys carry config-key dotted paths.
+QUALIFIED_CONFIG_KEYS_SCHEMA = 4
+
+
+def uses_qualified_config_keys(manifest: object, lexical: object) -> bool:
+    """Whether a published generation's keys qualify config-key nodes with their
+    dotted path. The manifest's `lexical_index_schema_version` decides, then the
+    index's own `schema_version`; with neither, keys are bare, as the server's
+    lexical reader also treats an unversioned index as v2."""
+    for container, field_name in (
+        (manifest, "lexical_index_schema_version"),
+        (lexical, "schema_version"),
+    ):
+        version = container.get(field_name) if isinstance(container, dict) else None
+        if isinstance(version, int) and not isinstance(version, bool):
+            return version >= QUALIFIED_CONFIG_KEYS_SCHEMA
+    return False
+
 
 # v3 field packing: field order is part of the on-disk contract (published
 # as `fields`); index into it is stored in the low FIELD_PACK_BITS of each
@@ -138,7 +169,7 @@ def _camel_split(segment: str) -> list[str]:
 
 def tokenize_text(text: str | None) -> list[str]:
     """PHP/JS-aware tokenizer (verified insufficiency of graphify's plain
-    `\\w+` regex above). Produces, for each raw non-alnum-delimited segment:
+    `[^\\W_]+` regex above). Produces, for each raw non-alnum-delimited segment:
     the segment itself (lowercased) AND its camelCase/snake_case subtokens.
     Namespace segments (`App`, `Service`, `Foo` from `App\\Service\\Foo`) and
     `Class::method` pairs (`Class`, `method` from `Class::method`) fall out
@@ -168,11 +199,14 @@ def tokenize_text(text: str | None) -> list[str]:
     return sorted(set(tokens))
 
 
-def extract_alias_forms(label: str, source_file: str | None) -> set[str]:
+def extract_alias_forms(
+    label: str, source_file: str | None, include_basename: bool = True
+) -> set[str]:
     """Exact-alias forms for O(1) lookup: the label as-is (normalized), the
     label with a leading namespace-separator stripped (leading-backslash
     variant per plan bullet), the bare method name of a `Class::method` pair,
-    the bare class name of the same pair, and the file basename."""
+    the bare class name of the same pair, and — when `include_basename` — the
+    file basename."""
     aliases: set[str] = set()
     if label:
         norm = _norm_lower(label)
@@ -186,10 +220,42 @@ def extract_alias_forms(label: str, source_file: str | None) -> set[str]:
                 aliases.add(_norm_lower(method))
         if "\\" in label:
             aliases.add(_norm_lower(label.split("\\")[-1]))
-    if source_file:
+    if source_file and include_basename:
         aliases.add(_norm_lower(Path(source_file).name))
     aliases.discard("")
     return aliases
+
+
+MANIFEST_FILENAME = "manifest.json"
+ORIGIN_SEMANTIC = "semantic"
+
+
+def stale_semantic_files(manifest_path: Path | None) -> set[str]:
+    """Source files whose LLM-written (`_origin: semantic`) nodes graphify no
+    longer refreshes. graphify's `save_manifest` (kind="ast", i.e. `update`)
+    stamps the new `ast_hash` and keeps `semantic_hash` only while the content
+    hash equals the previous `ast_hash`; a content change therefore leaves
+    `semantic_hash == ""` next to a non-empty `ast_hash`. Unchanged rows keep
+    their hashes (seeding branch), and files never seen before carry no
+    semantic nodes, so neither is flagged. `extract` never sends YAML to the LLM,
+    so that state does not heal on its own.
+
+    Rows without an `ast_hash` (semantic-only files such as Go-template Helm
+    charts) and legacy non-dict rows are not flagged. A missing or unreadable
+    manifest yields the empty set: staleness is a ranking hint, never an error."""
+    if manifest_path is None:
+        return set()
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(raw, dict):
+        return set()
+    return {
+        path
+        for path, row in raw.items()
+        if isinstance(row, dict) and row.get("ast_hash") and row.get("semantic_hash") == ""
+    }
 
 
 @dataclass
@@ -197,9 +263,25 @@ class LexicalIndexStats:
     documents: int = 0
     terms: int = 0
     aliases: int = 0
+    # Durable keys shared by more than one node (the server keeps one node per
+    # key, so the others cannot be addressed) and the nodes in those groups.
+    # `config_*` counts only groups holding a qualified YAML/JSON key node.
+    key_collisions: int = 0
+    key_collision_nodes: int = 0
+    config_key_collisions: int = 0
+    # Documents flagged `stale_semantic` (see `stale_semantic_files`).
+    stale_semantic_documents: int = 0
 
     def to_dict(self) -> dict:
-        return {"documents": self.documents, "terms": self.terms, "aliases": self.aliases}
+        return {
+            "stale_semantic_documents": self.stale_semantic_documents,
+            "documents": self.documents,
+            "terms": self.terms,
+            "aliases": self.aliases,
+            "key_collisions": self.key_collisions,
+            "key_collision_nodes": self.key_collision_nodes,
+            "config_key_collisions": self.config_key_collisions,
+        }
 
 
 @dataclass
@@ -211,8 +293,14 @@ class LexicalIndexResult:
 def build_lexical_index(
     graphs_by_repo: dict[str, dict],
     repo_roots_by_id: dict[str, Path],
+    graph_paths_by_repo: dict[str, Path] | None = None,
 ) -> LexicalIndexResult:
     """Builds the full lexical-index bundle artifact for one generation.
+
+    `graph_paths_by_repo` locates each repo's `graph.json`; graphify's
+    `manifest.json` sits next to it and marks semantic nodes whose file changed
+    since the LLM pass. Those documents are listed under `stale_semantic`
+    (doc ids), an additive top-level key, so the schema version stays 4.
 
     Deterministic by construction: repos are iterated in sorted order, node
     order within a repo follows the graph file (stable input), doc ids are
@@ -228,27 +316,62 @@ def build_lexical_index(
     node_id_index: dict[str, str] = {}
     documents: list[list[str]] = []
 
+    nodes_per_key: dict[str, int] = {}
+    config_keys_seen: set[str] = set()
+    stale_doc_ids: list[int] = []
+
     for repo_id in sorted(graphs_by_repo.keys()):
         graph_data = graphs_by_repo[repo_id]
         source_root = repo_roots_by_id.get(repo_id)
+        graph_path = (graph_paths_by_repo or {}).get(repo_id)
+        stale_files = stale_semantic_files(
+            graph_path.parent / MANIFEST_FILENAME if graph_path is not None else None
+        )
+        paths = config_key_paths(graph_data)
+        # Files that have a node naming the file itself: only that node gets
+        # the basename alias. A file without one (graphify emitted only its
+        # symbols) keeps the alias on every node, so it stays findable by name.
+        files_with_file_node = {
+            node.get("source_file")
+            for node in graph_data.get("nodes", [])
+            if isinstance(node, dict)
+            and is_file_node_label(node.get("label"), node.get("source_file"))
+        }
 
         for node in graph_data.get("nodes", []):
             if not isinstance(node, dict):
                 continue
-            key = node_key(repo_id, node)
+            qualified = paths.get(node.get("id"))
+            key = node_key(repo_id, node, qualified)
             if key is None:
                 continue
-            label = node.get("label") or ""
+            nodes_per_key[key] = nodes_per_key.get(key, 0) + 1
+            if qualified is not None:
+                config_keys_seen.add(key)
+            label = qualified or node.get("label") or ""
             source_file = node.get("source_file") or ""
             snippet = build_snippet(source_root, source_file, node_line(node))
 
             doc_id = len(documents)
             documents.append([repo_id, key])
             doc_base = doc_id << FIELD_PACK_BITS
+            if node.get("_origin") == ORIGIN_SEMANTIC and source_file in stale_files:
+                stale_doc_ids.append(doc_id)
 
+            # A config key's own name is its label; its ancestors are where it
+            # lives, like the file path. Indexing the whole dotted path at label
+            # boost gave every nested key of a JSON schema or package.json the
+            # label weight of words such as `integration` or `policy`, which
+            # reordered code-query results (measured 2026-11-06).
+            bare_label = node.get("label") or ""
+            ancestors = (
+                qualified[: -len(bare_label) - 1]
+                if qualified and qualified.endswith(PATH_SEPARATOR + bare_label)
+                else ""
+            )
             field_tokens = {
-                "label": set(tokenize_text(label)),
-                "path": set(tokenize_text(source_file)),
+                "label": set(tokenize_text(bare_label if qualified else label)),
+                "path": set(tokenize_text(source_file)) | set(tokenize_text(ancestors)),
                 "snippet": set(tokenize_text(snippet)) if snippet else set(),
             }
             for field_name, terms in field_tokens.items():
@@ -256,7 +379,10 @@ def build_lexical_index(
                 for term in terms:
                     postings.setdefault(term, set()).add(packed)
 
-            for alias in extract_alias_forms(label, source_file):
+            include_basename = source_file not in files_with_file_node or is_file_node_label(
+                node.get("label"), source_file
+            )
+            for alias in extract_alias_forms(label, source_file, include_basename):
                 alias_exact.setdefault(alias, set()).add(doc_id)
 
             raw_id = node.get("id")
@@ -284,10 +410,24 @@ def build_lexical_index(
         "alias_exact": sorted_aliases,
         "node_id_index": dict(sorted(node_id_index.items())),
         "document_count": len(documents),
+        "stale_semantic": stale_doc_ids,
     }
+    colliding = [key for key, count in nodes_per_key.items() if count > 1]
     stats = LexicalIndexStats(
         documents=len(documents),
         terms=len(sorted_postings),
         aliases=len(sorted_aliases),
+        key_collisions=len(colliding),
+        key_collision_nodes=sum(nodes_per_key[key] for key in colliding),
+        config_key_collisions=sum(1 for key in colliding if key in config_keys_seen),
+        stale_semantic_documents=len(stale_doc_ids),
+    )
+    # Measured, never fatal: code nodes can legitimately share
+    # (source_file, label), e.g. two overloads graphify labels alike.
+    log.info(
+        "lexical index: %d durable key(s) shared by %d node(s); %d of them config keys",
+        stats.key_collisions,
+        stats.key_collision_nodes,
+        stats.config_key_collisions,
     )
     return LexicalIndexResult(data=data, stats=stats)

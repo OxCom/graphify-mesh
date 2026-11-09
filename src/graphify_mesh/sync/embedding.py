@@ -81,6 +81,7 @@ from pathlib import Path
 import numpy as np
 
 from graphify_mesh.sync.config import Settings, is_valid_http_base_url
+from graphify_mesh.sync.config_keys import config_key_paths
 from graphify_mesh.sync.overlay_refs import LogicalRef
 from graphify_mesh.sync.publish import _fsync_dir
 from graphify_mesh.sync.source_cache import get_source_lines
@@ -174,7 +175,9 @@ SHARD_MATRIX_SUFFIX = ".npy"
 
 # Bumped whenever the meaning of the stamped fields changes in a way that must
 # invalidate every published shard even though the field values look identical.
-RECIPE_STAMP_VERSION = 1
+# 2: commit 21b2dfa changed build_embedding_input without a bump, so shards
+# stamped 1 hold vectors of the old input text.
+RECIPE_STAMP_VERSION = 2
 
 HealthCheckFn = Callable[[str, float], bool]
 
@@ -314,15 +317,41 @@ def key_to_ref(key: str) -> LogicalRef:
     return LogicalRef(repo=repo, source_file=source_file, qualified_label=label)
 
 
-def node_key(repo_id: str, node: dict) -> str | None:
+def node_key(repo_id: str, node: dict, qualified_label: str | None = None) -> str | None:
     """Durable logical key for a node, matching the `LogicalRef` shape WS4's
     overlay module already uses (C27) — never the raw per-repo graphify node
-    id, which is not stable across generations."""
+    id, which is not stable across generations.
+
+    `qualified_label` replaces the bare label when the caller derived one —
+    the dotted key path of a YAML/JSON key node (`config_keys.config_key_paths`),
+    without which sibling keys of one file share a key."""
     source_file = node.get("source_file")
     label = node.get("label")
     if not source_file or not label:
         return None
-    return LogicalRef(repo=repo_id, source_file=source_file, qualified_label=label).to_key()
+    return LogicalRef(
+        repo=repo_id, source_file=source_file, qualified_label=qualified_label or label
+    ).to_key()
+
+
+def graph_node_keys(repo_id: str | None, graph_data: dict) -> dict:
+    """Graph node id -> durable key for every keyable node of `graph_data`.
+
+    The single place sync stages and the server derive keys from a whole graph,
+    so both apply the same config-key qualification. `repo_id=None` takes each
+    node's own `repo` field (the merged graph); nodes without one are skipped."""
+    paths = config_key_paths(graph_data)
+    keys: dict = {}
+    for node in graph_data.get("nodes", []):
+        if not isinstance(node, dict) or "id" not in node:
+            continue
+        node_repo = repo_id if repo_id is not None else node.get("repo")
+        if not node_repo:
+            continue
+        key = node_key(node_repo, node, paths.get(node["id"]))
+        if key is not None:
+            keys[node["id"]] = key
+    return keys
 
 
 def _content_hash(text: str) -> str:
@@ -541,14 +570,16 @@ def embed_batch(
     return vectors
 
 
-def _embed_batch_with_retry(base_url: str, model: str, inputs: list[str]) -> list[list[float]]:
+def _embed_batch_with_retry(
+    base_url: str, model: str, inputs: list[str], timeout: float = EMBED_REQUEST_TIMEOUT
+) -> list[list[float]]:
     """`embed_batch` with EMBED_BATCH_RETRIES bounded retries (short fixed
     backoff) before letting the failure propagate. Looked up via the module
     global so tests monkeypatching `embedding.embed_batch` keep working."""
     attempts = EMBED_BATCH_RETRIES + 1
     for attempt in range(1, attempts + 1):
         try:
-            return embed_batch(base_url, model, inputs)
+            return embed_batch(base_url, model, inputs, timeout=timeout)
         except RuntimeError as exc:
             if attempt >= attempts:
                 raise
@@ -566,20 +597,66 @@ def _embed_batch_with_retry(base_url: str, model: str, inputs: list[str]) -> lis
 
 def _iter_embeddable_nodes(repo_id: str, graph_data: dict, source_root: Path | None):
     """Yields (key, label, source_file, snippet, is_trivial)
-    for every node in this repo's raw graph that has enough fields to build
-    a logical key at all. Nodes without a resolvable key (no source_file or
-    label — e.g. bare external/library nodes) are not embeddable and are
-    skipped entirely, same as they're unindexable for overlay logical refs."""
+    ONCE per durable key of this repo's raw graph. Nodes without a resolvable
+    key (no source_file or label — e.g. bare external/library nodes) are not
+    embeddable and are skipped entirely, same as they're unindexable for
+    overlay logical refs.
+
+    Several nodes can share a key (same file and label). Each yielded key used
+    to repeat per occurrence, so the caller stored one occurrence's hash next to
+    another occurrence's vector and re-embedded every duplicate on every run.
+    One representative per key is chosen instead — lowest line, then node id —
+    so the input text, the stored hash and the vector all come from one node.
+
+    `label` is the qualified label (a config key's dotted path) so the vector
+    carries the key's identity, not only its bare name; the trivial-accessor
+    test still looks at the bare label it was written for."""
+    paths = config_key_paths(graph_data)
+    chosen: dict[str, tuple[tuple[bool, int, str], dict, str | None]] = {}
     for node in graph_data.get("nodes", []):
         if not isinstance(node, dict):
             continue
-        key = node_key(repo_id, node)
+        qualified = paths.get(node.get("id"))
+        key = node_key(repo_id, node, qualified)
         if key is None:
             continue
+        line = node_line(node)
+        rank = (line is None, line or 0, str(node.get("id", "")))
+        current = chosen.get(key)
+        if current is None or rank < current[0]:
+            chosen[key] = (rank, node, qualified)
+    for key, (_rank, node, qualified) in chosen.items():
         label = node["label"]
         source_file = node["source_file"]
         snippet = build_snippet(source_root, source_file, node_line(node))
-        yield key, label, source_file, snippet, is_trivial_node(label, snippet)
+        yield key, qualified or label, source_file, snippet, is_trivial_node(label, snippet)
+
+
+def _shard_content_current(
+    repo_id: str, graph_data: dict, source_root: Path | None, previous_shard: RepoShard
+) -> bool:
+    """True when every entry of `previous_shard` still holds the content hash
+    compute_repo_shard would compute now, and every hashed entry has a vector.
+
+    An unchanged source digest does not prove this: a --skip-embedding run
+    records the new digest but carries the old vectors forward, so the next
+    run would see the repo as unchanged and keep those vectors forever.
+    Snippets come from the shared per-run line cache the lexical-index stage
+    reads as well, so this check opens no extra file."""
+    for key, label, source_file, snippet, trivial in _iter_embeddable_nodes(
+        repo_id, graph_data, source_root
+    ):
+        entry = previous_shard.entries.get(key)
+        if entry is None:
+            return False
+        if trivial:
+            if entry.get("content_hash") is not None:
+                return False
+            continue
+        digest = _content_hash(build_embedding_input(label, snippet, source_file))
+        if entry.get("content_hash") != digest or entry.get("row") is None:
+            return False
+    return True
 
 
 def compute_repo_shard(
@@ -591,6 +668,7 @@ def compute_repo_shard(
     model: str,
     stats: EmbeddingStats,
     recipe_stamp: str | None = None,
+    timeout: float = EMBED_REQUEST_TIMEOUT,
 ) -> RepoShard:
     """Builds this repo's shard for a repo that changed this run. Each
     `entries[key]` is `{"content_hash": ..., "row": int | None}` — `row`
@@ -657,7 +735,7 @@ def compute_repo_shard(
         batch_num = batch_start // EMBED_BATCH_SIZE + 1
         batch_keys = to_embed_keys[batch_start : batch_start + EMBED_BATCH_SIZE]
         batch_inputs = to_embed_inputs[batch_start : batch_start + EMBED_BATCH_SIZE]
-        vectors = _embed_batch_with_retry(base_url, model, batch_inputs)
+        vectors = _embed_batch_with_retry(base_url, model, batch_inputs, timeout)
         for key, vector in zip(batch_keys, vectors, strict=True):
             vector_sources[key] = vector
             stats.embedded += 1
@@ -970,6 +1048,22 @@ def stale_recipe_repo_ids(
     }
 
 
+def missing_shard_repo_ids(embeddings_current_dir: Path | None, repo_ids: set[str]) -> set[str]:
+    """The subset of `repo_ids` with no published shard file at all, v1 or later.
+
+    `stale_recipe_repo_ids` reports these too, since a missing stamp never
+    matches; this split only lets a log line tell "never embedded" from
+    "embedded with another recipe"."""
+    if embeddings_current_dir is None or not embeddings_current_dir.is_dir():
+        return set(repo_ids)
+    return {
+        repo_id
+        for repo_id in repo_ids
+        if not (embeddings_current_dir / _shard_meta_filename(repo_id)).is_file()
+        and not (embeddings_current_dir / _shard_filename(repo_id)).is_file()
+    }
+
+
 def read_previous_shard(embeddings_current_dir: Path | None, repo_id: str) -> RepoShard:
     if embeddings_current_dir is None or not embeddings_current_dir.is_dir():
         return RepoShard.empty()
@@ -996,11 +1090,40 @@ def read_previous_id_map(embeddings_current_dir: Path | None) -> dict[str, dict]
         return {}
 
 
+def _drop_stale_keys(repo_id: str, shard: RepoShard, current_keys: set[str]) -> RepoShard:
+    """`shard` without the entries whose key this run no longer derives, rows
+    renumbered to the sorted-key matrix the writer expects."""
+    stale = [key for key in shard.entries if key not in current_keys]
+    if not stale:
+        return shard
+    log.info(
+        "%s: carried-forward shard holds %d key(s) this run no longer derives — dropping them",
+        repo_id,
+        len(stale),
+    )
+    entries: dict[str, dict] = {}
+    vector_sources: dict[str, np.ndarray] = {}
+    for key, entry in shard.entries.items():
+        if key not in current_keys:
+            continue
+        entries[key] = {"content_hash": entry.get("content_hash"), "row": None}
+        vector = shard.vectors.get(key)
+        if vector is not None:
+            vector_sources[key] = vector
+    vectors = RepoVectors.from_mapping(vector_sources)
+    for row, key in enumerate(vectors.keys):
+        entries[key]["row"] = row
+    return RepoShard(
+        entries=entries, vectors=vectors, recipe_stamp=shard.recipe_stamp, recipe=shard.recipe
+    )
+
+
 def _carry_forward_shard(
     repo_id: str,
     previous_shard: RepoShard,
     current_recipe_stamp: str,
     dropped_repo_ids: list[str],
+    current_keys: set[str],
 ) -> RepoShard:
     """A previously published shard when this run's recipe produced it, an
     empty shard otherwise.
@@ -1014,9 +1137,14 @@ def _carry_forward_shard(
     the repo is named in the run's degraded marker. Losing one repo's vector
     channel for one generation is the cheaper failure; the next healthy run
     re-embeds it.
+
+    Entries whose key is not among `current_keys` (this run's durable keys for
+    the repo) are dropped as well. The first run after the config-key change
+    carries bare-keyed shards: their `enabled` vector belongs to a nested key,
+    and v4 would bind it to a top-level key of the same label.
     """
     if previous_shard.recipe_stamp == current_recipe_stamp:
-        return previous_shard
+        return _drop_stale_keys(repo_id, previous_shard, current_keys)
     if previous_shard.entries or previous_shard.vectors.matrix.size:
         dropped_repo_ids.append(repo_id)
         log.warning(
@@ -1028,6 +1156,46 @@ def _carry_forward_shard(
             current_recipe_stamp,
         )
     return RepoShard.empty()
+
+
+def carry_forward_stage(
+    graphs_by_repo: dict[str, dict], settings: Settings, status: str, reason: str
+) -> EmbeddingStageResult:
+    """The last published shards, restaged for this generation, with no embed call.
+
+    Used when the embed stage does not run (degraded backend, --skip-embedding).
+    Without it nothing is persisted, `embeddings/current` keeps the previous
+    generation id, and the server drops the whole vector channel on the id
+    mismatch. Nodes added since have no vector until a run embeds them. A shard
+    from a different recipe is dropped, not carried (see _carry_forward_shard).
+    """
+    previous_current_dir = (
+        settings.embeddings_current_symlink
+        if settings.embeddings_current_symlink.exists()
+        else None
+    )
+    current_recipe_stamp = recipe_stamp_for_model(settings.ollama_embed_model)
+    vectors_by_repo: dict[str, RepoVectors] = {}
+    shards_by_repo: dict[str, RepoShard] = {}
+    dropped_repo_ids: list[str] = []
+    for repo_id, repo_graph in graphs_by_repo.items():
+        prev_shard = _carry_forward_shard(
+            repo_id,
+            read_previous_shard(previous_current_dir, repo_id),
+            current_recipe_stamp,
+            dropped_repo_ids,
+            set(graph_node_keys(repo_id, repo_graph).values()),
+        )
+        shards_by_repo[repo_id] = prev_shard
+        vectors_by_repo[repo_id] = prev_shard.vectors
+    return EmbeddingStageResult(
+        status=status,
+        vectors_by_repo=vectors_by_repo,
+        shards_by_repo=shards_by_repo,
+        reason=reason,
+        id_map=read_previous_id_map(previous_current_dir),
+        vectors_dropped_repos=sorted(dropped_repo_ids),
+    )
 
 
 def run_embedding_stage(
@@ -1067,15 +1235,6 @@ def run_embedding_stage(
         if not healthy:
             degrade_reason = "embed health check failed"
 
-    previous_current_dir = (
-        settings.embeddings_current_symlink
-        if settings.embeddings_current_symlink.exists()
-        else None
-    )
-    previous_id_map = read_previous_id_map(previous_current_dir)
-
-    current_recipe_stamp = recipe_stamp_for_model(settings.ollama_embed_model)
-
     if degrade_reason:
         log.warning(
             "embed service unusable at %s (%s) — skipping embed-changed entirely (degraded mode); "
@@ -1084,37 +1243,23 @@ def run_embedding_stage(
             degrade_reason,
         )
         # Degraded: carry forward whatever was last published so a transient
-        # outage doesn't erase the whole index; nodes added since then simply
-        # have no vector until a healthy run recomputes them. A shard from a
-        # different recipe is the one thing not carried forward — see
-        # _carry_forward_shard.
-        carried_forward_vectors: dict[str, RepoVectors] = {}
-        shards_by_repo: dict[str, RepoShard] = {}
-        dropped_repo_ids: list[str] = []
-        for repo_id in graphs_by_repo:
-            prev_shard = _carry_forward_shard(
-                repo_id,
-                read_previous_shard(previous_current_dir, repo_id),
-                current_recipe_stamp,
-                dropped_repo_ids,
-            )
-            shards_by_repo[repo_id] = prev_shard
-            carried_forward_vectors[repo_id] = prev_shard.vectors
-        return EmbeddingStageResult(
-            status=EMBED_DEGRADED,
-            vectors_by_repo=carried_forward_vectors,
-            shards_by_repo=shards_by_repo,
-            reason=degrade_reason,
-            id_map=previous_id_map,
-            vectors_dropped_repos=sorted(dropped_repo_ids),
-        )
+        # outage doesn't erase the whole index.
+        return carry_forward_stage(graphs_by_repo, settings, EMBED_DEGRADED, degrade_reason)
 
+    previous_current_dir = (
+        settings.embeddings_current_symlink
+        if settings.embeddings_current_symlink.exists()
+        else None
+    )
+    previous_id_map = read_previous_id_map(previous_current_dir)
+
+    current_recipe_stamp = recipe_stamp_for_model(settings.ollama_embed_model)
     stats = EmbeddingStats()
     vectors_by_repo: dict[str, RepoVectors] = {}
     all_keys: set[str] = set()
     staged_shards: dict[str, RepoShard] = {}
     mid_run_failure: str | None = None
-    dropped_repo_ids = []
+    dropped_repo_ids: list[str] = []
 
     def _stage_shard(staged_repo_id: str, staged_shard: RepoShard) -> None:
         staged_shards[staged_repo_id] = staged_shard
@@ -1131,13 +1276,21 @@ def run_embedding_stage(
             repo_id in unchanged_repo_ids
             and previous_shard.entries
             and previous_shard.recipe_stamp == current_recipe_stamp
+            and set(previous_shard.entries) == set(graph_node_keys(repo_id, graph_data).values())
+            and _shard_content_current(repo_id, graph_data, source_root, previous_shard)
         ):
             # WS1's own changed-detection (decide_action -> ACTION_SKIP)
             # already told us this repo is untouched this run — reuse its
-            # whole previous shard rather than re-reading/re-hashing every
-            # node in it. Unchanged sources are not enough on their own: the
-            # shard must also come from this run's recipe, or a model switch
-            # would leave this repo on its old vector space silently.
+            # whole previous shard without an embed call. Every entry's
+            # content hash is still checked: a --skip-embedding run records
+            # the new digest but carries old vectors. Unchanged sources are
+            # not enough on their own: the shard must also come from this
+            # run's recipe, or a model switch
+            # would leave this repo on its old vector space silently. The key
+            # set must match too: when key derivation changes (config-key
+            # dotted paths), the old shard holds keys nothing looks up any more,
+            # so the repo goes through compute_repo_shard, which still reuses
+            # every vector whose key and input are unchanged.
             log.info("[%d/%d] %s: reusing previous shard (unchanged) ...", i, total_repos, repo_id)
             stats.reused_repos_unchanged += 1
             _stage_shard(repo_id, previous_shard)
@@ -1154,6 +1307,7 @@ def run_embedding_stage(
                 settings.ollama_embed_model,
                 stats,
                 current_recipe_stamp,
+                settings.embed_request_timeout,
             )
         except RuntimeError as exc:
             # A real embed_batch call failed AFTER the pre-flight health
@@ -1182,10 +1336,14 @@ def run_embedding_stage(
             _stage_shard(
                 repo_id,
                 _carry_forward_shard(
-                    repo_id, previous_shard, current_recipe_stamp, dropped_repo_ids
+                    repo_id,
+                    previous_shard,
+                    current_recipe_stamp,
+                    dropped_repo_ids,
+                    set(graph_node_keys(repo_id, graph_data).values()),
                 ),
             )
-            for fallback_repo_id, _ in repo_items[i:]:
+            for fallback_repo_id, fallback_graph in repo_items[i:]:
                 _stage_shard(
                     fallback_repo_id,
                     _carry_forward_shard(
@@ -1193,6 +1351,7 @@ def run_embedding_stage(
                         read_previous_shard(previous_current_dir, fallback_repo_id),
                         current_recipe_stamp,
                         dropped_repo_ids,
+                        set(graph_node_keys(fallback_repo_id, fallback_graph).values()),
                     ),
                 )
             break

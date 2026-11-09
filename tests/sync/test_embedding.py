@@ -10,6 +10,7 @@ import pytest
 
 from graphify_mesh.sync import embedding
 from graphify_mesh.sync.config import Settings
+from graphify_mesh.sync.source_cache import clear_source_cache
 from graphify_mesh.sync.vectors import RepoVectors
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
@@ -521,7 +522,16 @@ def test_run_embedding_stage_reuses_whole_shard_for_unchanged_repo(tmp_path, mon
                 "shard_format": embedding.SHARD_FORMAT_VERSION,
                 "dim": 1,
                 "recipe_stamp": embedding.recipe_stamp_for_model(settings.ollama_embed_model),
-                "entries": {"repo.a\x1fsrc/w.py\x1fWidget": {"content_hash": "abc", "row": 0}},
+                "entries": {
+                    "repo.a\x1fsrc/w.py\x1fWidget": {
+                        # The digest compute_repo_shard stores: src/w.py does
+                        # not exist, so the snippet is empty.
+                        "content_hash": embedding._content_hash(
+                            embedding.build_embedding_input("Widget", "", "src/w.py")
+                        ),
+                        "row": 0,
+                    }
+                },
             }
         ),
         encoding="utf-8",
@@ -550,6 +560,67 @@ def test_run_embedding_stage_reuses_whole_shard_for_unchanged_repo(tmp_path, mon
     assert result.status == embedding.EMBED_HEALTHY
     assert result.stats.reused_repos_unchanged == 1
     assert list(result.vectors_by_repo["repo.a"].get("repo.a\x1fsrc/w.py\x1fWidget")) == [9.0]
+
+
+def test_unchanged_repo_with_a_stale_content_hash_re_embeds_only_that_node(tmp_path, monkeypatch):
+    # The source digest says unchanged (a --skip-embedding run recorded it),
+    # but one body changed since its vector was embedded.
+    settings = _settings(tmp_path)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.py").write_text("def alpha():\n    return 1\n", encoding="utf-8")
+    (src / "b.py").write_text("def beta():\n    return 1\n", encoding="utf-8")
+    graph = {
+        "nodes": [
+            {"id": "n1", "label": "alpha", "source_file": "src/a.py"},
+            {"id": "n2", "label": "beta", "source_file": "src/b.py"},
+        ]
+    }
+    stamp = embedding.recipe_stamp_for_model(settings.ollama_embed_model)
+    monkeypatch.setattr(
+        embedding,
+        "embed_batch",
+        lambda base_url, model, inputs, timeout=30.0: [[1.0]] * len(inputs),
+    )
+    shard = embedding.compute_repo_shard(
+        "repo.a",
+        graph,
+        tmp_path,
+        embedding.RepoShard.empty(),
+        "http://x",
+        "m",
+        embedding.EmbeddingStats(),
+        stamp,
+    )
+    prev_gen_dir = settings.embeddings_dir / "generations" / "gen-0"
+    staged = embedding.stage_embeddings(tmp_path / "staging", {"repo.a": shard}, {})
+    prev_gen_dir.parent.mkdir(parents=True)
+    staged.rename(prev_gen_dir)
+    (settings.embeddings_dir / "current").symlink_to(prev_gen_dir, target_is_directory=True)
+    (src / "b.py").write_text("def beta():\n    return 22\n", encoding="utf-8")
+    clear_source_cache()
+    embedded: list[str] = []
+
+    def counting_embed(base_url, model, inputs, timeout=30.0):
+        embedded.extend(inputs)
+        return [[2.0]] * len(inputs)
+
+    monkeypatch.setattr(embedding, "embed_batch", counting_embed)
+    result = embedding.run_embedding_stage(
+        graph_paths_by_repo={},
+        repo_roots_by_id={"repo.a": tmp_path},
+        graphs_by_repo={"repo.a": graph},
+        unchanged_repo_ids={"repo.a"},
+        settings=settings,
+        provisional_generation_id="gen-1",
+        health_check=lambda base_url, timeout: True,
+    )
+
+    assert result.stats.reused_repos_unchanged == 0
+    assert result.stats.reused == 1
+    assert len(embedded) == 1
+    assert "return 22" in embedded[0]
+    assert list(result.vectors_by_repo["repo.a"].get("repo.a\x1fsrc/b.py\x1fbeta")) == [2.0]
 
 
 def test_run_embedding_stage_degraded_carries_forward_previous_vectors(tmp_path):
@@ -707,7 +778,9 @@ def test_run_embedding_stage_mid_run_failure_is_partial_not_crash(tmp_path, monk
     graphs_by_repo = {
         "repo.a": _graph_with_marker("Alpha"),
         "repo.b": _graph_with_marker("network-blip-marker-Bravo"),
-        "repo.c": _graph_with_marker("Gamma"),
+        # Carry-forward keeps only keys the current graph still derives, so
+        # repo.c's graph holds the node its previous shard was embedded for.
+        "repo.c": {"nodes": [dict(_graph_with_marker("Zeta")["nodes"][0], source_file="src/z.py")]},
     }
     result = embedding.run_embedding_stage(
         graph_paths_by_repo={},
@@ -1506,3 +1579,59 @@ def test_gc_embedding_generations_pins_whatever_current_points_at(tmp_path):
 
     assert removed == []
     assert (embeddings_dir / "generations" / "20260101T000000Z-aaa").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# duplicate durable keys
+# ---------------------------------------------------------------------------
+
+
+def _graph_with_duplicate_key() -> dict:
+    """Two nodes, one durable key (same file and label), different lines."""
+    return {
+        "nodes": [
+            {"id": "n2", "label": "Widget", "source_file": "w.py", "source_location": "L5"},
+            {"id": "n1", "label": "Widget", "source_file": "w.py", "source_location": "L1"},
+        ]
+    }
+
+
+def test_compute_repo_shard_embeds_a_duplicate_key_once_and_reuses_it(tmp_path, monkeypatch):
+    (tmp_path / "w.py").write_text(
+        "\n".join(f"line {i} of widget source" for i in range(1, 40)), encoding="utf-8"
+    )
+    seen: list[list[str]] = []
+
+    def fake_embed_batch(base_url, model, inputs, timeout=30.0):
+        seen.append(list(inputs))
+        return [[float(len(text)), 1.0] for text in inputs]
+
+    monkeypatch.setattr(embedding, "embed_batch", fake_embed_batch)
+    stamp = embedding.recipe_stamp_for_model("m")
+
+    def run(previous):
+        stats = embedding.EmbeddingStats()
+        shard = embedding.compute_repo_shard(
+            "repo.a",
+            _graph_with_duplicate_key(),
+            tmp_path,
+            previous_shard=previous,
+            base_url="https://host",
+            model="m",
+            stats=stats,
+            recipe_stamp=stamp,
+        )
+        return shard, stats
+
+    first, first_stats = run(embedding.RepoShard.empty())
+    assert first_stats.embedded == 1
+    assert len(seen) == 1 and len(seen[0]) == 1
+    key = next(iter(first.entries))
+    # The stored hash is the hash of the very text that produced the vector.
+    assert first.entries[key]["content_hash"] == embedding._content_hash(seen[0][0])
+
+    second, second_stats = run(first)
+    assert second_stats.embedded == 0
+    assert second_stats.reused == 1
+    assert len(seen) == 1
+    assert list(second.vectors.get(key)) == pytest.approx(list(first.vectors.get(key)))

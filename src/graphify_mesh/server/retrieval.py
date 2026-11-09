@@ -39,6 +39,7 @@ class Hit:
     score: float
     match_type: str  # "exact" | "anchor" | "fused"
     deprecated: bool
+    stale: bool = False
 
 
 @dataclass
@@ -240,6 +241,7 @@ def _hit_from_key(key: str, generation: Generation, score: float, match_type: st
         score=score,
         match_type=match_type,
         deprecated=ranking.DEPRECATED_PATH_MARKER in source_file,
+        stale=key in generation.stale_keys,
     )
 
 
@@ -253,7 +255,7 @@ def rank(
 ) -> RankedResult:
     """Top-level WS5 search orchestration: exact-alias bypass, symbol
     anchors (`anchors.py`), then lexical+vector+structural candidate
-    generation, RRF fusion, hub/DEPRECATED penalties, MMR diversification,
+    generation, RRF fusion, hub/DEPRECATED/stale-semantic penalties, MMR diversification,
     deterministic tie-break."""
     k = max(1, min(k, ranking.MAX_K))
     # Store-level degraded markers (reload rejections, embeddings stamp
@@ -325,7 +327,12 @@ def rank(
             if key in generation.node_id_by_key
         }
         penalized = [
-            (key, ranking.apply_penalties(key, score, degree_by_key, path_by_key))
+            (
+                key,
+                ranking.apply_penalties(
+                    key, score, degree_by_key, path_by_key, stale_keys=generation.stale_keys
+                ),
+            )
             for key, score in fused_scores.items()
         ]
         diversified_keys = ranking.mmr_select(

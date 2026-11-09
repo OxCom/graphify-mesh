@@ -83,8 +83,10 @@ CHILD_ENV_PASSTHROUGH = frozenset(
 # for a backend in use and never for a backend held in reserve.
 #
 # The extraction backend is pinned to Ollama by a literal at both call sites:
-# `--backend ollama` in `run_extract` below, and `backend="ollama"` in the
-# `run_label` call in sync/naming.py. No setting reaches either string, so nothing
+# `--backend ollama` in `run_extract` below, and the `"ollama"` backend that
+# sync/naming.py hands to the in-process labeler (graphify.llm's
+# `generate_community_labels`, called from sync/clustering.py). No setting
+# reaches either string, so nothing
 # an operator puts in the environment can select OpenAI, Anthropic, Gemini,
 # DeepSeek, Azure or Bedrock, and forwarding those credentials (the AWS_ prefix
 # covers the whole AWS credential chain) hands the child secrets for code it will
@@ -179,6 +181,10 @@ def _child_env_allows(name: str, extra: frozenset[str] = frozenset()) -> bool:
     # and is none of the child's business, whichever rule below would match it.
     if name.startswith("GRAPHIFY_MESH_"):
         return False
+    # graphify's `dispatch_command` reads it as `--force` in its `update` branch,
+    # which disables its shrink guard. Whether a run is forced is decided per repo by `run_update`.
+    if name == "GRAPHIFY_FORCE":
+        return False
     if name in extra:
         return True
     if name in CHILD_ENV_PASSTHROUGH or name.startswith("LC_"):
@@ -196,13 +202,13 @@ def _isolated_home_env(staging_home: Path) -> dict:
 
     The isolation is not only about leaving the operator's ~/.graphify alone.
     Upstream resolves custom LLM providers from `Path.home()/".graphify"/
-    "providers.json"` (graphify/llm.py:227) and its own comment there calls a
-    custom provider's `base_url` an exfiltration channel that receives the full
-    corpus plus the user's API key. A staging HOME means the child never sees
-    that file, so nothing on disk can redirect where a parsed repository goes.
-    Upstream also writes its query log and rebuild log under the real ~/.cache
-    (graphify/querylog.py:30 and graphify/hooks.py:289 in 0.9.56); those follow
-    HOME too.
+    "providers.json"` (graphify/llm.py `_custom_providers_path`) and its own
+    comment there calls a custom provider's `base_url` an exfiltration channel
+    that receives the full corpus plus the user's API key. A staging HOME means
+    the child never sees that file, so nothing on disk can redirect where a
+    parsed repository goes. Upstream also writes its query log and rebuild log
+    under the real ~/.cache (graphify/querylog.py and the module-level `_log` in
+    graphify/hooks.py, 0.9.103); those follow HOME too.
 
     What this does NOT do: the child still runs as the same UID, so it can open
     any absolute path the operator can, ~/.aws/credentials included.
@@ -704,10 +710,16 @@ def run_update(
     staging_home: Path,
     *,
     policy: SandboxPolicy | None = None,
+    force: bool = False,
 ) -> CliResult:
     """`graphify update <root>` — AST-only, code-only change (C18).
 
-    Runs under a private staging HOME like the merge/cluster/label calls: this
+    From graphify 0.9.102 `update` re-extracts only files whose content hash
+    changed, and that hash does not cover the extractor version. `force` adds
+    `--force`, graphify's full rebuild, which also skips graphify's own shrink
+    guard; `apply_action`'s guard still judges the result.
+
+    Runs under a private staging HOME like the merge call: this
     call parses untrusted repository source, so denying it the provider config
     described in `_isolated_home_env` matters more here than there.
 
@@ -717,7 +729,7 @@ def run_update(
     """
     staging_home.mkdir(parents=True, exist_ok=True)
     argv = _sandbox_argv(
-        _base_argv(graphify_bin) + ["update", str(root)],
+        _base_argv(graphify_bin) + ["update", str(root)] + (["--force"] if force else []),
         _project_write_paths(root, collection_path, staging_home),
         policy,
     )
@@ -738,8 +750,16 @@ def run_php_update(
     *,
     policy: SandboxPolicy | None = None,
     php_build_bin: str = "graphify-php-build",
+    force: bool = False,
 ) -> CliResult:
     """`graphify-php-build --graph <collection>/graph.json -- update <root>`.
+
+    `force` appends `--force` after `--`, where the wrapper passes it through to
+    graphify; see `run_update` for what it means there. The flag is explicit but
+    changes nothing: graphify-php-build appends `--force` to every `update`
+    itself, since an incremental update cannot re-resolve PHP calls from
+    unchanged files. Every PHP update is a full rebuild with graphify's shrink
+    guard waived; the mesh guard and graphify-shrink-check still judge it.
 
     For registry entries with `builder: graphify-php`. Plain `graphify update`
     never registers graphify-php's resolvers, so their call and route edges
@@ -781,7 +801,8 @@ def run_php_update(
     }
     argv = _sandbox_argv(
         resolve_bin_argv(php_build_bin)
-        + ["--graph", str(collection_path / "graph.json"), "--", "update", str(root)],
+        + ["--graph", str(collection_path / "graph.json"), "--", "update", str(root)]
+        + (["--force"] if force else []),
         _project_write_paths(root, collection_path, staging_home),
         policy,
     )
@@ -852,7 +873,8 @@ def run_extract(
     that could redirect that backend must not be visible to it. `collection_path`
     is the registry-declared output directory, for the reason in `run_update`.
     """
-    # No `--force`. It skips the semantic cache READ (graphify/cli.py:3932-3937),
+    # No `--force`. It skips the semantic cache READ (the `if force:` branch
+    # before `_check_semantic_cache` in graphify/cli.py, 0.9.103),
     # so every run re-dispatched every semantic file to the model although the
     # cache is keyed by content hash and prompt fingerprint and was being written
     # correctly all along. This pipeline already decides update/extract/noop from
@@ -891,51 +913,4 @@ def run_merge_graphs(
     )
     staging_home.mkdir(parents=True, exist_ok=True)
     argv = _sandbox_argv(argv, [out_path.parent, staging_home])
-    return _run(argv, cwd=None, env=_isolated_home_env(staging_home))
-
-
-def run_cluster_only(graphify_bin: str, target_dir: Path, staging_home: Path) -> CliResult:
-    """`graphify cluster-only <target_dir> --no-viz`.
-
-    No `--graph` override is passed: per the real CLI's output-location
-    rule, when the positional path's own `graphify-out/graph.json` is used
-    (no override), outputs land in `<target_dir>/graphify-out/` — exactly
-    where the naming stage staged the merged graph. HOME is redirected to a
-    private staging dir for the duration of this call only (C17), matching
-    `run_merge_graphs`.
-    """
-    argv = _base_argv(graphify_bin) + ["cluster-only", str(target_dir), "--no-viz"]
-    staging_home.mkdir(parents=True, exist_ok=True)
-    argv = _sandbox_argv(argv, [target_dir, staging_home])
-    return _run(argv, cwd=None, env=_isolated_home_env(staging_home))
-
-
-def run_label(
-    graphify_bin: str,
-    target_dir: Path,
-    staging_home: Path,
-    backend: str,
-    model: str,
-) -> CliResult:
-    """`graphify label <target_dir> --missing-only --backend <backend>
-    --model <model> --no-viz`.
-
-    `--missing-only` means only cids absent from `.graphify_labels.json`
-    (or equal to the literal placeholder `Community {cid}`) get sent to the
-    LLM backend — the naming stage relies on this to scope the LLM call to
-    exactly the communities it deleted from the labels file after the
-    sig-diff (C23/WS2 deliverable 2).
-    """
-    argv = _base_argv(graphify_bin) + [
-        "label",
-        str(target_dir),
-        "--missing-only",
-        "--backend",
-        backend,
-        "--model",
-        model,
-        "--no-viz",
-    ]
-    staging_home.mkdir(parents=True, exist_ok=True)
-    argv = _sandbox_argv(argv, [target_dir, staging_home])
     return _run(argv, cwd=None, env=_isolated_home_env(staging_home))

@@ -31,7 +31,7 @@ import yaml
 from graphify_mesh.sync.overlay_refs import (
     LogicalRef,
     OverlayEdge,
-    require_resolved,
+    canonical_ref,
 )
 
 log = logging.getLogger("graphify_mesh.sync.overlay_depends")
@@ -293,20 +293,22 @@ def build_manual_relation_edges(
 ) -> list[OverlayEdge]:
     """Every manual relation's source/target logical ref must resolve
     against the current generation's per-repo graphs — a dangling ref is a
-    hard error (raises DanglingReferenceError), not a warning, per plan WS4."""
+    hard error (raises DanglingReferenceError), not a warning, per plan WS4.
+    A bare config-key label shared by several nested keys raises its subclass
+    AmbiguousReferenceError."""
     edges: list[OverlayEdge] = []
     index_cache: dict[str, dict] = {}
     for relation in raw_relations:
-        source_ref = LogicalRef.from_dict(relation["source"])
-        target_ref = LogicalRef.from_dict(relation["target"])
-        require_resolved(
-            source_ref,
+        # Canonical refs: a bare config-key label is rewritten to its dotted
+        # path, the label the node's durable key carries on the server.
+        source_ref = canonical_ref(
+            LogicalRef.from_dict(relation["source"]),
             graphs_by_repo,
             context=f"manual relation source ({relation.get('type')})",
             index_cache=index_cache,
         )
-        require_resolved(
-            target_ref,
+        target_ref = canonical_ref(
+            LogicalRef.from_dict(relation["target"]),
             graphs_by_repo,
             context=f"manual relation target ({relation.get('type')})",
             index_cache=index_cache,
