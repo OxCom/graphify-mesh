@@ -332,6 +332,7 @@ class GraphifyIgnoreRules:
                 self._explicit.append((self._root, line))
         self._loaded: set[Path] = {self._root}
         self._linked: dict[Path, bool] = {}
+        self._linked_root = getattr(upstream, "_linked_worktree_main_root", None)
         self._cache: dict[Path, bool] = {}
         self._explicit_cache: dict[Path, bool] = {}
 
@@ -361,8 +362,11 @@ class GraphifyIgnoreRules:
             if upstream._is_noise_dir(part, parent):
                 return True
             parent = parent / part
+            # graphify < 0.9.97 has no linked-worktree prune (#4683); skipping keeps parity.
+            if self._linked_root is None:
+                continue
             if parent not in self._linked:
-                main_root = upstream._linked_worktree_main_root(parent)
+                main_root = self._linked_root(parent)
                 self._linked[parent] = main_root is not None and upstream._resolves_under_root(
                     main_root, self._root
                 )

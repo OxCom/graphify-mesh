@@ -26,12 +26,13 @@ HELPERS = (
     "_is_noise_dir",
     "_is_regular_file",
     "_is_scan_ignored",
-    "_linked_worktree_main_root",
     "_parse_gitignore_line",
     "_path_identity",
     "_resolves_under_root",
     "ignored_predicate",
 )
+# Added in graphify 0.9.97 (#4683); the mesh skips the worktree prune without it.
+OPTIONAL_HELPER = "_linked_worktree_main_root"
 
 FILES = {
     ".gitignore": "var/cache/\nCLAUDE.md\n*.log\n!keep.log\n",
@@ -67,6 +68,15 @@ def _git(root: Path, *args: str) -> None:
 def test_upstream_helpers_exist():
     missing = [name for name in HELPERS if not hasattr(detect, name)]
     assert not missing, f"graphify.detect no longer has {missing}"
+
+
+def test_worktree_helper_present_from_0_9_97():
+    from importlib.metadata import version
+
+    from packaging.version import Version
+
+    if Version(version("graphifyy")) >= Version("0.9.97"):
+        assert hasattr(detect, OPTIONAL_HELPER)
 
 
 @pytest.mark.parametrize("gitignore", [True, False])
