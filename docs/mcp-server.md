@@ -25,6 +25,12 @@ The advertised server name is **`graphify-mesh`**.
 | `--allow-public-bind` | `GRAPHIFY_MESH_ALLOW_PUBLIC_BIND` | off | Required to bind any non-loopback host, wildcards and concrete interface addresses alike. See `configuration.md` for what counts as loopback. |
 | — | `GRAPHIFY_MESH_HTTP_TOKEN` | none | Bearer token; required when `transport=http`, minimum 32 characters. |
 
+The server also reads the query-embedding variables
+(`GRAPHIFY_MESH_OLLAMA_EMBED_BASE_URL`, `GRAPHIFY_MESH_OLLAMA_EMBED_MODEL`,
+`GRAPHIFY_MESH_EMBED_NUM_CTX`, `GRAPHIFY_MESH_QUERY_EMBED_TIMEOUT`,
+`GRAPHIFY_MESH_QUERY_EMBED_COOLDOWN`);
+see [`configuration.md`](configuration.md).
+
 A flag beats its environment variable, which beats the default. stdio mode
 ignores the HTTP variables and the token entirely.
 

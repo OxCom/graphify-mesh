@@ -95,7 +95,9 @@ Each entry needs a stable `repo_id`, the checkout `root`, and the
 `collection_path` where that repo's `graph.json` lives. Keep `bin/registry.json`
 and any `*.env` file beside it out of group and other reach (`0644` for the
 registry, `0600` for the env file) — the engine warns at startup when they are
-looser, and never changes them for you. See
+looser, and never changes them for you. That warning covers only env files kept
+beside `registry.json`. The example units keep them in the workspace, where
+nothing checks their mode. See
 [`configuration.md`](configuration.md#registryjson) for the full schema.
 
 ## 5. First dry run
@@ -160,12 +162,18 @@ a machine running many agent sessions against the same generation.
 
 ### Env file
 
-Put the port and a generated token in `~/.config/claude-mcp/graphify-mesh.env`
-(never in the systemd unit file, which `systemctl cat` would expose to any
-local user):
+Put a generated token, and the port if you change it, in a server-only env
+file, `graphify-mesh-server.env`, with mode `600`. Keep it next to the shared
+`graphify-mesh-sync.env` the sync unit reads. Never put the token in the
+systemd unit file, which `systemctl cat` would expose to any local user. Start
+from [`examples/systemd/graphify-mesh-server.env.example`](../examples/systemd/graphify-mesh-server.env.example).
+The permission audit only checks env files in the directory holding
+`registry.json`, and only during sync runs; elsewhere the `chmod` is on you.
+With the example paths (env files in the workspace, `registry.json` under
+`graph-mesh/bin/`), neither env file is audited.
 
 ```bash
-GRAPHIFY_MESH_HTTP_PORT=19744
+#GRAPHIFY_MESH_HTTP_PORT=19744
 GRAPHIFY_MESH_HTTP_TOKEN=<generate one, do not reuse a token from elsewhere>
 ```
 
@@ -174,18 +182,25 @@ daemon exits `2` with the reason on stderr instead of starting unauthenticated.
 
 ### systemd unit
 
-Point the unit's `ExecStart` at the HTTP transport and have it read the env
-file above via `EnvironmentFile`:
+The recommended layout is the example units in
+[`examples/systemd/`](../examples/systemd/). The server unit reads the shared
+sync env file first, so query embeddings use the sync run's model and
+settings, then the server-only file, which wins on conflict:
 
 ```ini
 [Service]
-EnvironmentFile=%h/.config/claude-mcp/graphify-mesh.env
-Environment=GRAPHIFY_MESH_ROOT=/path/to/your/workspace/graph-mesh
-ExecStart=graphify-mesh-server --transport http
+EnvironmentFile=/path/to/your/workspace/graphify-mesh-sync.env
+EnvironmentFile=/path/to/your/workspace/graphify-mesh-server.env
+ExecStart=/path/to/your/venv/bin/graphify-mesh-server --transport http
 ```
 
 Restarting the unit drops graphify-mesh tools from every open session for a
 few seconds while it comes back up.
+
+Use `examples/systemd/graphify-mesh-server.service` with
+`graphify-mesh-server-reload.{path,service}`, which restart the server on a
+config change. Walkthrough:
+[`keeping-sync-up-to-date.md`](keeping-sync-up-to-date.md#running-the-shared-mcp-server-with-systemd).
 
 ### Client entry
 

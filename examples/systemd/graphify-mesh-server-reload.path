@@ -1,0 +1,23 @@
+[Unit]
+Description=Watch graphify-mesh-server config files and restart the server on change
+# EXAMPLE unit. Edit the /path/to/... placeholders before installing.
+# Install next to graphify-mesh-server.service and
+# graphify-mesh-server-reload.service, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now graphify-mesh-server-reload.path
+
+[Path]
+# Edit: the same two env files graphify-mesh-server.service reads.
+PathChanged=/path/to/your/workspace/graphify-mesh-sync.env
+PathChanged=/path/to/your/workspace/graphify-mesh-server.env
+# The server unit file and its drop-in directory. Watching the directory
+# catches drop-ins being created or deleted (e.g. by `systemctl --user edit`).
+# Editors that save by writing a temp file and renaming it over the original
+# are caught too: the rename counts as a change of the watched path.
+# A drop-in change is logged as the directory path, not the changed file.
+PathChanged=%h/.config/systemd/user/graphify-mesh-server.service
+PathChanged=%h/.config/systemd/user/graphify-mesh-server.service.d
+Unit=graphify-mesh-server-reload.service
+
+[Install]
+WantedBy=default.target

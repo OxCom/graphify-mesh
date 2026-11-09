@@ -38,7 +38,7 @@ MemoryMax=2G
 # What none of this hides is the EnvironmentFile= above. It is an ordinary file
 # owned by the service UID, the graphify children run as that UID, and the
 # engine's child sandbox keeps the filesystem readable — so a child that runs
-# code can read GRAPHIFY_MESH_OLLAMA_API_KEY and GRAPHIFY_MESH_HTTP_TOKEN out of
+# code can read GRAPHIFY_MESH_OLLAMA_API_KEY and any other secret out of
 # it directly, whatever the child env allowlist withholds. The sandbox masks the
 # mesh bin/ directory, which helps only while the file lives there. The way out
 # is a systemd credential (LoadCredential=/SetCredential=), which is readable

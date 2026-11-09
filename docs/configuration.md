@@ -37,8 +37,9 @@ keep their upstream names: `GRAPHIFY_BIN` and `GRAPHIFY_NO_BACKUP`.
 | `GRAPHIFY_MESH_CLUSTER_SCOPE` | sync (naming) | `repo` | `repo` clusters each repo's subgraph on its own, so an edit in one repo cannot reshape another repo's communities; an unchanged repo reuses its stored partition and names with no clustering and no LLM call. `global` clusters the whole merged graph, as before. The scope is part of the stored clustering recipe, so flipping it relabels every community once. An unknown value warns and uses the default. |
 | `GRAPHIFY_MESH_OLLAMA_HEALTH_TIMEOUT` | sync (naming) | `3.0` | Seconds to wait on the naming-stage health check before degrading. |
 | `GRAPHIFY_MESH_OLLAMA_API_TIMEOUT` | sync (naming) | `180.0` | Seconds one community-labeling call may take. Exported to graphify as `GRAPHIFY_API_TIMEOUT` by `naming.bind_upstream_backend`, because labeling now runs in process and the old `GRAPHIFY_MESH_CLI_TIMEOUT` bound on the child is gone. Upstream's own default is 600 s per call with zero retries for ollama, and a full relabel of ~1100 communities is ~11 sequential batches, so a wedged backend (healthy `/models`, hung completions) could outlast the unit's `TimeoutStartSec` and be SIGKILLed past every cleanup. Must be a number, `> 0` and `<= 3600`; anything else raises at startup naming the variable. Distinct from `GRAPHIFY_MESH_OLLAMA_HEALTH_TIMEOUT`, which bounds the `/models` probe only. |
-| `GRAPHIFY_MESH_OLLAMA_EMBED_BASE_URL` | sync (embed) | `http://localhost:11434` | **Native** `/api/embed` endpoint (no `/v1` suffix). |
-| `GRAPHIFY_MESH_OLLAMA_EMBED_MODEL` | sync (embed) | `qwen3-embedding:0.6b` | Embedding model. |
+| `GRAPHIFY_MESH_OLLAMA_EMBED_BASE_URL` | sync + server | `http://localhost:11434` | **Native** `/api/embed` endpoint (no `/v1` suffix). |
+| `GRAPHIFY_MESH_OLLAMA_EMBED_MODEL` | sync + server | `qwen3-embedding:0.6b` | Embedding model. |
+| `GRAPHIFY_MESH_EMBED_NUM_CTX` | sync + server | `1024` | Context window sent as `options.num_ctx` to `/api/embed`. The model default of 4096 reserves KV cache no embed input uses; 1024 covers the longest input measured with threefold headroom. A value below the real input length truncates silently and degrades the vector, so keep sync and server equal. Must be an integer: anything else fails at import in both sync and server (traceback, exit 1). |
 | `GRAPHIFY_MESH_OLLAMA_EMBED_HEALTH_TIMEOUT` | sync (embed) | `3.0` | Seconds to wait on the embed-stage health check before degrading. |
 | `GRAPHIFY_MESH_EMBED_TIMEOUT` | sync (embed) | `120.0` | Seconds one `/api/embed` request may take (`Settings.embed_request_timeout`). Must be a number, `> 0` and `<= 3600`; anything else raises at startup naming the variable. |
 | `GRAPHIFY_MESH_EMBED_CONCURRENCY` | sync (embed) | `1` | Max concurrent `/api/embed` batches (16 inputs each) per repo shard, on a bounded thread pool (`Settings.embed_concurrency`). `1` keeps the sequential loop. Measured through the shim, 12 batches: 8.2 inputs/s at 1, 21.1 at 3, 25.8 at 4, per-request latency 1.9 s to 2.4 s; raise it only for a backend that serves parallel requests. A failed batch cancels every batch not yet started, and the repo falls back to its previous shard as in the sequential path. Unparsable, zero or negative values degrade to `1`; values above `8` degrade to `8`. |
@@ -58,6 +59,8 @@ keep their upstream names: `GRAPHIFY_BIN` and `GRAPHIFY_NO_BACKUP`.
 | `GRAPHIFY_MESH_HTTP_HOST` | server | `127.0.0.1` | Bind address for `--transport http`. |
 | `GRAPHIFY_MESH_HTTP_PORT` | server | `19744` | Bind port for `--transport http`. |
 | `GRAPHIFY_MESH_HTTP_PATH` | server | `/mcp` | Mount path for `--transport http`. |
+| `GRAPHIFY_MESH_QUERY_EMBED_TIMEOUT` | server | `2.5` | Seconds a search waits for its query embedding before falling back to lexical/structural search. |
+| `GRAPHIFY_MESH_QUERY_EMBED_COOLDOWN` | server | `60.0` | Seconds after a failed query embedding during which searches skip the embedding call and run lexical/structural only. |
 | `GRAPHIFY_MESH_HTTP_TOKEN` | server | none | Bearer token required for `--transport http`. Blank or whitespace-only counts as absent, and a token shorter than 32 characters is refused: the daemon exits `2` with the reason on stderr rather than starting unauthenticated or with a guessable token. The error never echoes the token. stdio mode ignores this variable. |
 | `GRAPHIFY_MESH_ALLOW_PUBLIC_BIND` | server | off (`0`/`false`/`no`) | Opt-in required to bind **any** non-loopback host with `--transport http`, not only the wildcards. Loopback means `127.0.0.0/8`, `::1`, the IPv4-mapped loopback forms and the `localhost` names; a concrete interface address such as `192.168.1.10`, and any hostname that neither is `localhost` nor parses as an IP, count as public. The guard never resolves DNS. Without the opt-in, `ServerConfig.from_env` raises `ConfigError` before the daemon starts. |
 | `GRAPHIFY_MESH_CHILD_ENV_EXTRA` | sync | none | Comma-separated list of extra variable **names** to pass through to the `graphify` subprocesses. The child environment is an allowlist (`PATH`, `HOME`, `LANG`/`LC_*`, `NO_COLOR`, the proxy and CA variables, `PYTHONPATH`, the `OLLAMA_*` family, and `GRAPHIFY_*` minus `GRAPHIFY_MESH_*` and `GRAPHIFY_FORCE` — which covers `GRAPHIFY_OLLAMA_*`), so an operator-specific variable the upstream binary needs is declared here rather than by weakening the allowlist. The allowlist is narrow on purpose: the extraction backend is pinned to `ollama` by a literal at its call site (`sync/graphify_cli.py`'s `run_extract`), so no environment can select another backend and forwarding another vendor's credentials only widens what the child could leak. To run a non-Ollama backend you must therefore both make the backend selectable in the package and declare its variables here by name: the `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `DEEPSEEK_*`, `AZURE_OPENAI_*` and `AWS_*` families, plus `GOOGLE_API_KEY`, `KIMI_BASE_URL`, `MOONSHOT_API_KEY`, `CLAUDE_CONFIG_DIR`, `CLAUDE_PROJECT_DIR`, `FALKORDB_PASSWORD` and `LOCALAPPDATA`, no longer pass by default. When one of those names is set in the parent environment and dropped, it is logged by name at info level **once per process**, with this variable named as the fix. Every dropped parent variable is logged by name (never by value) at debug level, also once per process: the dropped set is a property of the engine's environment, identical for every child a run spawns. A `GRAPHIFY_MESH_*` name listed here is rejected with a warning: this package's own config, tokens included, is never the child's business. `GRAPHIFY_FORCE` never passes, listed here or not: graphify reads it as `update --force`, which disables graphify's own shrink guard, so the sync engine adds `--force` per repo instead (producer upgrade, `--allow-shrink` releasing a held update, or a matching `allow_shrink_once`). |
@@ -116,15 +119,18 @@ effect (see [`keeping-sync-up-to-date.md`](keeping-sync-up-to-date.md)).
 sync engine's children run as that same UID and `--ro-bind / /` keeps the whole
 filesystem readable, so a child that can run code can read that file directly
 and recover `GRAPHIFY_MESH_OLLAMA_API_KEY` and `GRAPHIFY_MESH_HTTP_TOKEN` — the
-exact names the child environment allowlist withholds. Network access is shared,
+exact names the child environment allowlist withholds. That covers any env file
+the UID owns, including a separate server token file such as the example
+`graphify-mesh-server.env`. Network access is shared,
 so reading and exfiltrating is one step. This is not only a sandbox problem: the
 file is readable by that UID whether the sandbox is on or off, and the allowlist
 was never a control against a process that can open files.
 
 What the sandbox does do is mask the mesh `bin/` directory, which is where the
-layout in [`setup.md`](setup.md) puts `registry.json` and the environment file.
-The child reads nothing in there. `GRAPHIFY_MESH_CHILD_MASK_PATHS` extends the
-masked set for a deployment that keeps the file elsewhere.
+layout in [`setup.md`](setup.md) puts `registry.json`. The child reads nothing
+in there. Env files kept elsewhere, such as in the workspace as the example
+units do, are outside the mask. `GRAPHIFY_MESH_CHILD_MASK_PATHS` extends the
+masked set: list those files there.
 
 That is a mitigation, not a fix. The fix is to stop the file being openable by
 the child's UID at all:
@@ -378,11 +384,14 @@ never changes a mode and never blocks a run over one.
 | `registry.json` | not group- or other-writable, e.g. `0644` | group or other can write |
 | `manual-relations.json` | not group- or other-writable, e.g. `0644` | group or other can write |
 
-The env file holds `GRAPHIFY_MESH_OLLAMA_API_KEY` and
-`GRAPHIFY_MESH_HTTP_TOKEN`, so anyone who can read it has those credentials.
-systemd does not tell the process which file it parsed as `EnvironmentFile=`,
-so the audit checks every `*.env` in the directory that holds `registry.json`
-instead. It only stats those files; it never opens one.
+The sync env file holds `GRAPHIFY_MESH_OLLAMA_API_KEY`. With the example
+systemd units, `GRAPHIFY_MESH_HTTP_TOKEN` lives in `graphify-mesh-server.env`.
+Anyone who can read either file has that credential. systemd does not tell the
+process which file it parsed as `EnvironmentFile=`, so the audit checks every
+`*.env` in the directory that holds `registry.json` instead. It only stats
+those files; it never opens one. Only the sync run does this check: the server
+audits `registry.json` but skips env files. The server token file is covered
+only if it sits beside `registry.json`.
 
 `registry.json` carries more authority than a list of paths suggests. Its
 `repos[].root`, `repos[].collection_path`, `disabled` and `external_roots`

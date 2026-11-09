@@ -671,7 +671,15 @@ def run_naming(
     merged_graph_data: dict,
     settings: Settings,
     health_check: HealthCheckFn | None = None,
+    *,
+    labeling_disabled_reason: str = "",
 ) -> NamingResult:
+    """Cluster and name communities.
+
+    A non-empty `labeling_disabled_reason` (e.g. "dry run") turns labeling off
+    on purpose: no health probe, no LLM call, and the reason replaces the
+    outage wording in logs and in the result.
+    """
     backend_check = assert_pinned_backend()
     fingerprint = publish.output_hash(merged_graph_data)
     state = naming_state.load(naming_dir)
@@ -743,7 +751,11 @@ def run_naming(
     carried = part.carried
 
     effective_url = bind_upstream_backend(settings)
-    healthy = _backend_healthy(settings, health_check, effective_url)
+    if labeling_disabled_reason:
+        log.info("naming: %s — labeling skipped", labeling_disabled_reason)
+        healthy = False
+    else:
+        healthy = _backend_healthy(settings, health_check, effective_url)
     llm_source = ""
     rejected = 0
     ask = {cid: m for cid, m in needs_llm.items() if cid not in part.ungrounded}
@@ -836,11 +848,15 @@ def run_naming(
     )
     any_provisional = bool(changed)
     if any_provisional:
-        reason = (
-            "ollama unreachable — provisional hub names kept"
-            if not healthy
-            else f"labeling incomplete (source={llm_source or 'none'})"
-        )
+        if labeling_disabled_reason:
+            reason = (
+                f"{labeling_disabled_reason} — {len(changed)} community(ies) would be "
+                "labeled, provisional hub names kept"
+            )
+        elif not healthy:
+            reason = "ollama unreachable — provisional hub names kept"
+        else:
+            reason = f"labeling incomplete (source={llm_source or 'none'})"
         if rejected:
             reason += f"; {rejected_note}"
         log.warning("naming: %d community(ies) provisional — %s", len(changed), reason)

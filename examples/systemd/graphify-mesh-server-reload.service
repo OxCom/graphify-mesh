@@ -1,0 +1,40 @@
+[Unit]
+Description=Restart graphify-mesh-server after a config file change
+# EXAMPLE unit. Started by graphify-mesh-server-reload.path; it has no
+# [Install] section and is never enabled on its own.
+#
+# A restart drops requests in flight, and those requests fail. The HTTP
+# transport is stateless (no MCP sessions), so the next request succeeds once
+# the server is back, after a few seconds.
+# One changed path is logged (with several changes, no guarantee which), never
+# file contents: one of the watched files holds the bearer token.
+# Read the log of both units together:
+#   journalctl --user -u graphify-mesh-server-reload -u graphify-mesh-server
+# No start limit. With the default (5 starts in 10 s) a burst of saves trips
+# it, and the .path unit then fails with unit-start-limit-hit and stops
+# watching until reset-failed.
+StartLimitIntervalSec=0
+
+[Service]
+# While this unit runs, the .path unit does not act on new changes.
+Type=oneshot
+# Debounce: saves that land in these 2 s merge into this run, and the restart
+# below reads the files as they are then. A save landing after the restart has
+# started may need one more save.
+ExecStartPre=/bin/sleep 2
+# systemd sets TRIGGER_PATH for a unit started by a .path unit. It names one
+# watched path. For a drop-in change it is the .service.d directory, not the
+# changed file. It is unset, and the log says `unknown path`, when this unit
+# is started by hand or on systemd older than 252.
+# `$$` passes a literal `$` to sh instead of systemd expanding it.
+ExecStart=/bin/sh -c 'echo "graphify-mesh config changed: $${TRIGGER_PATH:-unknown path}; restarting graphify-mesh-server.service"'
+# Reload first, so an edit to the unit file or a drop-in takes effect too.
+ExecStart=/usr/bin/systemctl --user daemon-reload
+# Flush the server's start-rate counter, so config-change restarts never trip
+# its start limit. reset-failed on a running or auto-restarting unit already
+# exits 0; `-` only keeps a not-loaded server unit from failing the reload.
+ExecStart=-/usr/bin/systemctl --user reset-failed graphify-mesh-server.service
+# restart also starts a server stopped on purpose. Stop the .path unit and
+# this unit with it: stopping this unit cancels a restart still in its sleep.
+#   systemctl --user stop graphify-mesh-server-reload.path graphify-mesh-server-reload.service graphify-mesh-server.service
+ExecStart=/usr/bin/systemctl --user restart graphify-mesh-server.service

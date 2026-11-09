@@ -390,9 +390,12 @@ otherwise forces ollama serial and the extract children read the same switch.
 A chunk holds 4 batches, so a higher value would never get a worker.
 
 A dry run makes no LLM call. It seeds its staging naming directory with the real
-`naming-state.json`, runs the stage as if the backend were down, so new
-communities get deterministic hub names, and logs how many communities a real
-run would label.
+`naming-state.json` and passes `labeling_disabled_reason="dry run"` to the
+naming stage. The stage then skips the backend health probe, logs
+`naming: dry run — labeling skipped` at INFO, and gives new communities
+deterministic hub names. It reports `degraded` with a `dry run — N
+community(ies) would be labeled` reason, never "ollama unreachable", and the
+pipeline logs how many communities a real run would label.
 
 ## The two MCP servers
 

@@ -403,3 +403,22 @@ def test_dry_run_makes_no_labeling_call(repo, monkeypatch, caplog):
     assert re.search(r"would label [1-9]\d* communities", caplog.text), caplog.text
     run(_settings(env, ollama_health_check=lambda *_a: True))
     assert calls, "control: a real run with a healthy backend does reach the labeler"
+
+
+def test_dry_run_reports_no_outage_and_probes_no_backend(repo, caplog):
+    env, _root, _collection = repo
+    probes: list[str] = []
+
+    def recording_health_check(base_url, *_a):
+        probes.append(base_url)
+        return True
+
+    caplog.set_level(logging.INFO, logger="graphify_mesh.sync")
+    report = run(_settings(env, dry_run=True, ollama_health_check=recording_health_check))
+
+    assert probes == []
+    assert "ollama unhealthy" not in caplog.text
+    assert "ollama unreachable" not in caplog.text
+    assert "unhealthy warning is expected" not in caplog.text
+    assert "naming: dry run — labeling skipped" in caplog.text
+    assert report.labeling_reason.startswith("dry run")

@@ -3,11 +3,13 @@
 Two kinds of file in the mesh configuration directory carry more authority
 than their mode usually reflects:
 
-* A secret-bearing ``*.env`` file next to ``registry.json``. The documented
-  layout (``examples/systemd/graphify-mesh-sync.env.example``) puts the
-  backend API keys there, and systemd never tells the process which file it
-  read its ``EnvironmentFile`` from, so the path cannot be learned at
-  runtime — the directory layout is the only thing this package can audit.
+* A secret-bearing ``*.env`` file next to ``registry.json``. The audit covers
+  only ``*.env`` files in that directory: keep backend API keys there if you
+  want them audited. The example layout
+  (``examples/systemd/graphify-mesh-sync.env.example``) does not. systemd
+  never tells the process which file it read its ``EnvironmentFile`` from, so
+  the path cannot be learned at runtime — the directory layout is the only
+  thing this package can audit.
   Anyone who can read the file has the keys.
 * ``registry.json`` and ``manual-relations.json``. The registry declares
   ``repos[].root``, ``repos[].collection_path``, ``disabled`` and

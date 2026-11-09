@@ -1,0 +1,65 @@
+[Unit]
+Description=graphify-mesh MCP server - shared HTTP daemon for every local agent
+# EXAMPLE unit. Edit every /path/to/... placeholder below before installing.
+# Install as a user unit, together with its reload watcher, e.g.:
+#   cp examples/systemd/graphify-mesh-server.service \
+#      examples/systemd/graphify-mesh-server-reload.{path,service} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now graphify-mesh-server.service graphify-mesh-server-reload.path
+# graphify-mesh-server-reload.path restarts this unit when one of its config
+# files changes. Full walkthrough: docs/keeping-sync-up-to-date.md.
+# Crash-loop guard. The default 10 s window never trips with RestartSec=2
+# (measured), so the window is widened to 60 s. Config-change restarts do not
+# count against it: the reload unit runs reset-failed first.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Edit: directory that contains your graph-mesh root (where graphify/global/ lives).
+WorkingDirectory=/path/to/your/workspace
+# Two environment files, read in this order. A key set in both takes its value
+# from the LATER file, and EnvironmentFile= beats any Environment= line.
+#
+# 1. The SAME env file graphify-mesh-sync.service reads. It carries
+#    GRAPHIFY_MESH_ROOT, GRAPHIFY_MESH_REGISTRY and the embedding settings
+#    (GRAPHIFY_MESH_OLLAMA_EMBED_BASE_URL, GRAPHIFY_MESH_OLLAMA_EMBED_MODEL,
+#    GRAPHIFY_MESH_EMBED_NUM_CTX). Query embeddings must use the model and
+#    context the sync run used for the stored vectors. One shared file keeps
+#    the two from drifting apart.
+# Edit: same path as EnvironmentFile= in graphify-mesh-sync.service.
+EnvironmentFile=/path/to/your/workspace/graphify-mesh-sync.env
+# 2. A server-only file holding GRAPHIFY_MESH_HTTP_TOKEN, chmod 600. Listed
+#    last, so it wins on conflict. This split is NOT isolation: the sync
+#    engine's graphify children run as the same UID and can open this file too
+#    (see docs/configuration.md). It keeps the token out of the sync process
+#    environment, and lets you share or edit the sync env file without
+#    exposing it. Real isolation means running the sync unit under a different
+#    UID from the one that owns this file. The server reads the token only from
+#    its environment.
+# Edit: path to your copy of graphify-mesh-server.env.example.
+EnvironmentFile=/path/to/your/workspace/graphify-mesh-server.env
+# Edit: path to the graphify-mesh-server console script inside your venv/pipx install.
+ExecStart=/path/to/your/venv/bin/graphify-mesh-server --transport http
+Restart=on-failure
+# Exit 2 is a config error (blank or short token, public bind without opt-in).
+# Fail once, visibly, instead of looping; the reload watcher restarts the unit
+# when the file is fixed. Other bad values (a non-integer
+# GRAPHIFY_MESH_EMBED_NUM_CTX) exit 1 and restart until the start limit.
+RestartPreventExitStatus=2
+RestartSec=2
+# The server keeps the published generation (graph, lexical index, embedding
+# vectors) in memory. Raise this if the daemon is OOM-killed while loading a
+# large mesh; `systemctl --user status graphify-mesh-server` shows current use.
+MemoryMax=2G
+
+# --- sandboxing/hardening ----------------------------------------------------
+# A `systemctl --user` unit ignores the mount-namespace directives
+# (ProtectHome=, ProtectSystem=, PrivateTmp=); see the note in
+# graphify-mesh-sync.service. NoNewPrivileges= and RestrictAddressFamilies=
+# (a seccomp filter) do apply to a user unit.
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

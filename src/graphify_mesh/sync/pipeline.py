@@ -649,11 +649,6 @@ def _add_shrink(a: tuple[int, int], b: tuple[int, int]) -> tuple[int, int]:
     return a[0] + b[0], a[1] + b[1]
 
 
-def _dry_run_no_labeling(_base_url: str, _api_key: str, _timeout: float) -> bool:
-    """Naming health check for dry runs: unhealthy, so no LLM label call is made."""
-    return False
-
-
 def _legacy_table(
     prior_state: dict | None, repo_id: str, active_version: int = CLASSIFICATION_VERSION
 ) -> ClassificationTable | None:
@@ -1683,17 +1678,14 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         report.labeling = "skipped (--skip-labeling)"
         report.clustering_backend = backend_check.backend
     else:
-        health_check = settings.ollama_health_check
         if settings.dry_run:
             # A dry run publishes nothing, so LLM labels would be thrown away
-            # (77 s observed). Degraded naming gives deterministic hub names
-            # instead. The real naming state seeds the staging copy, so only
+            # (77 s observed). Labeling is disabled, giving deterministic hub
+            # names. The real naming state seeds the staging copy, so only
             # communities a real run would send to the LLM are counted.
             real_state = settings.naming_dir / naming_state.STATE_FILENAME
             if real_state.is_file():
                 shutil.copyfile(real_state, naming_dir / naming_state.STATE_FILENAME)
-            health_check = _dry_run_no_labeling
-            log.info("naming: dry run — LLM labeling disabled, the unhealthy warning is expected")
         log.info("naming: reclustering + labeling communities ...")
         naming_result = naming.run_naming(
             settings.graphify_bin,
@@ -1701,7 +1693,8 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             naming_staging_home,
             stripped_graph_data,
             settings,
-            health_check=health_check,
+            health_check=settings.ollama_health_check,
+            labeling_disabled_reason="dry run" if settings.dry_run else "",
         )
         report.labeling = naming_result.labeling
         report.labeling_reason = naming_result.reason

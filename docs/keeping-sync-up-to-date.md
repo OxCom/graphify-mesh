@@ -313,20 +313,179 @@ systemctl --user start graphify-mesh-sync.timer
 module deleted in the checkout must not stay importable in the snapshot.
 
 The MCP server is a separate unit and usually runs the installed package with no
-`PYTHONPATH`, so writer and reader are on different code by construction. It
-picks a new generation up on the symlink flip without a restart as long as the
-generation format is unchanged. Restart it when a promotion changes something it
-shares, such as a dependency version:
+`PYTHONPATH`, so writer and reader are on different code by construction. With
+the example server unit, a `PYTHONPATH=` line in the shared env file reaches the
+server too. Put it in a drop-in of the sync unit instead, as shown above. The
+server picks a new generation up on the symlink flip without a restart as long
+as the generation format is unchanged. Restart it when a promotion changes
+something it shares, such as a dependency version:
 
 ```bash
-systemctl --user restart <your-mcp-unit>.service
+systemctl --user restart graphify-mesh-server.service
 ```
 
-To roll a promotion back, `systemctl --user revert graphify-mesh-sync.service`
-drops the drop-in, and `publish.prune_old_generations` keeps the previous
-generation on disk (`keep_structural_generations`, default 2), so repointing
-`current` at it is a `ln -sfn` away. Restore the env file's `PYTHONPATH=` line in
-the same act, or the unit falls back to the installed package.
+The promotion overwrites the only snapshot, so no previous one stays on disk.
+To roll a promotion back, export the previous tag and sync it in while the
+timer is stopped. Export rather than check out: a checkout carries uncommitted
+edits into the snapshot.
+
+```bash
+rm -rf /path/to/your/workspace/mesh-src.tag && mkdir -p /path/to/your/workspace/mesh-src.tag
+git -C /path/to/your/checkout archive <previous-tag> src | tar -x -C /path/to/your/workspace/mesh-src.tag
+rsync -a --delete /path/to/your/workspace/mesh-src.tag/src/ /path/to/your/workspace/mesh-src/
+```
+
+If quick rollback matters, copy `mesh-src/` to `mesh-src.prev/` before each
+promotion. Restore that copy with the timer stopped:
+
+```bash
+rsync -a --delete /path/to/your/workspace/mesh-src.prev/ /path/to/your/workspace/mesh-src/
+```
+
+To fall back to the installed package instead, remove the
+`PYTHONPATH` override. `systemctl --user revert graphify-mesh-sync.service`
+does that, but it removes every drop-in and override of the sync unit. To
+remove only this one, delete its drop-in file
+(`~/.config/systemd/user/graphify-mesh-sync.service.d/override.conf` when made
+with `systemctl --user edit`) and run `systemctl --user daemon-reload`.
+`publish.prune_old_generations` keeps the previous generation on disk
+(`keep_structural_generations`, default 2), so repointing `current` at it is a
+`ln -sfn` away. Do not put the `PYTHONPATH=` line in the shared env file: with
+the example server unit, it would switch the server too.
+
+## Running the shared MCP server with systemd
+
+`graphify-mesh-server --transport http` runs one MCP server for every local
+agent. Three example units in [`examples/systemd/`](../examples/systemd/) run
+it and restart it when its configuration changes:
+
+- `graphify-mesh-server.service` runs the daemon.
+- `graphify-mesh-server-reload.path` watches the config files.
+- `graphify-mesh-server-reload.service` logs the change and restarts the
+  daemon.
+
+The server reads two environment files. The first is the same
+`graphify-mesh-sync.env` the sync unit reads. Query embeddings must use the
+embedding model and settings the sync run used, and one shared file keeps them
+equal. The second file, `graphify-mesh-server.env`, holds the token and any
+server-only overrides, such as the port. The server file is read last, so a
+key set in both takes the server file's value. The shared file also carries
+`GRAPHIFY_MESH_OLLAMA_API_KEY` into the server, which does not use it. If that
+matters, keep the key in a file only the sync unit reads, such as a second
+`EnvironmentFile=` on the sync unit. The split keeps the token out of the sync
+process environment, and lets you share or edit the sync env file without
+exposing it. It is not isolation: the sync engine's `graphify` children run as
+the same UID and can open the server file too. Real isolation means running
+the sync unit under a different UID from the one that owns
+`graphify-mesh-server.env`. The server reads the token only from its
+environment; see [`configuration.md`](configuration.md).
+
+Changing `GRAPHIFY_MESH_OLLAMA_EMBED_MODEL` or
+`GRAPHIFY_MESH_OLLAMA_EMBED_BASE_URL` in the shared file restarts the server at
+once. After a model change, queries use the new model while the published
+vectors still come from the old one. Until the next sync publishes re-embedded
+vectors, the vector part of search is wrong. A model with a different dimension
+scores every vector as zero. A model with the same dimension compares vectors
+from two different spaces. The `degraded` list reports neither case. Run a sync
+right after the change, and do not rely on search before it publishes.
+
+A base-URL change that serves the same model name does not trigger
+re-embedding, and neither does a `GRAPHIFY_MESH_EMBED_NUM_CTX` change. The
+embedding cache key covers the model and snippet settings, not the endpoint or
+the context window. Unchanged nodes keep their old vectors, and only changed
+nodes are re-embedded. No flag forces a full re-embed.
+
+1. Create the server env file and fill in a generated token of at least 32
+   characters:
+
+   ```bash
+   cp examples/systemd/graphify-mesh-server.env.example \
+      /path/to/your/workspace/graphify-mesh-server.env
+   chmod 600 /path/to/your/workspace/graphify-mesh-server.env
+   python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+   ```
+
+2. Copy the three units:
+
+   ```bash
+   cp examples/systemd/graphify-mesh-server.service \
+      examples/systemd/graphify-mesh-server-reload.{path,service} \
+      ~/.config/systemd/user/
+   ```
+
+3. Edit every `/path/to/...` placeholder. The two `EnvironmentFile=` paths in
+   the server unit and the two env-file `PathChanged=` paths in the path unit
+   must name the same files.
+
+4. Enable the server and the watcher:
+
+   ```bash
+   systemctl --user daemon-reload && systemctl --user enable --now graphify-mesh-server.service graphify-mesh-server-reload.path
+   ```
+
+5. Verify the reload. Note the current PID, touch a watched file, then check
+   the journal and the PID again:
+
+   ```bash
+   systemctl --user show -p MainPID graphify-mesh-server
+   touch /path/to/your/workspace/graphify-mesh-server.env
+   journalctl --user -u graphify-mesh-server-reload -u graphify-mesh-server -n 20
+   systemctl --user show -p MainPID graphify-mesh-server
+   ```
+
+   The journal shows a line like `graphify-mesh config changed:
+   /path/to/your/workspace/graphify-mesh-server.env; restarting
+   graphify-mesh-server.service`, and `MainPID` has a new value. The reload
+   unit waits 2 s before restarting, so allow for that. The path reads
+   `unknown path` when the reload service is started by hand, or on systemd
+   older than 252. Neither sets `TRIGGER_PATH`.
+
+   If the watcher stopped (`systemctl --user is-failed
+   graphify-mesh-server-reload.path` prints `failed`), reset and restart it:
+
+   ```bash
+   systemctl --user reset-failed graphify-mesh-server-reload.service graphify-mesh-server-reload.path && systemctl --user start graphify-mesh-server-reload.path
+   ```
+
+The watcher also covers the server unit file and its drop-in directory
+(`graphify-mesh-server.service.d`), so the reload unit runs
+`systemctl --user daemon-reload` before the restart. A drop-in change is
+logged as the directory path, not the changed file. One changed path is
+logged (with several changes, no guarantee which), never file contents.
+
+The reload unit sleeps 2 s before it restarts the server. Saves that land in
+that window merge into the same run and are read by the restart. An edit
+landing after the restart has started can be missed until the next change, so
+save again if the journal shows no second restart. The reload unit sets
+`StartLimitIntervalSec=0`, so a burst of saves cannot trip systemd's default
+start limit and stop the watcher. The server unit sets its own crash-loop
+guard: `StartLimitIntervalSec=60` with `StartLimitBurst=5`. The default 10 s
+window never trips with `RestartSec=2`, so the window is wider. The reload unit
+runs `systemctl --user reset-failed` on the server before each restart, so
+config-change restarts do not count against it.
+
+The reload unit uses `systemctl restart`, which also starts a stopped server.
+When you stop the server on purpose, stop the watcher too, or the next config
+edit starts the server again. Stop the reload service as well: a reload job
+already in its 2 s sleep restarts the server when the sleep ends.
+
+```bash
+systemctl --user stop graphify-mesh-server-reload.path graphify-mesh-server-reload.service graphify-mesh-server.service
+```
+
+A failed server config check, such as a blank or short token or a public bind
+without the opt-in, makes the server exit `2`. `RestartPreventExitStatus=2`
+stops systemd retrying it, so the unit fails once and visibly. The watcher
+restarts it once the file is fixed. Other bad values, such as a non-integer
+`GRAPHIFY_MESH_EMBED_NUM_CTX`, fail with a traceback and exit `1`. The unit
+then restarts until it hits its start limit.
+
+A restart drops requests in flight, and those requests fail. The HTTP
+transport is stateless, so the next request succeeds once the server is back,
+after a few seconds.
+
+The sync service needs no reload unit. Each timer run starts a fresh process
+that reads its env file again.
 
 ## Troubleshooting
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -198,6 +199,31 @@ def test_degraded_when_backend_unhealthy_still_clusters_and_names_by_hub(tmp_pat
     state = naming_state.load(tmp_path / "naming")
     assert state is not None
     assert all(e.provisional for e in state.communities.values())
+
+
+def test_labeling_disabled_reason_skips_health_check_and_names_the_reason(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setattr(
+        "graphify_mesh.sync.clustering.llm_names",
+        lambda *a, **k: pytest.fail("LLM must not be called when labeling is disabled"),
+    )
+    caplog.set_level(logging.INFO, logger="graphify_mesh.sync")
+    result = naming.run_naming(
+        "graphify",
+        tmp_path / "naming",
+        tmp_path / "home",
+        json.loads(json.dumps(TWO_NODE_GRAPH)),
+        _settings(tmp_path, ollama_model="test-model"),
+        health_check=lambda *a, **k: pytest.fail("no health probe when labeling is disabled"),
+        labeling_disabled_reason="dry run",
+    )
+    assert result.labeling == naming.LABELING_DEGRADED
+    assert result.reason.startswith("dry run — ")
+    assert "would be labeled" in result.reason
+    assert "naming: dry run — labeling skipped" in caplog.text
+    assert "unhealthy" not in caplog.text
+    assert "unreachable" not in caplog.text
 
 
 def test_second_run_with_unchanged_graph_reuses_without_clustering(tmp_path, monkeypatch):
