@@ -423,6 +423,38 @@ def _scan_depth_from_env(name: str, default: int) -> int:
     return value
 
 
+# In-process LLM fan-out for community labeling and node embedding. Both
+# default to 1, the behavior measured safe on the current backend: on
+# 2026-09-21 four parallel labeling calls took 3.4x the per-call latency for
+# 1.17x throughput, because the backend served one request at a time. Raise
+# these once a backend handles parallel requests.
+LLM_DEFAULT_CONCURRENCY = 1
+LLM_MIN_CONCURRENCY = 1
+# Upstream fans labeling out over the batches of ONE generate_community_labels
+# call, and clustering.llm_names sends each call a chunk of exactly this many
+# batches. A higher value would never get a worker, so it is the ceiling.
+LABEL_MAX_CONCURRENCY = 4
+# Embedding batches are independent HTTP requests. Measured through the shim,
+# 16-input batches: 8.2 inputs/s at 1, 21.1 at 3, 25.8 at 4. 8 bounds a typo'd
+# value to a load the backend can still refuse politely.
+EMBED_MAX_CONCURRENCY = 8
+
+
+def _llm_concurrency_from_env(name: str, default: int, ceiling: int) -> int:
+    """Parse GRAPHIFY_MESH_LABEL_CONCURRENCY / GRAPHIFY_MESH_EMBED_CONCURRENCY.
+    Unset -> default; unparsable or below LLM_MIN_CONCURRENCY -> the floor;
+    above `ceiling` -> the ceiling. Degrade, never raise, same policy as
+    _scan_depth_from_env."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return LLM_MIN_CONCURRENCY
+    return max(LLM_MIN_CONCURRENCY, min(value, ceiling))
+
+
 def _split_colon_list(raw: str) -> list[str]:
     """Split a colon-separated root list, strip each segment, and drop
     empty/whitespace-only segments. Shared normalization for
@@ -1191,6 +1223,18 @@ class Settings:
             "GRAPHIFY_MESH_EXTRACT_CONCURRENCY", EXTRACT_DEFAULT_CONCURRENCY
         )
     )
+    # In-process LLM fan-out (see LLM_DEFAULT_CONCURRENCY): parallel labeling
+    # batches inside one upstream call, and parallel embedding batches per repo.
+    label_concurrency: int = field(
+        default_factory=lambda: _llm_concurrency_from_env(
+            "GRAPHIFY_MESH_LABEL_CONCURRENCY", LLM_DEFAULT_CONCURRENCY, LABEL_MAX_CONCURRENCY
+        )
+    )
+    embed_concurrency: int = field(
+        default_factory=lambda: _llm_concurrency_from_env(
+            "GRAPHIFY_MESH_EMBED_CONCURRENCY", LLM_DEFAULT_CONCURRENCY, EMBED_MAX_CONCURRENCY
+        )
+    )
 
     # Multi-root discovery depth: max nesting of the project dir below a
     # scan root (see SCAN_DEFAULT_DEPTH docstring above).
@@ -1207,6 +1251,12 @@ class Settings:
             self.scan_depth = SCAN_MIN_DEPTH
         if self.scan_depth > SCAN_MAX_DEPTH:
             self.scan_depth = SCAN_MAX_DEPTH
+        self.label_concurrency = max(
+            LLM_MIN_CONCURRENCY, min(self.label_concurrency, LABEL_MAX_CONCURRENCY)
+        )
+        self.embed_concurrency = max(
+            LLM_MIN_CONCURRENCY, min(self.embed_concurrency, EMBED_MAX_CONCURRENCY)
+        )
         if self.classification_version not in CLASSIFICATION_TABLES:
             raise ValueError(
                 f"classification_version must be one of {sorted(CLASSIFICATION_TABLES)}, "

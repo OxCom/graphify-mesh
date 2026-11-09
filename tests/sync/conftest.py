@@ -190,7 +190,7 @@ def _no_live_labeling(monkeypatch):
     every test down the provisional path.
     """
 
-    def fake_llm_names(G, communities, *, backend, model):
+    def fake_llm_names(G, communities, *, backend, model, max_concurrency=1):
         return {cid: f"Community Name {cid}" for cid in communities}, "llm"
 
     monkeypatch.setattr("graphify_mesh.sync.clustering.llm_names", fake_llm_names, raising=True)

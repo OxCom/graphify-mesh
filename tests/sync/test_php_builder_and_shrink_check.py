@@ -550,6 +550,247 @@ def test_check_env_drops_mesh_secrets(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# graphify-php attribution sidecar
+# ---------------------------------------------------------------------------
+
+SIDECAR = {
+    "schema": 1,
+    "producer": "graphify-php",
+    "external_stubs": "on",
+    "removed_edges": [],
+    "counts": {"core-suppressed-at-proved-site": 2},
+}
+
+
+def _attr_check(
+    tmp_path: Path, report: dict, *, supports: bool = True, code: int = 0
+) -> tuple[Path, Path, Path, Path]:
+    """A shrink-check double with a `--help`; logs argv, help calls and the sidecar it got."""
+    argv_log = tmp_path / "attr-argv.json"
+    help_log = tmp_path / "attr-help.log"
+    seen = tmp_path / "attr-seen.json"
+    out = tmp_path / "attr-out.json"
+    out.write_text(json.dumps(report), encoding="utf-8")
+    flag = "  --attribution ATTRIBUTION\n" if supports else ""
+    script = _executable(
+        tmp_path / "attr-shrink-check",
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        "if args == ['--help']:\n"
+        f"    open({str(help_log)!r}, 'a').write('x')\n"
+        f"    sys.stdout.write('usage: graphify-shrink-check\\n  --root ROOT\\n' + {flag!r})\n"
+        "    sys.exit(0)\n"
+        f"json.dump(args, open({str(argv_log)!r}, 'w'))\n"
+        "if '--attribution' in args:\n"
+        "    src = args[args.index('--attribution') + 1]\n"
+        f"    open({str(seen)!r}, 'w').write(open(src).read())\n"
+        f"sys.stdout.write(open({str(out)!r}).read())\n"
+        f"sys.exit({code})\n",
+    )
+    return script, argv_log, help_log, seen
+
+
+def _attributed_report() -> dict:
+    return _report(
+        "accept",
+        nodes={"old": 10, "new": 5, "lost": 5, "orphan": 0, "explained": 1},
+        edges={
+            "old": 10,
+            "new": 5,
+            "lost": 5,
+            "explained": 1,
+            "attributed": {"core-suppressed-at-proved-site": 2},
+            "attributed_total": 2,
+        },
+    )
+
+
+def _php_apply(tmp_path, monkeypatch, collection, script, *, builder="graphify-php", **kw):
+    invoker = _writing_invoker(5, 5, {"files": {}})
+    monkeypatch.setitem(sync_project._PHP_INVOKERS, ACTION_UPDATE, invoker)
+    monkeypatch.setitem(sync_project._INVOKERS, ACTION_UPDATE, invoker)
+    return _apply(
+        tmp_path,
+        collection,
+        shrink_policy="attributed",
+        shrink_check_bin=str(script),
+        builder=builder,
+        **kw,
+    )
+
+
+@pytest.fixture(autouse=False)
+def fresh_probe():
+    sync_project._shrink_check_supports_attribution.cache_clear()
+    yield
+    sync_project._shrink_check_supports_attribution.cache_clear()
+
+
+def test_sidecar_path_mirrors_graphify_php(tmp_path):
+    """graphify-php: attribution_path(status) = status.parent / .graphify-php-attribution.json."""
+    status = graphify_cli.php_status_path(tmp_path)
+    assert status == tmp_path / ".graphify-php-status.json"
+    assert graphify_cli.php_attribution_path(tmp_path) == (
+        status.parent / ".graphify-php-attribution.json"
+    )
+
+
+def test_php_sidecar_is_passed_and_attributed_loss_explained(tmp_path, monkeypatch, fresh_probe):
+    collection = _collection(tmp_path)
+    _write_json(graphify_cli.php_attribution_path(collection), SIDECAR)
+    script, argv_log, _, seen = _attr_check(tmp_path, _attributed_report())
+
+    outcome = _php_apply(tmp_path, monkeypatch, collection, script)
+
+    assert outcome.status == STATUS_UPDATED
+    argv = json.loads(argv_log.read_text())
+    assert "--attribution" in argv
+    # The tool reads a validated private copy, never the build-writable path itself.
+    passed = Path(argv[argv.index("--attribution") + 1])
+    assert passed != graphify_cli.php_attribution_path(collection)
+    assert not passed.exists(), "the private copy is removed after the check"
+    assert json.loads(seen.read_text()) == SIDECAR
+    # nodes: explained 1; edges: explained 1 + attributed_total 2
+    assert outcome.explained_shrink == (1, 3)
+
+
+def test_unsupported_tool_gets_no_flag(tmp_path, monkeypatch, fresh_probe):
+    collection = _collection(tmp_path)
+    _write_json(graphify_cli.php_attribution_path(collection), SIDECAR)
+    script, argv_log, _, _ = _attr_check(tmp_path, _report("accept"), supports=False)
+
+    outcome = _php_apply(tmp_path, monkeypatch, collection, script)
+
+    assert outcome.status == STATUS_UPDATED
+    assert "--attribution" not in json.loads(argv_log.read_text())
+
+
+def test_support_probe_runs_once_per_binary(tmp_path, monkeypatch, fresh_probe):
+    script, _, help_log, _ = _attr_check(tmp_path, _report("accept"))
+    for i in range(2):
+        collection = _collection(tmp_path / str(i))
+        _write_json(graphify_cli.php_attribution_path(collection), SIDECAR)
+        _php_apply(tmp_path, monkeypatch, collection, script)
+    assert help_log.read_text() == "x"
+
+
+def test_plain_graphify_builder_never_passes_a_sidecar(tmp_path, monkeypatch, fresh_probe):
+    collection = _collection(tmp_path)
+    _write_json(graphify_cli.php_attribution_path(collection), SIDECAR)
+    script, argv_log, help_log, _ = _attr_check(tmp_path, _report("accept"))
+
+    _php_apply(tmp_path, monkeypatch, collection, script, builder="graphify")
+
+    assert "--attribution" not in json.loads(argv_log.read_text())
+    assert not help_log.exists()
+
+
+def test_missing_sidecar_skips_the_probe(tmp_path, monkeypatch, fresh_probe):
+    collection = _collection(tmp_path)
+    script, argv_log, help_log, _ = _attr_check(tmp_path, _report("accept"))
+
+    outcome = _php_apply(tmp_path, monkeypatch, collection, script)
+
+    assert outcome.status == STATUS_UPDATED
+    assert "--attribution" not in json.loads(argv_log.read_text())
+    assert not help_log.exists()
+
+
+def _bad_sidecar(kind: str, path: Path, tmp_path: Path, monkeypatch) -> None:
+    if kind == "not-json":
+        path.write_text("{nope", encoding="utf-8")
+    elif kind == "not-object":
+        _write_json(path, [SIDECAR])
+    elif kind == "wrong-schema":
+        _write_json(path, {**SIDECAR, "schema": 2})
+    elif kind == "wrong-producer":
+        _write_json(path, {**SIDECAR, "producer": "someone-else"})
+    elif kind == "oversize":
+        _write_json(path, SIDECAR)
+        monkeypatch.setattr(sync_project, "ATTRIBUTION_MAX_BYTES", 16)
+    elif kind == "symlink":
+        target = tmp_path / "elsewhere.json"
+        _write_json(target, SIDECAR)
+        path.symlink_to(target)
+    elif kind == "directory":
+        path.mkdir()
+    elif kind == "not-utf8":
+        path.write_bytes(b"\xff\xfe{}")
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "not-json",
+        "not-object",
+        "wrong-schema",
+        "wrong-producer",
+        "oversize",
+        "symlink",
+        "directory",
+        "not-utf8",
+    ],
+)
+def test_unusable_sidecar_means_no_attribution_not_failure(
+    tmp_path, monkeypatch, fresh_probe, kind
+):
+    collection = _collection(tmp_path)
+    _bad_sidecar(kind, graphify_cli.php_attribution_path(collection), tmp_path, monkeypatch)
+    script, argv_log, _, _ = _attr_check(tmp_path, _report("accept"))
+
+    outcome = _php_apply(tmp_path, monkeypatch, collection, script)
+
+    assert outcome.status == STATUS_UPDATED
+    assert "--attribution" not in json.loads(argv_log.read_text())
+
+
+@pytest.mark.parametrize(
+    ("edges", "expected"),
+    [
+        ({"lost": 5, "explained": 1, "attributed": {"r": 2}, "attributed_total": 2}, 3),
+        # bounded by the actual loss (old 10 - new 5)
+        ({"lost": 5, "explained": 4, "attributed": {"r": 5}, "attributed_total": 5}, 5),
+        ({"lost": 5, "explained": 1, "attributed": {"r": -2}, "attributed_total": -2}, 1),
+        ({"lost": 5, "explained": 1, "attributed": {"r": True}, "attributed_total": True}, 1),
+        ({"lost": 5, "explained": 1, "attributed": {"r": "2"}, "attributed_total": "2"}, 1),
+        # larger than the report's own lost: malformed, ignored whole
+        ({"lost": 5, "explained": 1, "attributed": {"r": 9}, "attributed_total": 9}, 1),
+        # total disagrees with its own breakdown
+        ({"lost": 5, "explained": 1, "attributed": {"r": 1}, "attributed_total": 4}, 1),
+        ({"lost": 5, "explained": 1, "attributed_total": 2}, 1),
+        ({"explained": 1, "attributed": {"r": 2}, "attributed_total": 2}, 1),
+    ],
+    ids=[
+        "valid",
+        "capped-at-loss",
+        "negative",
+        "bool",
+        "string",
+        "over-report-lost",
+        "breakdown-mismatch",
+        "no-breakdown",
+        "no-lost",
+    ],
+)
+def test_explained_shrink_validates_attributed_total(edges, expected):
+    report = {"verdict": "accept", "nodes": {}, "edges": edges}
+    assert sync_project._explained_shrink(report, (10, 10), (5, 5)) == (0, expected)
+
+
+def test_explained_shrink_adds_node_attribution():
+    nodes = {"lost": 5, "orphan": 1, "explained": 1, "attributed": {"s": 2}, "attributed_total": 2}
+    report = {"verdict": "accept", "nodes": nodes, "edges": {}}
+    assert sync_project._explained_shrink(report, (10, 10), (5, 5)) == (4, 0)
+
+
+def test_refused_report_explains_nothing_even_with_attribution():
+    edges = {"lost": 5, "attributed": {"r": 5}, "attributed_total": 5}
+    report = {"verdict": "refuse", "edges": edges}
+    assert sync_project._explained_shrink(report, (10, 10), (5, 5)) == (0, 0)
+
+
+# ---------------------------------------------------------------------------
 # refusal hold keyed by refused_key
 # ---------------------------------------------------------------------------
 

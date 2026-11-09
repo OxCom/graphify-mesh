@@ -9,7 +9,7 @@ description = "Scheduled sync engine + companion MCP server that merges many per
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
-authors = [{ name = "AgentScopeX" }]
+authors = [{ name = "Andrii Afanasiev" }]
 keywords = ["graphify", "knowledge-graph", "mcp", "code-intelligence", "cross-project"]
 classifiers = [
     "Programming Language :: Python :: 3",

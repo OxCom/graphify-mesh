@@ -75,6 +75,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -669,6 +670,7 @@ def compute_repo_shard(
     stats: EmbeddingStats,
     recipe_stamp: str | None = None,
     timeout: float = EMBED_REQUEST_TIMEOUT,
+    concurrency: int = 1,
 ) -> RepoShard:
     """Builds this repo's shard for a repo that changed this run. Each
     `entries[key]` is `{"content_hash": ..., "row": int | None}` — `row`
@@ -731,21 +733,52 @@ def compute_repo_shard(
         log.info(
             "%s: embedding %d nodes in %d batches ...", repo_id, len(to_embed_keys), total_batches
         )
-    for batch_start in range(0, len(to_embed_keys), EMBED_BATCH_SIZE):
-        batch_num = batch_start // EMBED_BATCH_SIZE + 1
-        batch_keys = to_embed_keys[batch_start : batch_start + EMBED_BATCH_SIZE]
-        batch_inputs = to_embed_inputs[batch_start : batch_start + EMBED_BATCH_SIZE]
-        vectors = _embed_batch_with_retry(base_url, model, batch_inputs, timeout)
+    batches = [
+        (
+            to_embed_keys[start : start + EMBED_BATCH_SIZE],
+            to_embed_inputs[start : start + EMBED_BATCH_SIZE],
+        )
+        for start in range(0, len(to_embed_keys), EMBED_BATCH_SIZE)
+    ]
+
+    def record(batches_done: int, batch_keys: list[str], vectors: list[list[float]]) -> None:
+        # Main thread only: workers return vectors and never touch shared state.
         for key, vector in zip(batch_keys, vectors, strict=True):
             vector_sources[key] = vector
             stats.embedded += 1
         log.info(
             "%s: batch %d/%d done (%d nodes embedded so far)",
             repo_id,
-            batch_num,
+            batches_done,
             total_batches,
             stats.embedded,
         )
+
+    workers = max(1, min(concurrency, total_batches))
+    if workers == 1:
+        for batch_num, (batch_keys, batch_inputs) in enumerate(batches, start=1):
+            record(
+                batch_num,
+                batch_keys,
+                _embed_batch_with_retry(base_url, model, batch_inputs, timeout),
+            )
+    else:
+        # Vectors are keyed, and RepoVectors.from_mapping orders rows by sorted key,
+        # so completion order cannot change the shard. The progress count is
+        # batches completed, not the batch index, so it stays monotonic. The first
+        # failure re-raises out of the loop; shutdown then cancels every batch not
+        # yet started and waits for running ones, whose results are discarded,
+        # and the caller falls back to the previous shard as in the sequential path.
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"embed-{repo_id}")
+        try:
+            futures = {
+                pool.submit(_embed_batch_with_retry, base_url, model, batch_inputs, timeout): keys
+                for keys, batch_inputs in batches
+            }
+            for batches_done, future in enumerate(as_completed(futures), start=1):
+                record(batches_done, futures[future], future.result())
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
     repo_vectors = RepoVectors.from_mapping(vector_sources)
     for row, key in enumerate(repo_vectors.keys):
@@ -1308,6 +1341,7 @@ def run_embedding_stage(
                 stats,
                 current_recipe_stamp,
                 settings.embed_request_timeout,
+                concurrency=settings.embed_concurrency,
             )
         except RuntimeError as exc:
             # A real embed_batch call failed AFTER the pre-flight health

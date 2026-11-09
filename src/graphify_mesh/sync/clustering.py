@@ -18,6 +18,7 @@ import time
 import networkx as nx
 from networkx.readwrite import json_graph
 
+from graphify_mesh.sync.config import LABEL_MAX_CONCURRENCY, LLM_DEFAULT_CONCURRENCY
 from graphify_mesh.sync.validate import PLACEHOLDER_RE
 
 log = logging.getLogger("graphify_mesh.sync.clustering")
@@ -152,6 +153,7 @@ def llm_names(
     *,
     backend: str,
     model: str,
+    max_concurrency: int = LLM_DEFAULT_CONCURRENCY,
 ) -> tuple[dict[int, str], str]:
     """`({community_id: name}, source)` where source is "llm" or "placeholder".
 
@@ -160,19 +162,27 @@ def llm_names(
     """
     from graphify.llm import generate_community_labels
 
-    # max_concurrency=1, against upstream's default of 4
-    # (`generate_community_labels` in graphify/llm.py).
-    # Communities are labeled in batches of 100 (_LABEL_BATCH_SIZE in
-    # graphify/llm.py), so the batch count grows with the graph but a single call does not. What
-    # upstream's 4-way fan-out does instead is inflate the latency of each call,
-    # and the backend behind this endpoint serves one request at a time.
-    # Measured 2026-09-21, one 100-community batch: 12.2 s alone; four in
+    # max_concurrency defaults to 1, against upstream's default of 4
+    # (`generate_community_labels` in graphify/llm.py), and is raised by
+    # GRAPHIFY_MESH_LABEL_CONCURRENCY (Settings.label_concurrency).
+    # Upstream's fan-out inflates the latency of each call when the backend
+    # serves one request at a time, as the backend here did on 2026-09-21.
+    # Measured that day, one 100-community batch: 12.2 s alone; four in
     # parallel took 41.5 s wall with the slowest single call also 41.5 s, against
     # 48.7 s to run the same four serially. That is 1.17x throughput for 3.4x
     # per-call latency — and per-call latency is exactly what
     # `Settings.ollama_api_timeout` bounds, so the fan-out was spending the
     # timeout budget it had no way to earn back. The 2026-09-21 production run
-    # degraded 14 communities to provisional names this way.
+    # degraded 14 communities to provisional names this way. Raise the setting
+    # once the backend handles parallel requests, and re-measure per-call latency.
+    #
+    # Upstream runs min(max_concurrency, batches in this call) workers, and each
+    # call gets one chunk of LABEL_MAX_CONCURRENCY batches (below), so that
+    # constant is the ceiling: a higher value would never get a worker. For the
+    # ollama backend upstream also forces one worker unless
+    # GRAPHIFY_OLLAMA_PARALLEL=1, so that is set for the call and restored after:
+    # the child env allowlist forwards GRAPHIFY_*, and upstream's extraction
+    # reads the same switch.
     # batch_size against upstream's default of 100 (_LABEL_BATCH_SIZE, graphify's
     # llm.py). That default is sized by context window, and the window was never the
     # binding constraint: measured 2026-10-01 through the shim at num_ctx=16384, a
@@ -197,10 +207,15 @@ def llm_names(
     # attention over a long list, not of graphify or of the window.
     #
     # Chunked here only for progress: one upstream call over every community printed
-    # nothing for many minutes (quiet=True). Each chunk is 4 batches and upstream still
-    # batches inside it with the same batch_size, so the 2026-10-01 measurement holds.
+    # nothing for many minutes (quiet=True). Each chunk is LABEL_MAX_CONCURRENCY (4)
+    # batches and upstream still batches inside it with the same batch_size, so the
+    # 2026-10-01 measurement holds. The progress line reports whole chunks either way.
     batch_size = _label_batch_size()
-    chunk_size = 4 * batch_size
+    chunk_size = LABEL_MAX_CONCURRENCY * batch_size
+    parallel_gate = (
+        "GRAPHIFY_OLLAMA_PARALLEL" if backend == "ollama" and max_concurrency > 1 else None
+    )
+    saved_gate = os.environ.get(parallel_gate) if parallel_gate else None
     items = list(communities.items())
     total = len(items)
     chunk_count = max(1, -(-total // chunk_size))
@@ -210,15 +225,24 @@ def llm_names(
     started = time.monotonic()
     for index in range(chunk_count):
         chunk = dict(items[index * chunk_size : (index + 1) * chunk_size])
-        chunk_labels, source = generate_community_labels(
-            G,
-            chunk,
-            backend=backend,
-            model=model,
-            quiet=True,
-            max_concurrency=1,
-            batch_size=batch_size,
-        )
+        if parallel_gate:
+            os.environ[parallel_gate] = "1"
+        try:
+            chunk_labels, source = generate_community_labels(
+                G,
+                chunk,
+                backend=backend,
+                model=model,
+                quiet=True,
+                max_concurrency=max_concurrency,
+                batch_size=batch_size,
+            )
+        finally:
+            if parallel_gate:
+                if saved_gate is None:
+                    os.environ.pop(parallel_gate, None)
+                else:
+                    os.environ[parallel_gate] = saved_gate
         any_llm = any_llm or source == "llm"
         labels.update(chunk_labels)
         named = sum(

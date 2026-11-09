@@ -390,7 +390,7 @@ def test_dry_run_makes_no_labeling_call(repo, monkeypatch, caplog):
     env, _root, _collection = repo
     calls: list[int] = []
 
-    def recording_llm_names(G, communities, *, backend, model):
+    def recording_llm_names(G, communities, *, backend, model, max_concurrency=1):
         calls.append(len(communities))
         return {cid: f"Community Name {cid}" for cid in communities}, "llm"
 

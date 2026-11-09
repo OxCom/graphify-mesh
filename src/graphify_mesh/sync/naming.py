@@ -749,7 +749,11 @@ def run_naming(
     ask = {cid: m for cid, m in needs_llm.items() if cid not in part.ungrounded}
     if ask and healthy:
         llm_labels, llm_source = clustering.llm_names(
-            G, ask, backend="ollama", model=settings.ollama_model
+            G,
+            ask,
+            backend="ollama",
+            model=settings.ollama_model,
+            max_concurrency=settings.label_concurrency,
         )
         # Grounding check: a label must share a word with its own members' labels
         # or paths. Names shared across repos are fine ("doctrine migrations" in

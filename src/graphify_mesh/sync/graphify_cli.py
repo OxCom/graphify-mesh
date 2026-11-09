@@ -741,6 +741,21 @@ def run_update(
 # different floors turned one judgment into whichever refused first.
 PHP_MANAGED_ENV = {"GRAPHIFY_MESH_MANAGED": "1"}
 
+# graphify-php's own names: status.py `status_path()` reads GRAPHIFY_PHP_STATUS, and
+# shrink.py `attribution_path()` puts the shrink attribution sidecar beside that record.
+PHP_STATUS_FILENAME = ".graphify-php-status.json"
+PHP_ATTRIBUTION_FILENAME = ".graphify-php-attribution.json"
+
+
+def php_status_path(collection_path: Path) -> Path:
+    """Where the mesh points GRAPHIFY_PHP_STATUS for one repo: beside its graph."""
+    return collection_path / PHP_STATUS_FILENAME
+
+
+def php_attribution_path(collection_path: Path) -> Path:
+    """The sidecar graphify-php writes for that build, derived as graphify-php derives it."""
+    return php_status_path(collection_path).parent / PHP_ATTRIBUTION_FILENAME
+
 
 def run_php_update(
     graphify_bin: str,
@@ -796,7 +811,7 @@ def run_php_update(
     tmp_dir = staging_home / "tmp"
     tmp_dir.mkdir(exist_ok=True)
     writable_env = {
-        "GRAPHIFY_PHP_STATUS": str(collection_path / ".graphify-php-status.json"),
+        "GRAPHIFY_PHP_STATUS": str(php_status_path(collection_path)),
         "TMPDIR": str(tmp_dir),
     }
     argv = _sandbox_argv(

@@ -72,7 +72,7 @@ class _Recorder:
             self.cluster_calls.append(set(G.nodes()))
             return original(G, resolution, previous_assignments)
 
-        def llm_names(G, communities, *, backend, model):
+        def llm_names(G, communities, *, backend, model, max_concurrency=1):
             self.llm_calls.append(dict(communities))
             if labeler is not None:
                 return labeler(communities), "llm"

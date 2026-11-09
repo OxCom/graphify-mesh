@@ -7,16 +7,20 @@ per project code style rules.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import math
 import os
+import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeGuard
 
 from graphify_mesh.sync import graphify_cli
 from graphify_mesh.sync.config import CLASSIFICATION_VERSION, CURRENT_CLASSIFICATION
@@ -453,6 +457,16 @@ _PHP_EXIT_NOTES = {
 _SHRINK_CHECK_VERDICTS = {0: "accept", 1: "refuse"}
 SHRINK_CHECK_TIMEOUT_SECONDS = 300
 SHRINK_CHECK_TOP_FILES = 5
+SHRINK_CHECK_PROBE_TIMEOUT_SECONDS = 30
+
+# graphify-php's shrink attribution sidecar is written by the repo build, so it is
+# untrusted input. Above this size it is not handed to graphify-shrink-check at all.
+ATTRIBUTION_MAX_BYTES = 32 * 1024 * 1024
+# graphify-php shrink.py ATTRIBUTION_SCHEMA / ATTRIBUTION_PRODUCER.
+ATTRIBUTION_SCHEMA = 1
+ATTRIBUTION_PRODUCER = "graphify-php"
+_ATTRIBUTION_FLAG = "--attribution"
+_ATTRIBUTION_FLAG_RE = re.compile(r"(?<![\w-])--attribution(?![\w-])")
 
 # All four refusals of graphify's shrink guard (watch.py `_check_shrink`, 0.9.103)
 # carry this; two lack "Pass --force". The unreadable-graph refusal uses ";" and
@@ -696,6 +710,13 @@ def apply_action(
             graph_path,
             manifest_snapshot,
             manifest_path,
+            # Only graphify-php-build writes the sidecar, and it deletes a stale one first.
+            # After a plain-graphify run (php extract included) any sidecar is a leftover.
+            attribution=(
+                graphify_cli.php_attribution_path(collection_path)
+                if php_invoker is not None
+                else None
+            ),
         )
     if report is None:
         outcome_status = _classify_shrink(
@@ -852,8 +873,13 @@ def _shrink_check_report(
     new_graph: Path,
     old_manifest: Path | None,
     new_manifest: Path,
+    attribution: Path | None = None,
 ) -> dict | None:
     """Run graphify-shrink-check; its report, or None to use the count floor.
+
+    `attribution` is graphify-php's sidecar for this build. It reaches the tool as
+    `--attribution` only when the file exists, the installed tool knows the flag,
+    and the file passes `_attribution_copy`; otherwise the check runs without it.
 
     None covers every way the tool cannot answer: not installed, no manifest on
     either side to attribute against, exit 2, a crash, a timeout, or an exit 0
@@ -898,6 +924,15 @@ def _shrink_check_report(
     ]
     if producer_changed:
         argv.append("--producer-changed")
+    attribution_copy = None
+    if (
+        attribution is not None
+        and os.path.lexists(attribution)
+        and _attribution_supported(resolved)
+    ):
+        attribution_copy = _attribution_copy(attribution)
+    if attribution_copy is not None:
+        argv += [_ATTRIBUTION_FLAG, str(attribution_copy)]
     env = {k: v for k, v in os.environ.items() if graphify_cli._child_env_allows(k)}
     try:
         proc = subprocess.run(  # noqa: S603 - structured argv, binary from operator config
@@ -910,6 +945,9 @@ def _shrink_check_report(
     except (OSError, subprocess.TimeoutExpired) as exc:
         _warn_shrink_check_error(check_bin, f"did not run: {exc}")
         return None
+    finally:
+        if attribution_copy is not None:
+            attribution_copy.unlink(missing_ok=True)
     expected = _SHRINK_CHECK_VERDICTS.get(proc.returncode)
     if expected is None:
         tail = (proc.stderr or "").strip()[-500:]
@@ -947,6 +985,104 @@ def _parse_shrink_report(stdout: str) -> dict | None:
     return report if isinstance(report, dict) else None
 
 
+def _attribution_supported(resolved: str) -> bool:
+    """Whether this graphify-shrink-check accepts `--attribution`; cached per binary version.
+
+    The tool exposes no version or capability flag, so its argparse `--help` is probed
+    for the option string itself, which argparse prints verbatim. Keyed on mtime too,
+    so an in-place upgrade during a long-running process is seen.
+    """
+    try:
+        mtime_ns = os.stat(resolved).st_mtime_ns
+    except OSError:
+        return False
+    return _shrink_check_supports_attribution(resolved, mtime_ns)
+
+
+@functools.lru_cache(maxsize=16)
+def _shrink_check_supports_attribution(resolved: str, mtime_ns: int) -> bool:
+    del mtime_ns  # cache key only
+    env = {k: v for k, v in os.environ.items() if graphify_cli._child_env_allows(k)}
+    try:
+        proc = subprocess.run(  # noqa: S603 - structured argv, binary from operator config
+            [resolved, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=SHRINK_CHECK_PROBE_TIMEOUT_SECONDS,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.info("shrink check: --help probe of %s failed (%s); no attribution", resolved, exc)
+        return False
+    supported = proc.returncode == 0 and bool(_ATTRIBUTION_FLAG_RE.search(proc.stdout or ""))
+    if not supported:
+        log.info("shrink check: %s has no %s flag; no attribution", resolved, _ATTRIBUTION_FLAG)
+    return supported
+
+
+def _attribution_copy(sidecar: Path) -> Path | None:
+    """A private copy of a well-formed sidecar for the tool to read, or None.
+
+    The sidecar sits in a path the sandboxed build can write, so it is untrusted:
+    no symlinks, regular files only, at most ATTRIBUTION_MAX_BYTES, UTF-8 JSON
+    object with graphify-php's schema and producer. The tool validates the rest
+    (shrink.py `_parse_attribution`). Any defect means no attribution, never a
+    failed repo. The copy also keeps the tool off the build-writable path.
+    """
+    try:
+        raw = _read_attribution(sidecar)
+    except _SidecarRejectedError as exc:
+        log.warning("shrink check: attribution sidecar %s ignored: %s", sidecar, exc)
+        return None
+    fd, name = tempfile.mkstemp(prefix="graphify-mesh-attribution-", suffix=".json")
+    with os.fdopen(fd, "wb") as out:
+        out.write(raw)
+    return Path(name)
+
+
+class _SidecarRejectedError(Exception):
+    """Why an attribution sidecar is not handed to graphify-shrink-check."""
+
+
+def _read_attribution(sidecar: Path) -> bytes:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    too_big = f"larger than {ATTRIBUTION_MAX_BYTES} bytes"
+    try:
+        fd = os.open(sidecar, flags)
+    except OSError as exc:
+        raise _SidecarRejectedError(f"cannot open ({exc.strerror or exc})") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise _SidecarRejectedError("not a regular file")
+        if info.st_size > ATTRIBUTION_MAX_BYTES:
+            raise _SidecarRejectedError(too_big)
+        raw = b""
+        while len(raw) <= ATTRIBUTION_MAX_BYTES:
+            chunk = os.read(fd, ATTRIBUTION_MAX_BYTES + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError as exc:
+        raise _SidecarRejectedError(f"unreadable ({exc.strerror or exc})") from None
+    finally:
+        os.close(fd)
+    if len(raw) > ATTRIBUTION_MAX_BYTES:
+        raise _SidecarRejectedError(too_big)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise _SidecarRejectedError("not UTF-8 JSON") from None
+    if not isinstance(data, dict):
+        raise _SidecarRejectedError("not a JSON object")
+    schema = data.get("schema")
+    if isinstance(schema, bool) or schema != ATTRIBUTION_SCHEMA:
+        raise _SidecarRejectedError(f"schema {schema!r}, expected {ATTRIBUTION_SCHEMA}")
+    if data.get("producer") != ATTRIBUTION_PRODUCER:
+        raise _SidecarRejectedError("producer is not graphify-php")
+    return raw
+
+
 def _warn_shrink_check_mismatch(check_bin: str, detail: str) -> None:
     graphify_cli._log_once(
         f"shrink-check-mismatch:{check_bin}",
@@ -972,6 +1108,28 @@ def _report_int(section: object, key: str) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+def _is_count(value: object) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _attributed_total(section: object) -> int:
+    """`attributed_total` when the report's own figures vouch for it, else 0.
+
+    A count no larger than the section's `lost` that equals the sum of its
+    per-reason `attributed` breakdown; any other shape is ignored whole.
+    """
+    if not isinstance(section, dict):
+        return 0
+    total, lost = section.get("attributed_total"), section.get("lost")
+    breakdown = section.get("attributed")
+    if not (_is_count(total) and _is_count(lost) and isinstance(breakdown, dict)):
+        return 0
+    values = list(breakdown.values())
+    if not all(_is_count(v) for v in values) or sum(values) != total or total > lost:
+        return 0
+    return total
+
+
 def _refusal_detail(report: dict, policy: str) -> str:
     """The refusal line: the tool's reasons, then the files that lost the most."""
     reasons = [r for r in report.get("reasons") or [] if isinstance(r, str)]
@@ -990,12 +1148,15 @@ def _refusal_detail(report: dict, policy: str) -> str:
 def _explained_shrink(
     report: dict | None, old_counts: tuple[int, int], new_counts: tuple[int, int]
 ) -> tuple[int, int]:
-    """Loss the tool attributed to source changes, capped at the actual loss."""
+    """Loss the tool attributed to source changes or to graphify-php's own
+    recorded removals (`attributed_total`), capped at the actual loss."""
     if report is None or report.get("verdict") != "accept":
         return (0, 0)
     nodes, edges = report.get("nodes"), report.get("edges")
-    explained_nodes = _report_int(nodes, "explained") + _report_int(nodes, "orphan")
-    explained_edges = _report_int(edges, "explained")
+    explained_nodes = (
+        _report_int(nodes, "explained") + _report_int(nodes, "orphan") + _attributed_total(nodes)
+    )
+    explained_edges = _report_int(edges, "explained") + _attributed_total(edges)
     return (
         min(max(0, old_counts[0] - new_counts[0]), explained_nodes),
         min(max(0, old_counts[1] - new_counts[1]), explained_edges),

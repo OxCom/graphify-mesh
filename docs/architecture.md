@@ -119,7 +119,16 @@ discovery
   result "shrank unexpectedly" is decided by `graphify-shrink-check` under the
   default `attributed` policy, which accepts loss explained by source changes,
   and by the node/edge count floor when that tool is absent or errors
-  (`GRAPHIFY_MESH_SHRINK_POLICY`). A refusal restores `manifest.json` together
+  (`GRAPHIFY_MESH_SHRINK_POLICY`). For a `graphify-php` update the check also
+  gets `--attribution`: a private copy of `.graphify-php-attribution.json`, which
+  graphify-php writes beside the `GRAPHIFY_PHP_STATUS` record in the collection.
+  The mesh passes it only when the file exists, the installed tool lists the flag
+  in its `--help` (probed once per binary), and the file is a regular, non-symlink,
+  at most 32 MiB JSON object with `schema: 1` and `producer: graphify-php`. Any
+  other sidecar means no attribution, never a failed repo. The report's
+  `attributed_total` joins the explained loss that the global guard subtracts,
+  but only when it is a non-negative int that matches its per-reason breakdown
+  and does not exceed the report's `lost`. A refusal restores `manifest.json` together
   with `graph.json`, and a refused `update` is held while the attempt id,
   producer and policy stay the same. Since graphify 0.9.102 `update` is
   incremental, so the mesh adds `--force` (graphify's full rebuild, which also
@@ -201,7 +210,11 @@ discovery
   re-embeds every repo once. For an unchanged repo the log separates the two
   causes: "no published shard exists" against "published shard recipe differs
   from the configured one" (`embedding.missing_shard_repo_ids`). Each embed
-  request waits at most `GRAPHIFY_MESH_EMBED_TIMEOUT` seconds. When the stage
+  request waits at most `GRAPHIFY_MESH_EMBED_TIMEOUT` seconds. Batches run
+  sequentially unless `GRAPHIFY_MESH_EMBED_CONCURRENCY` raises the bounded pool
+  in `compute_repo_shard` (max 8). Workers only return vectors; the main thread
+  assigns them by key, so the shard is identical at any concurrency, and the
+  first failed batch cancels the batches not yet started. When the stage
   does not run (`--skip-embedding`), `embedding.carry_forward_stage` restages
   the last published shards under the new generation, dropping any shard of
   another recipe, so the server keeps its vector channel. Before, nothing was
@@ -368,6 +381,13 @@ Measured on the live mesh (33310 nodes, 1097 communities): clustering is
 deterministic and takes about 4 s, the whole naming stage about 104 s. A full
 relabel is about 11 sequential batched LLM calls — batch size 100, and upstream
 forces ollama calls serial.
+
+`GRAPHIFY_MESH_LABEL_CONCURRENCY` (default 1, max 4) lets upstream run that many
+batches of one chunk in parallel. The default stays 1 because the backend
+measured on 2026-09-21 served one request at a time. Above 1, `llm_names` sets
+`GRAPHIFY_OLLAMA_PARALLEL=1` for the call and restores it after, since upstream
+otherwise forces ollama serial and the extract children read the same switch.
+A chunk holds 4 batches, so a higher value would never get a worker.
 
 A dry run makes no LLM call. It seeds its staging naming directory with the real
 `naming-state.json`, runs the stage as if the backend were down, so new

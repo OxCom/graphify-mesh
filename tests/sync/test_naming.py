@@ -421,7 +421,7 @@ def test_reuse_refused_when_state_misses_a_node(tmp_path, monkeypatch):
 def test_llm_names_are_requested_only_for_communities_without_a_name(tmp_path, monkeypatch):
     calls = []
 
-    def fake_llm(G, communities, *, backend, model):
+    def fake_llm(G, communities, *, backend, model, max_concurrency=1):
         calls.append(sorted(communities))
         return {cid: f"Named {cid}" for cid in communities}, "llm"
 
@@ -946,7 +946,7 @@ def test_relabel_all_bypasses_reuse_and_carried_names(tmp_path, monkeypatch):
     be REUSED. With it, every community goes to the LLM and ids stay put."""
     calls = []
 
-    def fake_llm(G, communities, *, backend, model):
+    def fake_llm(G, communities, *, backend, model, max_concurrency=1):
         calls.append(sorted(communities))
         return {cid: f"Run{len(calls)} {cid}" for cid in communities}, "llm"
 
