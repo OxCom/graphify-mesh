@@ -89,6 +89,10 @@ DIGEST_RECIPE_KEY = "digest_recipe"
 # their one retry. A partial new document and a document graphify never reads
 # look the same in its manifest (no row), so the bound lives here.
 UNSTAMPED_DOCUMENTS_KEY = "unstamped_documents"
+# Per-repo state key: sha256 of the graph.json the sync last accepted. An
+# unchanged source digest skips the build, so without it a graph.json rewritten
+# by another program between runs was merged unchecked.
+GRAPH_HASH_KEY = "graph_content_hash"
 
 
 def digest_recipe(
@@ -251,6 +255,7 @@ def decide_action(
     legacy_manifest: SourceDigest | None = None,
     recipe_changed: bool = False,
     active_version: int = CLASSIFICATION_VERSION,
+    graph_drifted: bool = False,
 ) -> str:
     """Pick the action for one repo.
 
@@ -285,6 +290,10 @@ def decide_action(
 
     `active_version` is the table `current_manifest` was taken under
     (Settings.classification_version). A switch in either direction migrates.
+
+    `graph_drifted`: graph.json on disk differs from the one last accepted
+    (GRAPH_HASH_KEY). Like `producer_changed`, it turns a skip into an update
+    under the same refusal hold; the pipeline also forces that update.
     """
     if not has_graph:
         return ACTION_BOOTSTRAP
@@ -334,7 +343,11 @@ def decide_action(
         ):
             return ACTION_SKIP
         return ACTION_EXTRACT
-    if current_manifest.code_hash != prior_state.get("code_hash") or producer_changed:
+    if (
+        current_manifest.code_hash != prior_state.get("code_hash")
+        or producer_changed
+        or graph_drifted
+    ):
         return _update_unless_held(
             prior_state, current_manifest, shrink_grant, refusal_key, allow_shrink
         )

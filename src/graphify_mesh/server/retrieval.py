@@ -245,6 +245,17 @@ def _hit_from_key(key: str, generation: Generation, score: float, match_type: st
     )
 
 
+def _source_first(keys: list[str], generation: Generation) -> list[str]:
+    """`keys` with every test-path node moved after the source nodes, each
+    group in its original order."""
+    source: list[str] = []
+    tests: list[str] = []
+    for key in keys:
+        node = generation.node_by_id.get(generation.node_id_by_key.get(key, ""), {})
+        (tests if ranking.is_test_path(node.get("source_file") or "") else source).append(key)
+    return source + tests
+
+
 def rank(
     query: str,
     generation: Generation,
@@ -305,11 +316,17 @@ def rank(
             seed_for_structural, generation, repo_filter, include_inferred=include_inferred
         )
 
+        demote_tests = not ranking.query_mentions_tests(query)
         rankings = {
             "lexical": lexical_ranked,
             "vector": vector_ranked,
             "structural": structural_ranked,
         }
+        if demote_tests:
+            # RRF scores by position, so a test node holding rank 3 pushes every
+            # source node behind it down a slot; the per-score penalty below
+            # cannot undo that. Tests keep their relative order, after source.
+            rankings = {name: _source_first(keys, generation) for name, keys in rankings.items()}
         fused_scores = ranking.fuse_rankings(rankings)
         for excluded in selected_keys:
             fused_scores.pop(excluded, None)
@@ -330,7 +347,12 @@ def rank(
             (
                 key,
                 ranking.apply_penalties(
-                    key, score, degree_by_key, path_by_key, stale_keys=generation.stale_keys
+                    key,
+                    score,
+                    degree_by_key,
+                    path_by_key,
+                    stale_keys=generation.stale_keys,
+                    demote_tests=demote_tests,
                 ),
             )
             for key, score in fused_scores.items()

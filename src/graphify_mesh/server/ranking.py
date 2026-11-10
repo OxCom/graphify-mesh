@@ -26,6 +26,7 @@ Fusion contract (plan WS5 bullet 3):
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Set as AbstractSet
 
 # --- RRF (Reciprocal Rank Fusion) ------------------------------------------
@@ -64,6 +65,18 @@ DEPRECATED_PENALTY_FACTOR = 0.3
 # Helm templates with Go syntax have no AST nodes, so they stay findable.
 # 1.0 disables the demotion.
 STALE_SEMANTIC_PENALTY = 0.5
+
+# Test-code down-weight: test methods repeat the domain words of the code they
+# cover, often in their names, so they crowded source out of the top-k (cem.hub
+# probe "my team sub teams listing filter": 5 of 8 hits were test methods).
+# Applied only when the query does not ask for tests (`query_mentions_tests`).
+# 1.0 disables the demotion.
+TEST_PATH_PENALTY_FACTOR = 0.3
+TEST_DIR_NAMES = frozenset({"test", "tests", "__tests__", "spec", "specs", "testing"})
+TEST_FILE_PATTERN = re.compile(
+    r"(^test_.*\.py$|_test\.(py|go)$|Test\.php$|Tests?\.(cs|java|kt)$|\.(test|spec)\.[cm]?[jt]sx?$)"
+)
+TEST_QUERY_PATTERN = re.compile(r"test|\bspecs?\b|fixture", re.IGNORECASE)
 
 # Confidence handling is an allowlist: only EXTRACTED edges are followed by
 # default in traversal (structural candidates, similar, neighbors). graphify
@@ -139,8 +152,10 @@ def apply_penalties(
     degree_by_key: dict[str, int],
     path_by_key: dict[str, str],
     stale_keys: AbstractSet[str] = frozenset(),
+    demote_tests: bool = False,
 ) -> float:
-    """Multiplicative hub-degree + DEPRECATED-path + stale-semantic penalties.
+    """Multiplicative hub-degree + DEPRECATED-path + stale-semantic penalties,
+    plus the test-path penalty when `demote_tests` is set.
     Never applied to exact-alias bypass hits (those skip this function
     entirely — see `retrieval.rank_candidates`)."""
     score = base_score
@@ -151,7 +166,25 @@ def apply_penalties(
     path = path_by_key.get(doc_key, "") or ""
     if DEPRECATED_PATH_MARKER in path:
         score *= DEPRECATED_PENALTY_FACTOR
+    if demote_tests and is_test_path(path):
+        score *= TEST_PATH_PENALTY_FACTOR
     return score
+
+
+def is_test_path(path: str) -> bool:
+    """True for a file under a test directory (`tests/`, `__tests__/`, `spec/`,
+    ...) or named like a test (`*Test.php`, `test_*.py`, `*.spec.ts`, ...)."""
+    if not path:
+        return False
+    parts = path.replace("\\", "/").split("/")
+    if any(part.lower() in TEST_DIR_NAMES for part in parts[:-1]):
+        return True
+    return bool(TEST_FILE_PATTERN.search(parts[-1]))
+
+
+def query_mentions_tests(query: str) -> bool:
+    """True when the query asks for tests, so test code is not demoted."""
+    return bool(TEST_QUERY_PATTERN.search(query or ""))
 
 
 def _structural_similarity_proxy(key_a: str, key_b: str, path_by_key: dict[str, str]) -> float:

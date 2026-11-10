@@ -1,6 +1,7 @@
-"""`graphify-mesh` stdio MCP server (WS5 deliverable 2): wires the 7 hybrid/
-cross-project/evidence/traversal/discovery tools (`search`, `cross_project`,
-`find_similar`, `project_map`, `context_pack`, `neighbors`, `list_repos`) onto
+"""`graphify-mesh` stdio MCP server (WS5 deliverable 2): wires the
+hybrid/cross-project/evidence/traversal/discovery tools (`search`, `cross_project`,
+`find_similar`, `project_map`, `context_pack`, `neighbors`, `list_repos`, and the
+purpose-named `subclasses`, `importers`, `route_handler`, `controller_outline`) onto
 the MCP SDK's stdio transport (`mcp.server.stdio.stdio_server`), wrapped by
 `stdio_guard.capped_stdin` for the line-size cap the SDK's own reader does not provide.
 
@@ -31,6 +32,7 @@ from pathlib import Path
 from graphify_mesh.server import context_pack as context_pack_mod
 from graphify_mesh.server import project_map as project_map_mod
 from graphify_mesh.server import ranking
+from graphify_mesh.server import routes as routes_mod
 from graphify_mesh.server import similar as similar_mod
 from graphify_mesh.server import traverse as traverse_mod
 from graphify_mesh.server.citation import citation
@@ -51,6 +53,27 @@ from graphify_mesh.sync.registry import registry_hash
 log = logging.getLogger("graphify_mesh.server.server")
 
 SERVER_NAME = "graphify-mesh"
+
+# Sent in the MCP `initialize` result. A client that defers this server's
+# tools still keeps this text in the model's context, so it says which
+# question goes to which tool by the tool's name alone.
+SERVER_INSTRUCTIONS = (
+    "Code knowledge graph of the registered repos (list_repos gives repo ids). "
+    "Call it instead of grep for: all subclasses or implementors of a class, transitive "
+    "(subclasses); who imports a module or class (importers); which controller method "
+    "handles a route path or route name (route_handler); every route, handler and access "
+    "guard of a controller file, class or directory (controller_outline); where a mechanism "
+    "lives when you do not know its name or file (search); which other repos use or "
+    "implement something (cross_project). Not for literal strings, rosters, counts or "
+    "config values: grep those. Results cite repo:path:line from an offline index; verify "
+    "in source before relying on them."
+)
+
+# Relations each purpose-named tool traverses, intersected with what the
+# generation carries. `subclasses` and `importers` are `neighbors` with these
+# relations and direction "in" fixed.
+SUBCLASS_RELATIONS = ("implements", "inherits")
+IMPORT_RELATIONS = ("imports", "imports_from")
 
 DEFAULT_TOKEN_BUDGET = 2000
 
@@ -429,6 +452,88 @@ class GraphifyMeshServer:
             min_confidence_score=min_confidence_score,
         ).as_dict()
 
+    def _registered_repo(self, arguments: dict):
+        """The enabled registry entry for `repo`, or None when it is not
+        registered and enabled (the caller answers `repo_not_registered`)."""
+        repo = arguments.get("repo")
+        if not isinstance(repo, str) or not repo:
+            raise ToolError("'repo' must be a non-empty string (a registered repo_id)")
+        for entry in self._registry_entries():
+            if entry.enabled and entry.repo_id == repo:
+                return entry
+        return None
+
+    def _fixed_traversal(
+        self, arguments: dict, wanted: tuple[str, ...], depth: int, include_inferred: bool = False
+    ) -> dict:
+        """`neighbors` with relations and direction fixed by the tool, over
+        the `wanted` relations this generation actually carries."""
+        node = arguments.get("node")
+        if not isinstance(node, str) or not node:
+            raise ToolError("'node' must be a non-empty string (a class name, FQCN, key or label)")
+        entry = self._registered_repo(arguments)
+        repo = arguments["repo"]
+        if entry is None:
+            return traverse_mod.NeighborsResult(
+                resolved=False,
+                repo=repo,
+                relations=list(wanted),
+                direction=traverse_mod.DIRECTION_IN,
+                depth=depth,
+                include_inferred=include_inferred,
+                degraded=["repo_not_registered"],
+            ).as_dict()
+        generation = self._generation()
+        relations = sorted(name for name in wanted if name in generation.relations)
+        if not relations:
+            raise ToolError(f"the current generation has none of the relations {', '.join(wanted)}")
+        return traverse_mod.neighbors(
+            node, repo, relations, traverse_mod.DIRECTION_IN, depth, include_inferred, generation
+        ).as_dict()
+
+    def tool_subclasses(self, arguments: dict) -> dict:
+        include_inferred = arguments.get("include_inferred", False)
+        if not isinstance(include_inferred, bool):
+            raise ToolError("'include_inferred' must be a boolean")
+        return self._fixed_traversal(
+            arguments, SUBCLASS_RELATIONS, traverse_mod.MAX_DEPTH, include_inferred
+        )
+
+    def tool_importers(self, arguments: dict) -> dict:
+        return self._fixed_traversal(arguments, IMPORT_RELATIONS, _validate_depth(arguments))
+
+    def tool_route_handler(self, arguments: dict) -> dict:
+        route = arguments.get("route")
+        if not isinstance(route, str) or not route.strip():
+            raise ToolError("'route' must be a non-empty string (a path, prefix or route name)")
+        entry = self._registered_repo(arguments)
+        if entry is None:
+            return routes_mod.RouteResult(
+                resolved=False,
+                repo=arguments["repo"],
+                query=route,
+                degraded=["repo_not_registered"],
+            ).as_dict()
+        return routes_mod.route_handler(route, entry.repo_id, self._generation()).as_dict()
+
+    def tool_controller_outline(self, arguments: dict) -> dict:
+        target = arguments.get("target")
+        if not isinstance(target, str) or not target.strip():
+            raise ToolError(
+                "'target' must be a non-empty string (a controller file, directory or class)"
+            )
+        entry = self._registered_repo(arguments)
+        if entry is None:
+            return routes_mod.OutlineResult(
+                resolved=False,
+                repo=arguments["repo"],
+                target=target,
+                degraded=["repo_not_registered"],
+            ).as_dict()
+        return routes_mod.controller_outline(
+            target, entry.repo_id, self._generation(), repo_root=str(entry.root)
+        ).as_dict()
+
     def tool_list_repos(self, arguments: dict) -> dict:
         cwd = _validate_cwd(arguments)
         entries = self._registry_entries()
@@ -502,6 +607,10 @@ class GraphifyMeshServer:
         "context_pack": "tool_context_pack",
         "neighbors": "tool_neighbors",
         "list_repos": "tool_list_repos",
+        "subclasses": "tool_subclasses",
+        "importers": "tool_importers",
+        "route_handler": "tool_route_handler",
+        "controller_outline": "tool_controller_outline",
     }
 
     def tool_schemas(self) -> list[dict]:
@@ -736,6 +845,108 @@ class GraphifyMeshServer:
                             ),
                         },
                     },
+                },
+            },
+            {
+                "name": "subclasses",
+                "description": (
+                    "Every class that extends or implements a class or interface, "
+                    "transitively (depth 16), inside one registered repo. Finds the indirect "
+                    "subclasses that `grep 'extends X'` misses. Takes a short class name, a "
+                    "FQCN (App\\Form\\AbstractForm, leading backslash allowed) or a key. "
+                    "A closed set only when complete, frontier_exhausted and "
+                    "reliability='exact' are all true. On node_not_found, `suggestions` "
+                    "lists the closest labels to retry with. Same as neighbors with "
+                    "relation=[inherits, implements], direction=in, depth=16."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "node": {
+                            "type": "string",
+                            "description": "Class or interface: short name, FQCN or key.",
+                        },
+                        "repo": {"type": "string", "description": "Registered repo_id."},
+                        "include_inferred": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Also follow INFERRED-confidence edges.",
+                        },
+                    },
+                    "required": ["node", "repo"],
+                },
+            },
+            {
+                "name": "importers",
+                "description": (
+                    "Every file or module that imports a module, class or symbol, inside one "
+                    "registered repo: the complete set over indexed import edges, not a "
+                    "ranked top-k. `depth` 1 (default) gives direct importers; raise it for "
+                    "importers of importers. Same as neighbors with relation=[imports, "
+                    "imports_from], direction=in."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "node": {
+                            "type": "string",
+                            "description": "Imported module, class or symbol: name, FQCN or key.",
+                        },
+                        "repo": {"type": "string", "description": "Registered repo_id."},
+                        "depth": {
+                            "type": "integer",
+                            "default": traverse_mod.DEFAULT_DEPTH,
+                            "minimum": 1,
+                            "maximum": traverse_mod.MAX_DEPTH,
+                        },
+                    },
+                    "required": ["node", "repo"],
+                },
+            },
+            {
+                "name": "route_handler",
+                "description": (
+                    "Which controller method handles an HTTP route, with its HTTP methods, "
+                    "route name and access guards. Takes a full path "
+                    "(/teams/{team}/members; placeholder names need not match), a route "
+                    "name, or a path prefix (returns every route under it). When no route "
+                    "matches the full path it returns the longest indexed prefix routes "
+                    "(match='ancestor_prefix'); on no match at all, `suggestions` lists the "
+                    "closest route paths and names."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "route": {
+                            "type": "string",
+                            "description": "Route path, path prefix, or route name.",
+                        },
+                        "repo": {"type": "string", "description": "Registered repo_id."},
+                    },
+                    "required": ["route", "repo"],
+                },
+            },
+            {
+                "name": "controller_outline",
+                "description": (
+                    "Outline of a controller in one call: every route it declares with the "
+                    "handler method, HTTP methods, route name and access guard (method- and "
+                    "class-level #[IsGranted]), in source order. Replaces grepping "
+                    "'#[Route|public function|IsGranted' over a controller. Takes a "
+                    "controller file path (repo-relative, absolute, or a trailing part like "
+                    "TimeTracking/TeamController.php), a directory (every controller under "
+                    "it), or a class name or FQCN."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "Controller file, directory, or class name/FQCN.",
+                        },
+                        "repo": {"type": "string", "description": "Registered repo_id."},
+                    },
+                    "required": ["target", "repo"],
                 },
             },
         ]

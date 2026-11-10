@@ -19,6 +19,7 @@ with the other `_validate_*` helpers; this module assumes validated input.
 
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass, field
 
 from graphify_mesh.server import ranking
@@ -107,6 +108,8 @@ class NeighborsResult:
     degraded: list[str] = field(default_factory=list)
     # `_resolver` values seen on traversed calls/indirect_call edges (data only).
     resolvers: set[str] = field(default_factory=set)
+    # Closest labels in the repo, filled only on node_not_found.
+    suggestions: list[str] = field(default_factory=list)
 
     @property
     def reliability(self) -> str:
@@ -155,14 +158,16 @@ class NeighborsResult:
             "skipped_unkeyed": self.skipped_unkeyed,
             "notes": self.notes,
             "degraded": self.degraded,
+            "suggestions": self.suggestions,
         }
 
 
 def _resolve_seeds(node_arg: str, repo: str, generation: Generation) -> list[str]:
     """Seed node ids for `node_arg`, restricted to `repo`: a durable key, then
-    a graph node id, then an exact label, then a case-insensitive label /
-    `norm_label` match, then a bare method name matched as `.name()`. Every
-    node matching at the first tier that matches anything becomes a seed."""
+    a graph node id, then the label tiers of `_label_seeds`. A namespaced
+    name (`App\\Form\\AbstractForm`, a leading `\\`, or `Class::method`) that
+    matches nothing as written is retried by its short name, narrowed by the
+    namespace path when several nodes share that short name."""
     for candidate in (generation.node_id_by_key.get(node_arg), node_arg):
         if candidate is None:
             continue
@@ -170,6 +175,25 @@ def _resolve_seeds(node_arg: str, repo: str, generation: Generation) -> list[str
         if node is not None and node.get("repo") == repo:
             return [candidate]
     repo_node_ids = generation.nodes_by_repo.get(repo, [])
+    seeds = _label_seeds(node_arg, repo_node_ids, generation)
+    if seeds:
+        return seeds
+    class_part, sep, method = node_arg.partition("::")
+    class_part = class_part.strip().lstrip("\\")
+    if sep:
+        classes = _class_seeds(class_part, repo_node_ids, generation)
+        return _methods_of(classes, method.strip().removesuffix("()"), generation)
+    if class_part != node_arg:
+        return _class_seeds(class_part, repo_node_ids, generation)
+    if "\\" in node_arg:
+        return _class_seeds(node_arg, repo_node_ids, generation)
+    return []
+
+
+def _label_seeds(node_arg: str, repo_node_ids: list[str], generation: Generation) -> list[str]:
+    """An exact label, then a case-insensitive label / `norm_label` match,
+    then a bare method name matched as `.name()`. Every node matching at the
+    first tier that matches anything is returned."""
     exact = [nid for nid in repo_node_ids if generation.node_by_id[nid].get("label") == node_arg]
     if exact:
         return exact
@@ -186,6 +210,59 @@ def _resolve_seeds(node_arg: str, repo: str, generation: Generation) -> list[str
     # `reminderSubmitWeek` would otherwise never resolve.
     method_label = f".{node_arg}()"
     return [nid for nid in repo_node_ids if generation.node_by_id[nid].get("label") == method_label]
+
+
+def _class_seeds(fqcn: str, repo_node_ids: list[str], generation: Generation) -> list[str]:
+    """Nodes for a namespaced class name. graphify labels a class by its short
+    name, so the short name is matched; when several nodes share it, the ones
+    whose source path ends with the namespace path (PSR-4: `App\\Form\\X` ->
+    `.../Form/X.php`, the vendor prefix dropped) win, if any do."""
+    parts = [part for part in fqcn.strip().lstrip("\\").split("\\") if part]
+    if not parts:
+        return []
+    candidates = _label_seeds(parts[-1], repo_node_ids, generation)
+    if len(candidates) <= 1 or len(parts) == 1:
+        return candidates
+    suffix = "/".join(parts[1:]).lower()
+    narrowed = []
+    for nid in candidates:
+        stem = str(generation.node_by_id[nid].get("source_file") or "").lower()
+        stem = stem.rsplit(".", 1)[0]
+        if stem == suffix or stem.endswith("/" + suffix):
+            narrowed.append(nid)
+    return narrowed or candidates
+
+
+def _methods_of(class_ids: list[str], method: str, generation: Generation) -> list[str]:
+    """Method nodes labelled `.method()` that a `method` edge attaches to one
+    of `class_ids`."""
+    label = f".{method}()"
+    found: set[str] = set()
+    for class_id in class_ids:
+        for neighbor_id, link in generation.adjacency.get(class_id, []):
+            if link.get("relation") != "method" or link.get("source") != class_id:
+                continue
+            if generation.node_by_id.get(neighbor_id, {}).get("label") == label:
+                found.add(neighbor_id)
+    return sorted(found)
+
+
+def near_labels(node_arg: str, repo: str, generation: Generation, limit: int = 8) -> list[str]:
+    """Distinct labels in `repo` closest to `node_arg` (its short name for a
+    namespaced or `Class::method` argument), for a caller to retry with after
+    node_not_found."""
+    short = node_arg.split("::", 1)[0].strip().rstrip("\\").rsplit("\\", 1)[-1]
+    short = short or node_arg
+    labels = sorted(
+        {
+            str(generation.node_by_id[nid].get("label") or "")
+            for nid in generation.nodes_by_repo.get(repo, [])
+        }
+        - {""}
+    )
+    folded = {label.lower(): label for label in labels}
+    close = difflib.get_close_matches(short.lower(), list(folded), n=limit, cutoff=0.6)
+    return [folded[label] for label in close]
 
 
 def _node_card(node_id: str, key: str, repo: str, generation: Generation) -> dict:
@@ -287,6 +364,7 @@ def neighbors(
     ]
     if not seed_ids:
         result.degraded = ["node_not_found"]
+        result.suggestions = near_labels(node_arg, repo, generation)
         return result
     result.resolved = True
 

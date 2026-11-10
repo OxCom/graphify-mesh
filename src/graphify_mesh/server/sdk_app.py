@@ -1,4 +1,4 @@
-"""Registers this package's 7 tools on the MCP SDK's low-level Server.
+"""Registers this package's tools on the MCP SDK's low-level Server.
 
 Both transports (stdio and streamable HTTP) go through here, so
 `GraphifyMeshServer.tool_schemas` / `.call_tool` stay the single source of
@@ -19,7 +19,7 @@ import anyio.to_thread
 import mcp.types as types
 from mcp.server.lowlevel import Server
 
-from graphify_mesh.server.server import SERVER_NAME, GraphifyMeshServer
+from graphify_mesh.server.server import SERVER_INSTRUCTIONS, SERVER_NAME, GraphifyMeshServer
 
 log = logging.getLogger("graphify_mesh.server.sdk_app")
 
@@ -105,4 +105,9 @@ def build_sdk_server(mesh: GraphifyMeshServer) -> Server:
             content=_to_blocks(result), is_error=bool(result.get("isError"))
         )
 
-    return Server(SERVER_NAME, on_list_tools=list_tools, on_call_tool=call_tool)
+    return Server(
+        SERVER_NAME,
+        instructions=SERVER_INSTRUCTIONS,
+        on_list_tools=list_tools,
+        on_call_tool=call_tool,
+    )

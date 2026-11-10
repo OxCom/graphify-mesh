@@ -108,6 +108,10 @@ def test_stdio_initialize_and_tools_list_over_real_subprocess(tmp_path):
             "context_pack",
             "neighbors",
             "list_repos",
+            "subclasses",
+            "importers",
+            "route_handler",
+            "controller_outline",
         }
     finally:
         proc.stdin.close()
@@ -213,6 +217,10 @@ def test_unparseable_json_line_gets_parse_error(tmp_path):
             "context_pack",
             "neighbors",
             "list_repos",
+            "subclasses",
+            "importers",
+            "route_handler",
+            "controller_outline",
         }
     finally:
         proc.stdin.close()

@@ -30,6 +30,8 @@ import hashlib
 import json
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -481,6 +483,9 @@ class GenerationStore:
         self._embeddings_target: str | None = None
         self.degraded: list[str] = []
         self._lock = ReadWriteLock()
+        # Serializes reloads; held while a generation loads, so the rwlock is
+        # only ever held for the swap. See `ensure_fresh`.
+        self._reload_mutex = threading.Lock()
 
     def _stat_signature(self) -> tuple[str | None, float | None, str | None]:
         """Cheap change-detection signature for the published state this store
@@ -526,12 +531,22 @@ class GenerationStore:
                 and embeddings_target == self._embeddings_target
             ):
                 return  # unchanged, nothing to do
-        with self._lock.write():
-            # Re-check under the write lock, from a FRESH stat — never from
-            # the signature captured above. Two reasons, and only the second
-            # one needs the fresh stat:
+            serving = self._generation is not None
+        # Single-flight: one thread loads, under `_reload_mutex` only, never
+        # under the read/write lock. Loading a generation (155 MB of JSON plus
+        # indexes) took 2.6 s measured on an idle host and 20 s+ under swap
+        # pressure; held under the write lock, every tool call of every client
+        # waited for it. While something is already served, the other threads
+        # do not wait for the load: they serve the previous generation until
+        # the swap. Only the very first load blocks, since there is nothing
+        # else to serve.
+        if not self._reload_mutex.acquire(blocking=not serving):
+            return
+        try:
+            # Re-check from a FRESH stat, never from the signature captured
+            # above. Two reasons, and only the second one needs the fresh stat:
             #   * another thread may have reloaded this exact generation
-            #     while this one waited for the lock, and without a re-check
+            #     while this one waited for the mutex, and without a re-check
             #     N concurrent readers each trigger their own full reload;
             #   * a publish may have advanced `current` during that wait and
             #     another thread may have already loaded the newer
@@ -546,19 +561,31 @@ class GenerationStore:
                 # `current` disappeared while this thread waited. Keep
                 # serving what is loaded rather than reloading a path that
                 # is no longer published.
-                if self._generation is None:
-                    self.degraded = ["no_generation_published"]
+                with self._lock.write():
+                    if self._generation is None:
+                        self.degraded = ["no_generation_published"]
                 return
-            if (
-                fresh_target == self._current_target
-                and fresh_mtime == self._manifest_mtime
-                and fresh_embeddings == self._embeddings_target
-            ):
-                return
+            with self._lock.read():
+                if (
+                    fresh_target == self._current_target
+                    and fresh_mtime == self._manifest_mtime
+                    and fresh_embeddings == self._embeddings_target
+                ):
+                    return
+            started = time.monotonic()
             self._try_reload(fresh_target, fresh_mtime, fresh_embeddings)
+            log.info(
+                "graphify-mesh: reload of %s finished in %.2f s",
+                os.path.basename(fresh_target),
+                time.monotonic() - started,
+            )
+        finally:
+            self._reload_mutex.release()
 
     def _try_reload(self, target: str, mtime: float | None, embeddings_target: str | None) -> None:
-        # Only ever called under `self._lock.write()` — see `ensure_fresh`.
+        # Only ever called under `self._reload_mutex`, never under the rwlock:
+        # the load runs while readers keep serving the previous generation,
+        # and only the final swap below takes the write lock. See `ensure_fresh`.
         # Every artifact read goes through the CAPTURED realpath (`target`),
         # never the live `current` symlink: a sync publish flipping `current`
         # mid-load must not mix files from two generations into one
@@ -676,17 +703,18 @@ class GenerationStore:
 
         # Only the fully successful path swaps state, so a rejected or failed
         # reload leaves the previous generation and its signature untouched.
-        self._generation = generation
-        self._current_target = target
-        self._manifest_mtime = mtime
-        self._embeddings_target = embeddings_target
         degraded: list[str] = []
         if not embeddings:
             degraded.append("embeddings_unavailable")
         for marker in embedding_markers:
             if marker not in degraded:
                 degraded.append(marker)
-        self.degraded = degraded
+        with self._lock.write():
+            self._generation = generation
+            self._current_target = target
+            self._manifest_mtime = mtime
+            self._embeddings_target = embeddings_target
+            self.degraded = degraded
 
     def _load_embeddings_checked(
         self, manifest_generation_id: str

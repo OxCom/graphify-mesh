@@ -97,6 +97,7 @@ from graphify_mesh.sync.sync_project import (
     ACTION_UPDATE,
     CLASSIFICATION_VERSION_KEY,
     DIGEST_RECIPE_KEY,
+    GRAPH_HASH_KEY,
     STATUS_BOOTSTRAP_FAILED,
     STATUS_FAILED,
     STATUS_INFRA_FAILED,
@@ -1255,13 +1256,24 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             upgraded = _producer_upgraded(
                 prior_state, versions.graphify, versions.producer_versions
             )
+            on_disk_hash = file_content_hash(graph_path) if has_graph else None
+            accepted_hash = (prior_state or {}).get(GRAPH_HASH_KEY)
+            # State written before GRAPH_HASH_KEY existed has no hash: the skip
+            # path below seeds it, rather than rebuilding every repo once.
+            drifted = accepted_hash is not None and on_disk_hash != accepted_hash
             # --allow-shrink forces only the update it releases: the one held on
             # this key. Forcing every update in the run disabled graphify's own
-            # guards for repos the operator never looked at.
-            force_rebuilds[entry.repo_id] = upgraded or (
-                settings.allow_shrink
-                and prior_state is not None
-                and refusal_held(prior_state, hold_key)
+            # guards for repos the operator never looked at. A drifted graph is
+            # forced because an incremental update keeps the rewritten file's
+            # extraction of every unchanged source file.
+            force_rebuilds[entry.repo_id] = (
+                upgraded
+                or drifted
+                or (
+                    settings.allow_shrink
+                    and prior_state is not None
+                    and refusal_held(prior_state, hold_key)
+                )
             )
             action = decide_action(
                 prior_state,
@@ -1275,7 +1287,17 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 legacy_manifest=legacy_manifest,
                 recipe_changed=recipe_changed,
                 active_version=active_version,
+                graph_drifted=drifted,
             )
+            if drifted:
+                log.warning(
+                    "[%d/%d] %s: graph.json changed outside the sync (sha256 %s, accepted %s)",
+                    i,
+                    total_active,
+                    entry.repo_id,
+                    (on_disk_hash or "missing")[:12],
+                    (accepted_hash or "")[:12],
+                )
             log.info("[%d/%d] %s: %s ...", i, total_active, entry.repo_id, action)
             bar.tick(i - 1, f"{entry.repo_id}: {action} ...")
 
@@ -1306,6 +1328,28 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                     }
                     if recipe:
                         state[entry.repo_id][DIGEST_RECIPE_KEY] = recipe
+                if drifted:
+                    # The rebuild that would replace the rewritten file is held
+                    # by an earlier refusal. Count the repo as suspect so the
+                    # publish gate sees it, and keep the accepted hash.
+                    stale_repos.append(entry.repo_id)
+                    publish_blocking_repos.append(entry.repo_id)
+                    report.project_actions.append(
+                        {
+                            "repo_id": entry.repo_id,
+                            "action": action,
+                            "status": "graph_drift_held",
+                            "reason": "graph.json changed outside the sync; rebuild held",
+                        }
+                    )
+                    graph_paths_by_repo[entry.repo_id] = graph_path
+                    bar.tick(i, f"{entry.repo_id}: graph drift held")
+                    continue
+                if accepted_hash is None and on_disk_hash is not None and prior_state is not None:
+                    state[entry.repo_id] = {
+                        **(state.get(entry.repo_id) or prior_state),
+                        GRAPH_HASH_KEY: on_disk_hash,
+                    }
                 report.project_actions.append(
                     {"repo_id": entry.repo_id, "action": action, "status": "unchanged"}
                 )
@@ -1489,6 +1533,9 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 if recipe:
                     accepted[DIGEST_RECIPE_KEY] = recipe
                 accepted["producer"] = producer_for(action, entry.builder)
+                accepted_graph_hash = outcome.graph_content_hash or file_content_hash(graph_path)
+                if accepted_graph_hash:
+                    accepted[GRAPH_HASH_KEY] = accepted_graph_hash
                 versions = repo_versions[entry.repo_id]
                 if versions.graphify:
                     accepted["graphify_version"] = versions.graphify

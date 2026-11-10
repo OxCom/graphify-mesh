@@ -116,14 +116,24 @@ graph. The one exception is `list_repos`, which still serves the registry part.
 
 ## Concurrency (HTTP mode)
 
-Reads run in parallel; a generation reload takes an exclusive lock
-(`server/rwlock.py`, writer-preferring, so a steady stream of reads cannot
-postpone a reload indefinitely). The two read-path caches — the registry
+Reads run in parallel. A generation reload loads and indexes the new
+generation without holding the read/write lock (`server/rwlock.py`); only the
+final swap takes the exclusive write lock. One thread loads at a time
+(`GenerationStore._reload_mutex`); while a generation is already served, other
+calls keep getting it during the load instead of waiting. Only the first load
+of a process blocks callers. Each finished reload logs
+`reload of <generation> finished in N s` at INFO. The two read-path caches — the registry
 cache in `server/scope.py` and the per-generation index cache in
 `server/similar.py` — are each guarded by their own lock, with the fast hit
 path lock-free.
 
-## The 7 tools
+## The 11 tools
+
+The `initialize` result carries an `instructions` string
+(`server/server.py:SERVER_INSTRUCTIONS`) that names which question goes to which
+tool. A client that defers this server's tool schemas still keeps that text in
+the model's context, and the purpose-named tools below make the tool name alone
+say what it answers.
 
 ### `list_repos`
 Lists the registered, enabled repositories with their roots, and the repo a directory belongs to. Start here to find valid `repo_id`s for `scope="repo:<id>"`, `repos`/`exclude_repos`, `project_map` and `neighbors`.
@@ -182,6 +192,15 @@ schema version unchanged). Ranking multiplies a stale node's fused score by
 `STALE_SEMANTIC_PENALTY` (`server/ranking.py`, 0.5; 1.0 disables). Stale nodes are
 demoted, never dropped, and an exact-alias hit is flagged but not demoted.
 
+Test code is ranked below source unless the query asks for tests (it contains
+`test`, `spec`/`specs` or `fixture`, case-insensitive). A test node is one under
+a `test`, `tests`, `__tests__`, `spec`, `specs` or `testing` directory, or a file
+named like a test (`*Test.php`, `test_*.py`, `*_test.py`, `*_test.go`,
+`*.test.ts`, `*.spec.tsx`, ...; `server/ranking.py:is_test_path`). Each
+retriever's candidate list puts test nodes after source nodes before fusion,
+and the fused score of a test node is multiplied by `TEST_PATH_PENALTY_FACTOR`
+(0.3; 1.0 disables the score penalty). Exact and anchor hits are not demoted.
+
 Hits from `search`, `cross_project` and `find_similar`, and `context_pack`
 cards, carry no `community_name`: the labels proved unreliable and cost payload
 without adding evidence.
@@ -237,7 +256,7 @@ an interface, all importers of a module. On cem.hub, subclasses of
 
 | Arg | Type | Default | Notes |
 |-----|------|---------|-------|
-| `node` | string | — (required) | Durable key, graph node id, or label. Labels match exactly, then case-insensitively, then as a bare method name (`reminderSubmitWeek` matches `.reminderSubmitWeek()`). Several matches all become seeds. |
+| `node` | string | — (required) | Durable key, graph node id, or label. Labels match exactly, then case-insensitively, then as a bare method name (`reminderSubmitWeek` matches `.reminderSubmitWeek()`). A namespaced name (`App\Form\AbstractForm`, with or without a leading `\`) that matches nothing as written resolves by its short name, narrowed to nodes whose path ends with the namespace path minus its first segment when several share the name. `Class::method` resolves to the `.method()` node attached to that class by a `method` edge. Several matches all become seeds. On `node_not_found`, `suggestions` lists up to 8 closest labels. |
 | `repo` | string | — (required) | A registered, enabled `repo_id`. The traversal never leaves it. |
 | `relation` | string or string[] | — (required) | 1 to 16 relation names, e.g. `inherits`, `implements`, `imports`, `calls`. A name absent from the generation is an error that lists the names present. |
 | `direction` | string | — (required) | `in`: edges whose target is the current node (subclasses for `inherits`, importers for `imports`). `out`: edges whose source is the current node (parents for `inherits`). `both`: either. |
@@ -270,6 +289,66 @@ that built the repo. When a traversed call edge carries a `_resolver`
 attribute, `notes` names that resolver and says untyped receivers, chained and
 dynamic calls remain unresolved. A missing call edge is not evidence that no
 call exists.
+
+### `subclasses` and `importers`
+`neighbors` with the relations and direction fixed, so the name alone says
+what the tool answers. Same payload, same `node` resolution and `suggestions`.
+
+| Tool | Relations | Direction | Depth | Extra args |
+|------|-----------|-----------|-------|------------|
+| `subclasses` | `inherits`, `implements` | `in` | 16 | `include_inferred` |
+| `importers` | `imports`, `imports_from` | `in` | `depth` arg, default 1 | `depth` |
+
+Only the relations the generation carries are traversed; none of them present
+is an error. Both take `node` and `repo` (required).
+
+### `route_handler`
+The handler method of an HTTP route, with HTTP methods, route name, and access
+guards. Routes are the `_kind: "http_route"` nodes graphify-php emits from
+`#[Route]` attributes; routes declared in YAML/XML config are not indexed.
+
+| Arg | Type | Default | Notes |
+|-----|------|---------|-------|
+| `route` | string | — (required) | Full path, route name, or path prefix. |
+| `repo` | string | — (required) | A registered, enabled `repo_id`. |
+
+Resolution stops at the first tier that matches, reported in `match`: `path`
+(exact `route_path`, else label), `route_name`, `path_pattern` (a route
+`{placeholder}` matches any segment, its name ignored; a query placeholder
+matches only a route placeholder), `path_prefix` (every route under the path),
+then `ancestor_prefix` (the longest indexed routes whose path is a prefix of
+the query; `notes` warns that the exact route may be missing from the index).
+No match returns `resolved: false`, `node_not_found`, and up to 8 closest route
+paths and names in `suggestions`.
+
+Each route lists `guards` (`guarded_by` edges from the route node, i.e.
+security.yaml `access_control` rules proved to match it) and its `handlers`.
+Each handler carries `class`, `guards` (method- and class-level `#[IsGranted]`,
+`scope` `method` or `class`) and `access_checks` (`checks_access` edges:
+in-body `isGranted()`, `denyAccessUnlessGranted()` or configured `can*` calls,
+with `call`, `kind` and `conditional`). `kind` is `framework` for `isGranted()`
+and `denyAccessUnlessGranted()`, `pattern` for a name-matched helper (from the
+edge's `check_kind`, else derived from `check_call`). The guard mechanism
+(`attribute`) is read from the edge first. `coverage` splits routes into three
+exclusive buckets: `guarded_or_framework_checked`, `pattern_check_only` (not
+counted as checked: the index cannot see what the helper does) and
+`no_indexed_check`. `no_indexed_check` does not mean unprotected: `notes`
+always states what is not modelled. When the generation has no
+`guarded_by` or no `checks_access` edges at all, `degraded` carries
+`guards_not_indexed` or `access_checks_not_indexed`.
+
+### `controller_outline`
+Every route of a controller in source order, each with the same route card as
+`route_handler`, plus each class's class-level guards and the same `coverage`.
+
+| Arg | Type | Default | Notes |
+|-----|------|---------|-------|
+| `target` | string | — (required) | Repo-relative or absolute controller file, a trailing path part (`TimeTracking/TeamController.php`), a directory, or a class name or FQCN. |
+| `repo` | string | — (required) | A registered, enabled `repo_id`. |
+
+`match` is `file`, `file_suffix`, `directory` or `class`. A miss returns up to 8
+closest controller files in `suggestions`. At most 500 routes are reported
+(`truncated`).
 
 ### `context_pack`
 Evidence cards (citations, snippets, confidence) for a goal, truncated to a

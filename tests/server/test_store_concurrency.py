@@ -98,8 +98,11 @@ def test_readers_never_see_a_half_built_generation(store_with_two_generations):
         t.start()
     for t in threads:
         t.join(timeout=10)
-    assert seen and all(count == seen[0] for count in seen)
-    assert seen[0] > 0
+    # Readers that arrive during the load are served the previous generation
+    # (1 node) rather than waiting; the rest get the new one (2 nodes). Never
+    # anything in between.
+    assert seen and set(seen) <= {1, 2}
+    assert store.generation.generation_id == "gen-2"
 
 
 def test_a_stale_capture_never_reloads_over_a_newer_generation(store_with_two_generations):
@@ -165,3 +168,38 @@ def test_a_stale_capture_never_reloads_over_a_newer_generation(store_with_two_ge
     assert not any(target.endswith("gen-1") for target in reloads[1:]), (
         f"reloaded a stale generation after gen-2 was loaded: {reloads}"
     )
+
+
+def test_a_slow_reload_does_not_block_readers(store_with_two_generations):
+    """A reload must not run under the write lock: while one thread loads the
+    new generation, other tool calls keep getting the previous one without
+    waiting. The health probe after the 2026-11-10 14:48 publish timed out
+    after 20 s because every call queued behind the load."""
+    store, publish_next = store_with_two_generations
+    store.ensure_fresh()
+    publish_next()
+
+    loading = threading.Event()
+    release = threading.Event()
+    original = store._try_reload
+
+    def slow_reload(target, mtime, embeddings_target):
+        loading.set()
+        assert release.wait(timeout=10)
+        return original(target, mtime, embeddings_target)
+
+    store._try_reload = slow_reload  # type: ignore[method-assign]
+    loader = threading.Thread(target=lambda: store.generation)
+    loader.start()
+    assert loading.wait(timeout=10)
+
+    served: list[str] = []
+    reader = threading.Thread(target=lambda: served.append(store.generation.generation_id))
+    reader.start()
+    reader.join(timeout=2)
+    assert not reader.is_alive(), "reader waited for the reload"
+    assert served == ["gen-1"]
+
+    release.set()
+    loader.join(timeout=10)
+    assert store.generation.generation_id == "gen-2"
