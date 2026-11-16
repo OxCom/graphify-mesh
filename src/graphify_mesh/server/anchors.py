@@ -94,11 +94,16 @@ def _alias_members(
 
 def _neighbor_keys(
     key: str, generation: Generation, repo_filter: frozenset[str] | None
-) -> set[str]:
+) -> tuple[set[str], set[str]]:
+    """(neighbours in other files, neighbours in the candidate's own file)."""
     node_id = generation.node_id_by_key.get(key)
     if node_id is None:
-        return set()
-    keys: set[str] = set()
+        return set(), set()
+    own_node = generation.node_by_id.get(node_id, {})
+    # A file is (repo, path): two repos can both hold `src/Controller.php`.
+    own_file = (own_node.get("repo"), own_node.get("source_file"))
+    other_file: set[str] = set()
+    same_file: set[str] = set()
     for neighbor_id, edge in generation.adjacency.get(node_id, []):
         # Ignores the caller's `include_inferred` on purpose: a pin must rest
         # on EXTRACTED evidence only.
@@ -110,8 +115,12 @@ def _neighbor_keys(
         neighbor_node = generation.node_by_id.get(neighbor_id, {})
         if repo_filter is not None and neighbor_node.get("repo") not in repo_filter:
             continue
-        keys.add(neighbor_key)
-    return keys
+        neighbor_file = (neighbor_node.get("repo"), neighbor_node.get("source_file"))
+        if own_file[1] and neighbor_file == own_file:
+            same_file.add(neighbor_key)
+        else:
+            other_file.add(neighbor_key)
+    return other_file, same_file
 
 
 def _full_token_keys(
@@ -162,7 +171,7 @@ def _candidate_scores(
         for token in needed:
             token_keys[token] = _full_token_keys(token, generation, repo_filter)
     else:
-        probe = set(via).union(*neighbors_by_key.values())
+        probe = set(via).union(*(other | same for other, same in neighbors_by_key.values()))
         key_docs = {key: cache.doc_ids_by_key[key] for key in probe if key in cache.doc_ids_by_key}
         doc_ids = {doc_id for ids in key_docs.values() for doc_id in ids}
         for token in needed:
@@ -170,15 +179,20 @@ def _candidate_scores(
 
     scores: list[tuple[str, float]] = []
     for key, via_tokens in via.items():
-        neighbors = neighbors_by_key[key]
+        other_file, same_file = neighbors_by_key[key]
         score = 0.0
         for token in tokens:
             if token in via_tokens:
                 continue
             keys = token_keys[token]
-            if key in keys:
+            own = key in keys
+            if own:
                 score += token_idf[token]
-            if not neighbors.isdisjoint(keys):
+            # A same-file sibling may corroborate a token the candidate matches
+            # itself, never supply one: a method summing its file's getters was
+            # pinned on their words. Trade-off: a node whose query words come
+            # only from same-file siblings is not pinned and ranks as fused.
+            if not other_file.isdisjoint(keys) or (own and not same_file.isdisjoint(keys)):
                 score += token_idf[token]
         scores.append((key, score))
     scores.sort(key=lambda kv: (-kv[1], kv[0]))

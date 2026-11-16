@@ -1,0 +1,814 @@
+{
+ "manifest": {
+  "generation_id": "gen-routes-v2"
+ },
+ "repo": "demo.app",
+ "repo_root": "/srv/demo",
+ "graph": {
+  "nodes": [
+   {
+    "id": "s_c_user",
+    "repo": "demo.app",
+    "label": "UserController",
+    "source_file": "src/Controller/Admin/UserController.php",
+    "source_location": "L12"
+   },
+   {
+    "id": "s_m_list",
+    "repo": "demo.app",
+    "label": ".list()",
+    "source_file": "src/Controller/Admin/UserController.php",
+    "source_location": "L20"
+   },
+   {
+    "id": "s_m_edit",
+    "repo": "demo.app",
+    "label": ".edit()",
+    "source_file": "src/Controller/Admin/UserController.php",
+    "source_location": "L30"
+   },
+   {
+    "id": "s_m_delete",
+    "repo": "demo.app",
+    "label": ".delete()",
+    "source_file": "src/Controller/Admin/UserController.php",
+    "source_location": "L40"
+   },
+   {
+    "id": "s_c_report",
+    "repo": "demo.app",
+    "label": "ReportController",
+    "source_file": "src/Controller/Admin/ReportController.php",
+    "source_location": "L9"
+   },
+   {
+    "id": "s_m_show",
+    "repo": "demo.app",
+    "label": ".show()",
+    "source_file": "src/Controller/Admin/ReportController.php",
+    "source_location": "L15"
+   },
+   {
+    "id": "s_m_export",
+    "repo": "demo.app",
+    "label": ".export()",
+    "source_file": "src/Controller/Admin/ReportController.php",
+    "source_location": "L25"
+   },
+   {
+    "id": "s_g_admin",
+    "repo": "demo.app",
+    "label": "ROLE_ADMIN",
+    "source_file": "",
+    "_kind": "access_guard",
+    "provider": "symfony",
+    "guard_kind": "authorization",
+    "guard_key": "ROLE_ADMIN",
+    "guard_literal": true
+   },
+   {
+    "id": "s_g_full",
+    "repo": "demo.app",
+    "label": "IS_AUTHENTICATED_FULLY",
+    "source_file": "",
+    "_kind": "access_guard",
+    "provider": "symfony",
+    "guard_kind": "authentication",
+    "guard_key": "IS_AUTHENTICATED_FULLY",
+    "guard_literal": true
+   },
+   {
+    "id": "s_g_voter",
+    "repo": "demo.app",
+    "label": "post.owner",
+    "source_file": "",
+    "_kind": "access_guard",
+    "provider": "symfony",
+    "guard_kind": "unknown",
+    "guard_key": "post.owner",
+    "guard_literal": true
+   },
+   {
+    "id": "s_k_granted",
+    "repo": "demo.app",
+    "label": "ROLE_AUDITOR",
+    "source_file": "src/Controller/Admin/ReportController.php",
+    "_kind": "access_guard",
+    "guard_literal": true
+   },
+   {
+    "id": "s_k_subject",
+    "repo": "demo.app",
+    "label": "Report::EXPORT",
+    "source_file": "src/Controller/Admin/ReportController.php",
+    "_kind": "access_guard",
+    "guard_literal": false
+   },
+   {
+    "id": "s_k_can",
+    "repo": "demo.app",
+    "label": "canExport",
+    "source_file": "src/Controller/Admin/ReportController.php",
+    "_kind": "access_guard",
+    "guard_literal": false
+   },
+   {
+    "id": "s_r_users",
+    "repo": "demo.app",
+    "label": "/admin/users",
+    "source_file": "src/Controller/Admin/UserController.php",
+    "source_location": "L19",
+    "_kind": "http_route",
+    "route_schema": 2,
+    "route_path": "/admin/users",
+    "route_name": "admin_users",
+    "http_methods": [
+     "GET"
+    ],
+    "route_complete": true,
+    "declared_in": "src/Controller/Admin/UserController.php",
+    "provider": "symfony",
+    "route_template": "/admin/users",
+    "effective_guards": [
+     "s_g_admin"
+    ],
+    "authorization_state": "covered",
+    "authorization_reason": ""
+   },
+   {
+    "id": "s_r_edit",
+    "repo": "demo.app",
+    "label": "/admin/users/{id}/edit",
+    "source_file": "src/Controller/Admin/UserController.php",
+    "source_location": "L29",
+    "_kind": "http_route",
+    "route_schema": 2,
+    "route_path": "/admin/users/{id}/edit",
+    "route_name": "admin_user_edit",
+    "http_methods": [
+     "GET",
+     "POST"
+    ],
+    "route_complete": true,
+    "declared_in": "src/Controller/Admin/UserController.php",
+    "provider": "symfony",
+    "route_template": "/admin/users/{id}/edit",
+    "effective_guards": [
+     "s_g_admin"
+    ],
+    "authorization_state": "covered",
+    "authorization_reason": ""
+   },
+   {
+    "id": "s_r_delete",
+    "repo": "demo.app",
+    "label": "/admin/users/{id}",
+    "source_file": "src/Controller/Admin/UserController.php",
+    "source_location": "L39",
+    "_kind": "http_route",
+    "route_schema": 2,
+    "route_path": "/admin/users/{id}",
+    "route_name": "admin_user_delete",
+    "http_methods": [
+     "DELETE"
+    ],
+    "route_complete": true,
+    "declared_in": "src/Controller/Admin/UserController.php",
+    "provider": "symfony",
+    "route_template": "/admin/users/{id}",
+    "effective_guards": [
+     "s_g_admin",
+     "s_g_voter"
+    ],
+    "authorization_state": "undecided",
+    "authorization_reason": "voter-undecided"
+   },
+   {
+    "id": "s_r_show",
+    "repo": "demo.app",
+    "label": "/admin/reports/{id}",
+    "source_file": "src/Controller/Admin/ReportController.php",
+    "source_location": "L14",
+    "_kind": "http_route",
+    "route_schema": 2,
+    "route_path": "/admin/reports/{id}",
+    "route_name": "admin_report_show",
+    "http_methods": [
+     "GET"
+    ],
+    "route_complete": true,
+    "declared_in": "src/Controller/Admin/ReportController.php",
+    "provider": "symfony",
+    "route_template": "/admin/reports/{id}",
+    "effective_guards": [
+     "s_g_full"
+    ],
+    "authorization_state": "not_proven",
+    "authorization_reason": ""
+   },
+   {
+    "id": "s_r_export",
+    "repo": "demo.app",
+    "label": "/admin/reports/{id}/export",
+    "source_file": "src/Controller/Admin/ReportController.php",
+    "source_location": "L24",
+    "_kind": "http_route",
+    "route_schema": 2,
+    "route_path": "/admin/reports/{id}/export",
+    "route_name": "admin_report_export",
+    "http_methods": [
+     "GET"
+    ],
+    "route_complete": true,
+    "declared_in": "src/Controller/Admin/ReportController.php",
+    "provider": "symfony",
+    "route_template": "/admin/reports/{id}/export",
+    "effective_guards": [
+     "s_g_full"
+    ],
+    "authorization_state": "not_proven",
+    "authorization_reason": ""
+   },
+   {
+    "id": "l_c_post",
+    "repo": "demo.app",
+    "label": "PostController",
+    "source_file": "app/Http/Controllers/PostController.php",
+    "source_location": "L10"
+   },
+   {
+    "id": "l_m_index",
+    "repo": "demo.app",
+    "label": ".index()",
+    "source_file": "app/Http/Controllers/PostController.php",
+    "source_location": "L14"
+   },
+   {
+    "id": "l_m_show",
+    "repo": "demo.app",
+    "label": ".show()",
+    "source_file": "app/Http/Controllers/PostController.php",
+    "source_location": "L22"
+   },
+   {
+    "id": "l_m_drafts",
+    "repo": "demo.app",
+    "label": ".drafts()",
+    "source_file": "app/Http/Controllers/PostController.php",
+    "source_location": "L30"
+   },
+   {
+    "id": "l_m_feed",
+    "repo": "demo.app",
+    "label": ".feed()",
+    "source_file": "app/Http/Controllers/PostController.php",
+    "source_location": "L38"
+   },
+   {
+    "id": "l_c_page",
+    "repo": "demo.app",
+    "label": "PageController",
+    "source_file": "app/Http/Controllers/PageController.php",
+    "source_location": "L8"
+   },
+   {
+    "id": "l_m_page",
+    "repo": "demo.app",
+    "label": ".show()",
+    "source_file": "app/Http/Controllers/PageController.php",
+    "source_location": "L12"
+   },
+   {
+    "id": "l_g_auth",
+    "repo": "demo.app",
+    "label": "auth",
+    "source_file": "routes/web.php",
+    "_kind": "access_guard",
+    "provider": "laravel",
+    "guard_kind": "authentication",
+    "guard_key": "auth",
+    "guard_literal": true
+   },
+   {
+    "id": "l_g_throttle",
+    "repo": "demo.app",
+    "label": "throttle:60,1",
+    "source_file": "routes/web.php",
+    "_kind": "access_guard",
+    "provider": "laravel",
+    "guard_kind": "middleware",
+    "guard_key": "throttle:60,1",
+    "guard_literal": true
+   },
+   {
+    "id": "l_g_guest",
+    "repo": "demo.app",
+    "label": "guest",
+    "source_file": "routes/web.php",
+    "_kind": "access_guard",
+    "provider": "laravel",
+    "guard_kind": "public",
+    "guard_key": "guest",
+    "guard_literal": true
+   },
+   {
+    "id": "l_k_gate",
+    "repo": "demo.app",
+    "label": "Gate::authorize",
+    "source_file": "app/Http/Controllers/PostController.php",
+    "_kind": "access_guard",
+    "guard_literal": false
+   },
+   {
+    "id": "l_k_draft",
+    "repo": "demo.app",
+    "label": "canDraft",
+    "source_file": "app/Http/Controllers/PostController.php",
+    "_kind": "access_guard",
+    "guard_literal": false
+   },
+   {
+    "id": "l_r_index",
+    "repo": "demo.app",
+    "label": "/posts",
+    "source_file": "routes/web.php",
+    "source_location": "L5",
+    "_kind": "http_route",
+    "route_schema": 2,
+    "route_path": "/posts",
+    "route_name": "posts.index",
+    "http_methods": [
+     "GET"
+    ],
+    "route_complete": true,
+    "declared_in": "routes/web.php",
+    "provider": "laravel",
+    "route_template": "/posts",
+    "effective_guards": [
+     "l_g_auth",
+     "l_g_throttle"
+    ],
+    "authorization_state": "not_proven",
+    "authorization_reason": ""
+   },
+   {
+    "id": "l_r_show",
+    "repo": "demo.app",
+    "label": "/posts/{id?}",
+    "source_file": "routes/web.php",
+    "source_location": "L6",
+    "_kind": "http_route",
+    "route_schema": 2,
+    "route_path": "/posts/{id?}",
+    "route_name": "posts.show",
+    "http_methods": [
+     "GET"
+    ],
+    "route_complete": true,
+    "declared_in": "routes/web.php",
+    "provider": "laravel",
+    "route_template": "/posts/{id?}",
+    "effective_guards": [],
+    "authorization_state": "not_proven",
+    "authorization_reason": ""
+   },
+   {
+    "id": "l_r_drafts",
+    "repo": "demo.app",
+    "label": "/drafts",
+    "source_file": "routes/web.php",
+    "source_location": "L7",
+    "_kind": "http_route",
+    "route_schema": 2,
+    "route_path": "/drafts",
+    "route_name": "drafts",
+    "http_methods": [
+     "GET"
+    ],
+    "route_complete": true,
+    "declared_in": "routes/web.php",
+    "provider": "laravel",
+    "route_template": "/drafts",
+    "effective_guards": [],
+    "authorization_state": "not_proven",
+    "authorization_reason": ""
+   },
+   {
+    "id": "l_r_feed",
+    "repo": "demo.app",
+    "label": "/feed",
+    "source_file": "routes/web.php",
+    "source_location": "L8",
+    "_kind": "http_route",
+    "route_schema": 2,
+    "route_path": "/feed",
+    "route_name": "feed",
+    "http_methods": [
+     "GET"
+    ],
+    "route_complete": true,
+    "declared_in": "routes/web.php",
+    "provider": "laravel",
+    "route_template": "/feed",
+    "effective_guards": [
+     "l_g_guest"
+    ],
+    "authorization_state": "not_proven",
+    "authorization_reason": ""
+   },
+   {
+    "id": "l_r_health",
+    "repo": "demo.app",
+    "label": "/health",
+    "source_file": "routes/web.php",
+    "source_location": "L9",
+    "_kind": "http_route",
+    "route_schema": 2,
+    "route_path": "/health",
+    "route_name": "health",
+    "http_methods": [
+     "GET"
+    ],
+    "route_complete": true,
+    "declared_in": "routes/web.php",
+    "provider": "laravel",
+    "route_template": "/health",
+    "effective_guards": [],
+    "authorization_state": "not_proven",
+    "authorization_reason": "",
+    "handler_kind": "closure"
+   },
+   {
+    "id": "l_r_legacy",
+    "repo": "demo.app",
+    "label": "/legacy/{slug}",
+    "source_file": "routes/web.php",
+    "source_location": "L10",
+    "_kind": "http_route",
+    "route_schema": 2,
+    "route_path": "/legacy/{slug}",
+    "route_name": "legacy",
+    "http_methods": [
+     "GET"
+    ],
+    "route_complete": true,
+    "declared_in": "routes/web.php",
+    "provider": "laravel",
+    "route_template": "",
+    "effective_guards": [],
+    "authorization_state": "not_proven",
+    "authorization_reason": "",
+    "handler_kind": "unresolved",
+    "route_template_reason": "route-template-unparsed"
+   },
+   {
+    "id": "l_r_page",
+    "repo": "demo.app",
+    "label": "/{slug?}",
+    "source_file": "routes/web.php",
+    "source_location": "L11",
+    "_kind": "http_route",
+    "route_schema": 2,
+    "route_path": "/{slug?}",
+    "route_name": "pages.show",
+    "http_methods": [
+     "GET"
+    ],
+    "route_complete": true,
+    "declared_in": "routes/web.php",
+    "provider": "laravel",
+    "route_template": "/{slug?}",
+    "effective_guards": [],
+    "authorization_state": "not_proven",
+    "authorization_reason": ""
+   }
+  ],
+  "links": [
+   {
+    "source": "s_r_users",
+    "target": "s_m_list",
+    "relation": "handled_by",
+    "confidence": "EXTRACTED",
+    "provider": "symfony",
+    "_via": "attribute"
+   },
+   {
+    "source": "s_r_edit",
+    "target": "s_m_edit",
+    "relation": "handled_by",
+    "confidence": "EXTRACTED",
+    "provider": "symfony",
+    "_via": "attribute"
+   },
+   {
+    "source": "s_r_delete",
+    "target": "s_m_delete",
+    "relation": "handled_by",
+    "confidence": "EXTRACTED",
+    "provider": "symfony",
+    "_via": "attribute"
+   },
+   {
+    "source": "s_r_show",
+    "target": "s_m_show",
+    "relation": "handled_by",
+    "confidence": "EXTRACTED",
+    "provider": "symfony",
+    "_via": "attribute"
+   },
+   {
+    "source": "s_r_export",
+    "target": "s_m_export",
+    "relation": "handled_by",
+    "confidence": "EXTRACTED",
+    "provider": "symfony",
+    "_via": "attribute"
+   },
+   {
+    "source": "s_c_user",
+    "target": "s_m_list",
+    "relation": "method",
+    "confidence": "EXTRACTED"
+   },
+   {
+    "source": "s_c_user",
+    "target": "s_m_edit",
+    "relation": "method",
+    "confidence": "EXTRACTED"
+   },
+   {
+    "source": "s_c_user",
+    "target": "s_m_delete",
+    "relation": "method",
+    "confidence": "EXTRACTED"
+   },
+   {
+    "source": "s_c_report",
+    "target": "s_m_show",
+    "relation": "method",
+    "confidence": "EXTRACTED"
+   },
+   {
+    "source": "s_c_report",
+    "target": "s_m_export",
+    "relation": "method",
+    "confidence": "EXTRACTED"
+   },
+   {
+    "source": "s_c_user",
+    "target": "s_g_admin",
+    "relation": "guarded_by",
+    "confidence": "EXTRACTED",
+    "guard_scope": "class",
+    "guard_kind": "authorization",
+    "provider": "symfony",
+    "_via": "attribute",
+    "source_file": "src/Controller/Admin/UserController.php",
+    "source_location": "L11"
+   },
+   {
+    "source": "s_m_delete",
+    "target": "s_g_voter",
+    "relation": "guarded_by",
+    "confidence": "EXTRACTED",
+    "guard_scope": "method",
+    "guard_kind": "unknown",
+    "provider": "symfony",
+    "_via": "attribute",
+    "source_file": "src/Controller/Admin/UserController.php",
+    "source_location": "L38"
+   },
+   {
+    "source": "s_r_show",
+    "target": "s_g_full",
+    "relation": "guarded_by",
+    "confidence": "EXTRACTED",
+    "guard_scope": "route",
+    "guard_kind": "authentication",
+    "provider": "symfony",
+    "_via": "access_control",
+    "source_file": "config/packages/security.yaml",
+    "source_location": "L30"
+   },
+   {
+    "source": "s_r_export",
+    "target": "s_g_full",
+    "relation": "guarded_by",
+    "confidence": "EXTRACTED",
+    "guard_scope": "route",
+    "guard_kind": "authentication",
+    "provider": "symfony",
+    "_via": "access_control",
+    "source_file": "config/packages/security.yaml",
+    "source_location": "L30"
+   },
+   {
+    "source": "s_m_edit",
+    "target": "s_k_granted",
+    "relation": "checks_access",
+    "confidence": "EXTRACTED",
+    "check_call": "denyAccessUnlessGranted",
+    "check_kind": "framework",
+    "guard_kind": "authorization",
+    "provider": "symfony",
+    "conditional": false,
+    "source_file": "src/Controller/Admin/UserController.php",
+    "source_location": "L32"
+   },
+   {
+    "source": "s_m_show",
+    "target": "s_k_granted",
+    "relation": "checks_access",
+    "confidence": "EXTRACTED",
+    "check_call": "isGranted",
+    "check_kind": "framework",
+    "guard_kind": "authorization",
+    "provider": "symfony",
+    "conditional": false,
+    "source_file": "src/Controller/Admin/ReportController.php",
+    "source_location": "L17"
+   },
+   {
+    "source": "s_m_export",
+    "target": "s_k_subject",
+    "relation": "checks_access",
+    "confidence": "EXTRACTED",
+    "check_call": "isGranted",
+    "check_kind": "framework",
+    "guard_kind": "unknown",
+    "provider": "symfony",
+    "conditional": false,
+    "source_file": "src/Controller/Admin/ReportController.php",
+    "source_location": "L27"
+   },
+   {
+    "source": "s_m_export",
+    "target": "s_k_can",
+    "relation": "checks_access",
+    "confidence": "EXTRACTED",
+    "check_call": "canExport",
+    "check_kind": "pattern",
+    "guard_kind": "authorization",
+    "provider": "symfony",
+    "conditional": false,
+    "source_file": "src/Controller/Admin/ReportController.php",
+    "source_location": "L28"
+   },
+   {
+    "source": "l_r_index",
+    "target": "l_m_index",
+    "relation": "handled_by",
+    "confidence": "EXTRACTED",
+    "provider": "laravel",
+    "_via": "route_file"
+   },
+   {
+    "source": "l_r_show",
+    "target": "l_m_show",
+    "relation": "handled_by",
+    "confidence": "EXTRACTED",
+    "provider": "laravel",
+    "_via": "route_file"
+   },
+   {
+    "source": "l_r_drafts",
+    "target": "l_m_drafts",
+    "relation": "handled_by",
+    "confidence": "EXTRACTED",
+    "provider": "laravel",
+    "_via": "route_file"
+   },
+   {
+    "source": "l_r_feed",
+    "target": "l_m_feed",
+    "relation": "handled_by",
+    "confidence": "EXTRACTED",
+    "provider": "laravel",
+    "_via": "route_file"
+   },
+   {
+    "source": "l_r_page",
+    "target": "l_m_page",
+    "relation": "handled_by",
+    "confidence": "EXTRACTED",
+    "provider": "laravel",
+    "_via": "route_file"
+   },
+   {
+    "source": "l_c_post",
+    "target": "l_m_index",
+    "relation": "method",
+    "confidence": "EXTRACTED"
+   },
+   {
+    "source": "l_c_post",
+    "target": "l_m_show",
+    "relation": "method",
+    "confidence": "EXTRACTED"
+   },
+   {
+    "source": "l_c_post",
+    "target": "l_m_drafts",
+    "relation": "method",
+    "confidence": "EXTRACTED"
+   },
+   {
+    "source": "l_c_post",
+    "target": "l_m_feed",
+    "relation": "method",
+    "confidence": "EXTRACTED"
+   },
+   {
+    "source": "l_c_page",
+    "target": "l_m_page",
+    "relation": "method",
+    "confidence": "EXTRACTED"
+   },
+   {
+    "source": "l_r_index",
+    "target": "l_g_auth",
+    "relation": "guarded_by",
+    "confidence": "EXTRACTED",
+    "guard_scope": "route",
+    "guard_kind": "authentication",
+    "provider": "laravel",
+    "_via": "middleware",
+    "source_file": "routes/web.php",
+    "source_location": "L5"
+   },
+   {
+    "source": "l_r_index",
+    "target": "l_g_throttle",
+    "relation": "guarded_by",
+    "confidence": "EXTRACTED",
+    "guard_scope": "route",
+    "guard_kind": "middleware",
+    "provider": "laravel",
+    "_via": "middleware",
+    "source_file": "routes/web.php",
+    "source_location": "L5"
+   },
+   {
+    "source": "l_r_feed",
+    "target": "l_g_guest",
+    "relation": "guarded_by",
+    "confidence": "EXTRACTED",
+    "guard_scope": "route",
+    "guard_kind": "public",
+    "provider": "laravel",
+    "_via": "middleware",
+    "source_file": "routes/web.php",
+    "source_location": "L8"
+   },
+   {
+    "source": "l_m_show",
+    "target": "l_k_gate",
+    "relation": "checks_access",
+    "confidence": "EXTRACTED",
+    "check_call": "Gate::authorize",
+    "check_kind": "framework",
+    "guard_kind": "unknown",
+    "provider": "laravel",
+    "conditional": false,
+    "source_file": "app/Http/Controllers/PostController.php",
+    "source_location": "L24"
+   },
+   {
+    "source": "l_m_drafts",
+    "target": "l_k_draft",
+    "relation": "checks_access",
+    "confidence": "EXTRACTED",
+    "check_call": "canDraft",
+    "check_kind": "pattern",
+    "guard_kind": "authorization",
+    "provider": "laravel",
+    "conditional": false,
+    "source_file": "app/Http/Controllers/PostController.php",
+    "source_location": "L32"
+   }
+  ]
+ },
+ "queries": {
+  "route_handler": [
+   "/admin/users",
+   "/posts/{id?}",
+   "/legacy/{slug}",
+   "posts.index",
+   "/admin/users/42",
+   "/posts/7",
+   "/posts",
+   "/admin/reports",
+   "/",
+   "/admin/users/42/edit/history",
+   "missing.route"
+  ],
+  "controller_outline": [
+   "app/Http/Controllers/PostController.php",
+   "routes/web.php",
+   "src/Controller/Admin",
+   "PostController",
+   "App\\Controller\\Admin\\ReportController",
+   "Missing.php"
+  ]
+ }
+}

@@ -5,9 +5,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from conftest import build_generation, make_link, make_node
 
 from graphify_mesh.server.config import ServerConfig
 from graphify_mesh.server.store import (
+    Generation,
     GenerationStore,
     GenerationUnavailableError,
     validate_manifest_consistency,
@@ -715,3 +717,60 @@ def test_embeddings_symlink_flip_alone_triggers_a_reload(tmp_path):
     assert generation.generation_id == "gen-1"
     assert "repo.a" in generation.embeddings
     assert "embeddings_generation_mismatch" not in store.degraded
+
+
+def _index_snapshot(generation: Generation) -> dict:
+    return {
+        "node_ids": sorted(generation.node_by_id),
+        "nodes_by_repo": {repo: sorted(ids) for repo, ids in generation.nodes_by_repo.items()},
+        "degree": {node_id: generation.degree(node_id) for node_id in generation.adjacency},
+        "key_by_node_id": dict(generation.key_by_node_id),
+        "node_id_by_key": dict(generation.node_id_by_key),
+        "relations": generation.relations,
+    }
+
+
+def _indexing_fixture() -> Generation:
+    nodes = [
+        make_node("repo.a", "Alpha", "a.py"),
+        make_node("repo.a", "Beta", "b.py"),
+        make_node("repo.b", "Gamma", "c.py"),
+    ]
+    links = [
+        make_link("repo.a:Alpha", "repo.a:Beta", relation="calls"),
+        make_link("repo.a:Beta", "repo.b:Gamma", relation="imports"),
+    ]
+    return build_generation(nodes, links)
+
+
+def test_build_indexes_twice_equals_one_call():
+    generation = _indexing_fixture()
+    once = _index_snapshot(generation)
+    assert once["degree"] == {"repo.a:Alpha": 1, "repo.a:Beta": 2, "repo.b:Gamma": 1}
+
+    generation.build_indexes()
+
+    assert _index_snapshot(generation) == once
+    assert len(generation.nodes_by_repo["repo.a"]) == 2
+
+
+def test_build_indexes_rebuild_drops_removed_nodes_and_links():
+    generation = _indexing_fixture()
+    generation.graph["nodes"] = [n for n in generation.graph["nodes"] if n["label"] != "Gamma"]
+    generation.graph["links"] = generation.graph["links"][:1]
+
+    generation.build_indexes()
+
+    fresh = Generation(
+        generation_id=generation.generation_id,
+        manifest=generation.manifest,
+        graph=generation.graph,
+        overlay=generation.overlay,
+        lexical=generation.lexical,
+        embeddings={},
+    )
+    fresh.build_indexes()
+    assert _index_snapshot(generation) == _index_snapshot(fresh)
+    assert "repo.b" not in generation.nodes_by_repo
+    assert "repo.b:Gamma" not in generation.adjacency
+    assert generation.relations == frozenset({"calls"})

@@ -88,6 +88,14 @@ class Generation:
     stale_keys: frozenset[str] = field(default_factory=frozenset)
 
     def build_indexes(self) -> None:
+        # Rebuilds every derived index from empty, so a second call (or a call
+        # after `graph` changed) never appends duplicate adjacency entries or
+        # keeps entries for nodes that are gone.
+        node_by_id: dict = {}
+        nodes_by_repo: dict = {}
+        adjacency: dict = {}
+        key_by_node_id: dict = {}
+        node_id_by_key: dict = {}
         relations: set[str] = set()
         self.stale_keys = lexical_read.stale_semantic_keys(self.lexical)
         # Keys must match the ones sync wrote into this generation's lexical
@@ -101,9 +109,9 @@ class Generation:
         for node in self.graph.get("nodes", []):
             if not isinstance(node, dict) or "id" not in node:
                 continue
-            self.node_by_id[node["id"]] = node
+            node_by_id[node["id"]] = node
             repo_id = node.get("repo")
-            self.nodes_by_repo.setdefault(repo_id, []).append(node["id"])
+            nodes_by_repo.setdefault(repo_id, []).append(node["id"])
             if repo_id:
                 key = (
                     qualified_keys.get(node["id"])
@@ -111,19 +119,24 @@ class Generation:
                     else node_key(repo_id, node)
                 )
                 if key is not None:
-                    self.key_by_node_id[node["id"]] = key
-                    self.node_id_by_key[key] = node["id"]
+                    key_by_node_id[node["id"]] = key
+                    node_id_by_key[key] = node["id"]
         for link in self.graph.get("links", self.graph.get("edges", [])):
             if not isinstance(link, dict):
                 continue
             src, dst = link.get("source"), link.get("target")
             if src is None or dst is None:
                 continue
-            self.adjacency.setdefault(src, []).append((dst, link))
-            self.adjacency.setdefault(dst, []).append((src, link))
+            adjacency.setdefault(src, []).append((dst, link))
+            adjacency.setdefault(dst, []).append((src, link))
             relation = link.get("relation")
             if isinstance(relation, str) and relation:
                 relations.add(relation)
+        self.node_by_id = node_by_id
+        self.nodes_by_repo = nodes_by_repo
+        self.adjacency = adjacency
+        self.key_by_node_id = key_by_node_id
+        self.node_id_by_key = node_id_by_key
         self.relations = frozenset(relations)
 
     def degree(self, node_id: str) -> int:

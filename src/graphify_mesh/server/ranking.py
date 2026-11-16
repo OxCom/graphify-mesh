@@ -76,7 +76,15 @@ TEST_DIR_NAMES = frozenset({"test", "tests", "__tests__", "spec", "specs", "test
 TEST_FILE_PATTERN = re.compile(
     r"(^test_.*\.py$|_test\.(py|go)$|Test\.php$|Tests?\.(cs|java|kt)$|\.(test|spec)\.[cm]?[jt]sx?$)"
 )
-TEST_QUERY_PATTERN = re.compile(r"test|\bspecs?\b|fixture", re.IGNORECASE)
+# Matched against whole query words after camelCase, snake_case and path
+# splitting (`_query_words`), so "UserServiceTest" asks for tests while
+# "latest" and "majestic" do not.
+TEST_QUERY_PATTERN = re.compile(
+    r"^(tests?|testing|testcases?|pytest|unittest|specs?|fixtures?|phpunit|jest|cypress|e2e"
+    r"|mock\w*)$",
+    re.IGNORECASE,
+)
+_QUERY_WORD_SPLIT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 # Confidence handling is an allowlist: only EXTRACTED edges are followed by
 # default in traversal (structural candidates, similar, neighbors). graphify
@@ -94,6 +102,8 @@ CONFIDENCE_AMBIGUOUS = "AMBIGUOUS"
 # Trade-off between relevance (fused score) and novelty vs already-selected
 # results. 1.0 = pure relevance (no diversification), 0.0 = pure novelty.
 MMR_LAMBDA = 0.7
+# Rank whose score bounds the relevance spread that scales the MMR penalty.
+MMR_SCALE_DEPTH = 10
 
 # --- Tool contracts -----------------------------------------------------
 
@@ -184,7 +194,7 @@ def is_test_path(path: str) -> bool:
 
 def query_mentions_tests(query: str) -> bool:
     """True when the query asks for tests, so test code is not demoted."""
-    return bool(TEST_QUERY_PATTERN.search(query or ""))
+    return any(TEST_QUERY_PATTERN.match(word) for word in _QUERY_WORD_SPLIT.split(query or ""))
 
 
 def _structural_similarity_proxy(key_a: str, key_b: str, path_by_key: dict[str, str]) -> float:
@@ -199,6 +209,23 @@ def _structural_similarity_proxy(key_a: str, key_b: str, path_by_key: dict[str, 
     if path_a and path_a == path_b:
         return 0.9
     return 0.0
+
+
+def mmr_penalty_scale(scores: list[float]) -> float:
+    """Scale for the MMR similarity penalty: the relevance spread between the
+    best score and the `MMR_SCALE_DEPTH`-th best, so penalty and relevance sit
+    on one scale. Fused RRF scores sit near 0.016-0.05 while the similarity
+    proxy is 0.9; unscaled, the penalty pushed every same-file second hit
+    below all other candidates. A fixed depth, not the caller's `k`, so a
+    top-3 is always a prefix of the top-5; not the whole pool either, whose
+    near-zero tail would make the penalty dwarf the gaps it competes with.
+    Scores that all tie carry no relevance signal: the penalty keeps its
+    unscaled weight (1.0) and decides the order alone."""
+    if not scores:
+        return 1.0
+    ordered = sorted(scores, reverse=True)
+    spread = ordered[0] - ordered[min(MMR_SCALE_DEPTH, len(ordered)) - 1]
+    return spread if spread > 0 else 1.0
 
 
 def mmr_select(
@@ -226,6 +253,7 @@ def mmr_select(
     if not scored_candidates:
         return []
 
+    penalty_scale = mmr_penalty_scale([score for _, score in scored_candidates])
     # Mutable pool entries: [key, score, running max_sim vs selected].
     pool: list[list] = [[key, score, 0.0] for key, score in scored_candidates]
     selected: list[str] = []
@@ -257,7 +285,7 @@ def mmr_select(
             sim = _structural_similarity_proxy(entry[0], last_selected, path_by_key)
             if sim > entry[2]:
                 entry[2] = sim
-            value = lam * entry[1] - (1 - lam) * entry[2]
+            value = lam * entry[1] - (1 - lam) * entry[2] * penalty_scale
             rank = (-value, entry[0])
             if best_rank is None or rank < best_rank:
                 best_rank = rank

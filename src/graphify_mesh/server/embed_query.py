@@ -99,6 +99,27 @@ def _classify(exc: Exception) -> str:
     return REASON_UNREACHABLE
 
 
+# Qwen3-Embedding is instruction-aware: its model card formats a query as
+# f"Instruct: {task}\nQuery:{query}" (no space after "Query:") and embeds
+# documents bare. The sync pipeline embeds nodes bare, so only the query side
+# gets the instruction, and only for that model family. Matched on the last
+# path segment of the model name, so registry namespaces such as
+# `hf.co/Qwen/Qwen3-Embedding-0.6B-GGUF` are recognised too.
+QUERY_INSTRUCTION_MODEL_PREFIX = "qwen3-embedding"
+# The model card's own example task. A code-specific task string measured
+# lower on the rank goldens.
+QUERY_INSTRUCTION_TASK = (
+    "Given a web search query, retrieve relevant passages that answer the query"
+)
+
+
+def instruct_query(model: str, query: str) -> str:
+    """`query` as the embedding model expects it at search time."""
+    if not model.rsplit("/", 1)[-1].lower().startswith(QUERY_INSTRUCTION_MODEL_PREFIX):
+        return query
+    return f"Instruct: {QUERY_INSTRUCTION_TASK}\nQuery:{query}"
+
+
 class QueryEmbedder:
     """Callable matching `retrieval.EmbedQueryFn` (`str -> list[float] | None`),
     plus a `last_failure_reason` attribute the caller reads via `getattr` so
@@ -139,7 +160,9 @@ class QueryEmbedder:
             # per-query noise the cooldown exists to remove.
             return None
         try:
-            vectors = embed_batch(self.base_url, self.model, [query], timeout=self.timeout)
+            vectors = embed_batch(
+                self.base_url, self.model, [instruct_query(self.model, query)], timeout=self.timeout
+            )
         except RuntimeError as exc:
             reason = _classify(exc)
             self._record_failure(reason)

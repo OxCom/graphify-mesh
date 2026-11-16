@@ -177,7 +177,10 @@ the file node only; a YAML/JSON key node's label alias is its dotted key path), 
 `anchor`, then `fused` for the ranked hybrid results. A query token whose alias
 (`t` or `.t()`) names 1 to 10 nodes makes those nodes anchor candidates, each
 scored by the idf of the other query tokens found in its own fields and in its
-depth-1 EXTRACTED neighbours. At most two candidates are pinned, each only if it
+depth-1 EXTRACTED neighbours. A neighbour in the candidate's own file (same
+repo and path) counts for a token only when the candidate matches that token
+itself: it can confirm a query word, never supply one
+(`server/anchors.py:_candidate_scores`). At most two candidates are pinned, each only if it
 scores at least 10 and at least twice the next candidate; otherwise no `anchor`
 hit appears and ranking is unchanged. The idf is corpus-wide, not per scope.
 `cross_project` and `context_pack` rank through the same code, so anchors apply
@@ -192,14 +195,41 @@ schema version unchanged). Ranking multiplies a stale node's fused score by
 `STALE_SEMANTIC_PENALTY` (`server/ranking.py`, 0.5; 1.0 disables). Stale nodes are
 demoted, never dropped, and an exact-alias hit is flagged but not demoted.
 
-Test code is ranked below source unless the query asks for tests (it contains
-`test`, `spec`/`specs` or `fixture`, case-insensitive). A test node is one under
+Test code is ranked below source unless the query asks for tests
+(`TEST_QUERY_PATTERN`: it contains `test`, `spec`/`specs`, `fixture`, `phpunit`,
+`jest`, `cypress`, `e2e` or `mock`, case-insensitive). A test node is one under
 a `test`, `tests`, `__tests__`, `spec`, `specs` or `testing` directory, or a file
 named like a test (`*Test.php`, `test_*.py`, `*_test.py`, `*_test.go`,
-`*.test.ts`, `*.spec.tsx`, ...; `server/ranking.py:is_test_path`). Each
-retriever's candidate list puts test nodes after source nodes before fusion,
-and the fused score of a test node is multiplied by `TEST_PATH_PENALTY_FACTOR`
-(0.3; 1.0 disables the score penalty). Exact and anchor hits are not demoted.
+`*.test.ts`, `*.spec.tsx`, ...; `server/ranking.py:is_test_path`). The lexical
+and vector retrievers split source from test before the depth cut: each keeps
+its best source nodes up to its depth from its whole score order, then its best
+`TEST_CANDIDATE_DEPTH` (10) test nodes behind them (`server/retrieval.py`).
+Each candidate list then puts test nodes after source nodes before fusion, and
+the fused score of a test node is multiplied by `TEST_PATH_PENALTY_FACTOR`
+(0.3; 1.0 disables the score penalty). One fused result slot in every
+`TEST_RESULT_SLOT_EVERY` (10) is kept for the best remaining test hit, so with
+10 or more fused slots a test stays reachable at the tail. Exact and anchor
+hits are not demoted.
+
+Fused ranking (`server/retrieval.py:rank`):
+
+- **Lexical.** A key's score is field boost x idf, summed per query word. Each
+  query word scores once per (key, field), so a key whose label several graph
+  nodes share is not counted twice (`server/retrieval.py:lexical_candidates`).
+- **Vector.** For a model whose name (last path segment) starts with
+  `qwen3-embedding`, the query is sent as
+  `Instruct: <task>\nQuery:<query>`; documents stay bare
+  (`server/embed_query.py:instruct_query`).
+- **Structural.** Seeded from the top 10 of the exact hits, then the lexical
+  and vector lists fused, so a node only the vector side found still brings
+  its neighbours.
+- **Fusion.** Unweighted reciprocal rank fusion (`RRF_K` 60) over the three
+  lists.
+- **Diversification.** MMR (`MMR_LAMBDA` 0.7). Its similarity penalty is
+  multiplied by the score spread between the best and the
+  `MMR_SCALE_DEPTH`-th (10) best candidate, so penalty and relevance share one
+  scale; all-tied scores keep the unscaled penalty
+  (`server/ranking.py:mmr_penalty_scale`).
 
 Hits from `search`, `cross_project` and `find_similar`, and `context_pack`
 cards, carry no `community_name`: the labels proved unreliable and cost payload
@@ -348,7 +378,118 @@ Every route of a controller in source order, each with the same route card as
 
 `match` is `file`, `file_suffix`, `directory` or `class`. A miss returns up to 8
 closest controller files in `suggestions`. At most 500 routes are reported
-(`truncated`).
+(`truncated`). A route without `route_schema` is listed under its own
+`source_file`. A v2 route is listed under the files of its `handled_by` targets
+(see Route contract v2). `route_count`, `coverage` and the 500 budget count each
+route once, even when its handlers sit in two files and it is listed under both.
+
+On a generation without `route_schema`, `notes` ends with a warning:
+`guarded_or_framework_checked` counts any guard, including authentication-only
+guards (`IS_AUTHENTICATED_*`) and `roles: []` access_control rules, so it is not
+an authorization count.
+
+### Route contract v2
+A route node carrying `route_schema: 2` is read framework-neutrally. The
+schema is decided per route node, so a repo or a generation can mix v2 and
+older routes. A route without the marker keeps the reading described above.
+The guard and check edges of a handler and its class are read as v2 when the
+route or the handler is v2; a handler is v2 when any v2 route is `handled_by`
+it. The result carries `route_schema: 2` when any route of the repo is v2.
+
+Fields read from the graph:
+
+| Element | Fields |
+|---------|--------|
+| `http_route` node | `provider`, `handler_kind`, `route_path`, `route_template`, `route_template_reason`, `declared_in`, `effective_guards`, `authorization_state`, `authorization_reason` |
+| `access_guard` node | `guard_kind`, `guard_key`, `provider` (node ids are never parsed) |
+| `guarded_by` edge | `guard_kind`, `provider`, `_via`, `guard_scope` |
+| `checks_access` edge | `check_kind`, `guard_kind`, `provider`, `check_call` |
+| `handled_by` edge | `_via`, `provider` |
+
+Each v2 route card adds:
+
+- `provider` and `handler_kind`: `method`, `closure` or `unresolved`. When the
+  node has no valid `handler_kind`, it is derived: `method` with a `handled_by`
+  edge, else `unresolved`. A `closure` or `unresolved` route has an empty
+  `handlers` list. `controller_outline` lists it under its `declared_in` file.
+- `route_template` and `route_template_reason` (`""` when nothing applies;
+  `route-template-unparsed` comes with an empty template).
+- `declared_in`, made repo-relative against the registered repo root. An
+  absolute path outside the root, or with no root to check against, a Windows
+  path (drive letter, backslash-rooted or UNC), and a relative path that
+  leaves the repo become `""`, never the host path.
+  The server passes the registered root to both `route_handler` and
+  `controller_outline`. Every other path a v2 card emits follows the same
+  rule: the card's and each handler's `source_file` and `citation`, guard and
+  check citations, and the files `controller_outline` lists a route under. A
+  card's or handler's `key` is `null` when the node's `source_file` is a host
+  path, since the key embeds that path.
+- `http_methods`: a list of strings; any other value counts as absent (`[]`).
+- `effective_guards`, each with `guard`, `kind`, `key` and `provider`. An id is
+  kept only when it resolves to an `access_guard` node of the same repo.
+- `authorization_state` (`covered`, `no_proven_authorization` for the
+  producer's `not_proven`, or `undecided`) and `authorization_reason`. A
+  missing or unknown state counts as `undecided` with reason
+  `authorization-state-missing`.
+- `mesh_reason`: `""`, or the reason the mesh overrides the producer's state
+  (see below).
+
+Guards add `kind`, `provider`, `via` and `key`. Checks add `guard_kind` and
+`provider`. Handlers add `via` and `provider`. Every v2 field must be a string,
+or a list of strings for `effective_guards`. A value of any other type counts
+as absent.
+
+`check_kind` comes from the edge only: `framework`, anything else counts as
+`pattern`. The `isGranted`/`denyAccessUnlessGranted` name fallback applies only
+to unversioned routes.
+
+Path matching reads `route_template`. `{name}` matches one segment, and trailing
+`{name?}` segments may be left out, so `/user/{id?}` matches `/user` and
+`/user/42`, and `/{slug?}` matches `/`. The full-path tier accepts `route_path`
+or `route_template`. A route with an empty template is skipped by the wildcard
+tier. The prefix tiers still list it through its `route_path`. Whenever the
+wildcard tier runs while such a route exists in the repo, the result has
+`complete: false` and `degraded` carries `route_template_missing`.
+
+`coverage` puts each v2 route in the first matching bucket:
+
+1. `undecided` when `mesh_reason` is set.
+2. `authorization_covered`: `authorization_state` is `covered`.
+3. `undecided`: state `undecided`. `undecided_reasons` counts each reason,
+   preferring `mesh_reason`.
+4. `framework_check_only`: a `checks_access` edge with `check_kind: framework`
+   and `guard_kind: authorization`.
+5. `authentication_only`: an effective guard of kind `authentication`, or a
+   framework check of kind `authentication`.
+6. `public_declared`: an effective guard of kind `public`.
+7. `undecided`: a framework check of another `guard_kind`, such as `unknown`
+   (an unresolved subject), and nothing above. Its reason is
+   `access-check-kind-unknown`.
+8. `pattern_check_only`: a `check_kind: pattern` edge and nothing above.
+9. `no_indexed_check`: nothing above. This does not mean the route is open.
+
+The mesh sets `mesh_reason`, overriding the producer's state, for producer data
+that contradicts itself:
+
+| `mesh_reason` | When |
+|---------------|------|
+| `guard-missing` | An `effective_guards` id resolves to no node, a node of another repo, or a node that is not an `access_guard`. `degraded` carries `effective_guard_unresolved`. |
+| `producer-inconsistent` | `handler_kind` `method` without a `handled_by` edge, or `closure`/`unresolved` with one. `covered` with no effective guard of kind `authorization`. `not_proven` with an effective guard of kind `authorization`, or with empty or absent `effective_guards` while a `guarded_by` edge of kind `authorization` sits on the route, handler or class. A framework `checks_access` edge without a `guard_kind`, or with one outside the contract set (which also adds `route_field_invalid`). `degraded` carries `route_producer_inconsistent`. |
+
+When a result holds both v2 and unversioned routes, `coverage` reports the v2
+buckets and nests the legacy buckets under `legacy`. `routes` counts all of
+them. `degraded` also carries `route_field_invalid` when a v2 field had the
+wrong type or an `authorization_state`/`handler_kind` outside its enum, and `declared_in_outside_repo` when any v2 path was withheld. `controller_outline` reports it also for a path withheld while listing the repo's routes by file, so a route listed under no file still leaves the marker.
+
+A result with no routes, such as a miss, takes its `coverage` shape from the
+repo. When any route node of the repo is v2 (the result carries
+`route_schema: 2`), `coverage` holds every v2 bucket and `routes` at `0`, with
+`undecided_reasons: {}`. A repo without v2 route nodes keeps the legacy keys.
+
+Notes avoid framework terms. The Symfony note on access_control rules,
+firewalls and voters is chosen per result: it appears only when a route in that
+result has `provider: symfony`. A laravel-only result in a mixed repo and a miss
+carry no Symfony note.
 
 ### `context_pack`
 Evidence cards (citations, snippets, confidence) for a goal, truncated to a

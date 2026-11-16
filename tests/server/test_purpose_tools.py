@@ -126,6 +126,37 @@ def test_purpose_tools_fail_closed_on_unregistered_repo(tmp_path):
     assert payload["degraded"] == ["repo_not_registered"]
 
 
+def test_route_handler_normalizes_absolute_declared_in_against_repo_root(tmp_path):
+    routes_file = "routes/web.php"
+    absolute = str(tmp_path / "hub" / routes_file)
+    route = make_node(
+        REPO,
+        "/inside",
+        routes_file,
+        node_id="r_inside",
+        line=1,
+        _kind="http_route",
+        route_schema=2,
+        route_path="/inside",
+        route_name="inside",
+        http_methods=["GET"],
+        route_complete=True,
+        declared_in=absolute,
+        provider="laravel",
+        route_template="/inside",
+        effective_guards=[],
+        authorization_state="not_proven",
+        authorization_reason="",
+    )
+    handler = make_node(REPO, ".show()", "app/Http/Controllers/C.php", node_id="m_in")
+    link = make_link("r_inside", "m_in", relation="handled_by")
+    link.update(provider="laravel", _via="route_file")
+    server = _server(tmp_path, nodes=[route, handler], links=[link])
+    payload = _call(server, "route_handler", route="/inside", repo=REPO)
+    assert payload["routes"][0]["declared_in"] == routes_file
+    assert absolute not in json.dumps(payload)
+
+
 def test_existing_tools_are_kept_and_new_ones_listed(tmp_path):
     names = [schema["name"] for schema in _server(tmp_path).tool_schemas()]
     assert names == [

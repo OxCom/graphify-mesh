@@ -1,0 +1,1383 @@
+{
+ "controller_outline": {
+  "/srv/demo/src/Controller/Admin/StatsController.php": {
+   "complete": true,
+   "controllers": [
+    {
+     "classes": [
+      {
+       "guards": [],
+       "label": "StatsController"
+      }
+     ],
+     "routes": [
+      {
+       "citation": "[demo.app:src/Controller/Admin/StatsController.php:14]",
+       "guards": [
+        {
+         "attribute": "access_control",
+         "citation": "[demo.app:config/packages/security.yaml:?]",
+         "guard": "roles: [ROLE_ADMIN]",
+         "literal": null,
+         "scope": "route",
+         "subject": ""
+        }
+       ],
+       "handlers": [
+        {
+         "access_checks": [],
+         "citation": "[demo.app:src/Controller/Admin/StatsController.php:15]",
+         "class": "StatsController",
+         "guards": [],
+         "key": "demo.app\u001fsrc/Controller/Admin/StatsController.php\u001f.stats()",
+         "label": ".stats()",
+         "source_file": "src/Controller/Admin/StatsController.php"
+        }
+       ],
+       "http_methods": [
+        "GET"
+       ],
+       "key": "demo.app\u001fsrc/Controller/Admin/StatsController.php\u001f/admin/stats",
+       "path": "/admin/stats",
+       "route_complete": true,
+       "route_name": "admin_stats",
+       "source_file": "src/Controller/Admin/StatsController.php"
+      }
+     ],
+     "source_file": "src/Controller/Admin/StatsController.php"
+    }
+   ],
+   "coverage": {
+    "guarded_or_framework_checked": 1,
+    "no_indexed_check": 0,
+    "pattern_check_only": 0,
+    "routes": 1
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "file",
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "repo": "demo.app",
+   "resolved": true,
+   "route_count": 1,
+   "suggestions": [],
+   "target": "/srv/demo/src/Controller/Admin/StatsController.php",
+   "truncated": false
+  },
+  "Admin/StatsController.php": {
+   "complete": true,
+   "controllers": [
+    {
+     "classes": [
+      {
+       "guards": [],
+       "label": "StatsController"
+      }
+     ],
+     "routes": [
+      {
+       "citation": "[demo.app:src/Controller/Admin/StatsController.php:14]",
+       "guards": [
+        {
+         "attribute": "access_control",
+         "citation": "[demo.app:config/packages/security.yaml:?]",
+         "guard": "roles: [ROLE_ADMIN]",
+         "literal": null,
+         "scope": "route",
+         "subject": ""
+        }
+       ],
+       "handlers": [
+        {
+         "access_checks": [],
+         "citation": "[demo.app:src/Controller/Admin/StatsController.php:15]",
+         "class": "StatsController",
+         "guards": [],
+         "key": "demo.app\u001fsrc/Controller/Admin/StatsController.php\u001f.stats()",
+         "label": ".stats()",
+         "source_file": "src/Controller/Admin/StatsController.php"
+        }
+       ],
+       "http_methods": [
+        "GET"
+       ],
+       "key": "demo.app\u001fsrc/Controller/Admin/StatsController.php\u001f/admin/stats",
+       "path": "/admin/stats",
+       "route_complete": true,
+       "route_name": "admin_stats",
+       "source_file": "src/Controller/Admin/StatsController.php"
+      }
+     ],
+     "source_file": "src/Controller/Admin/StatsController.php"
+    }
+   ],
+   "coverage": {
+    "guarded_or_framework_checked": 1,
+    "no_indexed_check": 0,
+    "pattern_check_only": 0,
+    "routes": 1
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "file_suffix",
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "repo": "demo.app",
+   "resolved": true,
+   "route_count": 1,
+   "suggestions": [],
+   "target": "Admin/StatsController.php",
+   "truncated": false
+  },
+  "BlogController": {
+   "complete": true,
+   "controllers": [
+    {
+     "classes": [
+      {
+       "guards": [
+        {
+         "attribute": "IsGranted",
+         "citation": "[demo.app:src/Controller/BlogController.php:11]",
+         "guard": "ROLE_READER",
+         "literal": true,
+         "scope": "class",
+         "subject": ""
+        }
+       ],
+       "label": "BlogController"
+      }
+     ],
+     "routes": [
+      {
+       "citation": "[demo.app:src/Controller/BlogController.php:19]",
+       "guards": [],
+       "handlers": [
+        {
+         "access_checks": [],
+         "citation": "[demo.app:src/Controller/BlogController.php:20]",
+         "class": "BlogController",
+         "guards": [
+          {
+           "attribute": "IsGranted",
+           "citation": "[demo.app:src/Controller/BlogController.php:11]",
+           "guard": "ROLE_READER",
+           "literal": true,
+           "scope": "class",
+           "subject": ""
+          }
+         ],
+         "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.index()",
+         "label": ".index()",
+         "source_file": "src/Controller/BlogController.php"
+        }
+       ],
+       "http_methods": [
+        "GET"
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog",
+       "path": "/blog",
+       "route_complete": true,
+       "route_name": "blog_index",
+       "source_file": "src/Controller/BlogController.php"
+      },
+      {
+       "citation": "[demo.app:src/Controller/BlogController.php:29]",
+       "guards": [],
+       "handlers": [
+        {
+         "access_checks": [],
+         "citation": "[demo.app:src/Controller/BlogController.php:30]",
+         "class": "BlogController",
+         "guards": [
+          {
+           "attribute": "IsGranted",
+           "citation": "[demo.app:src/Controller/BlogController.php:28]",
+           "guard": "ROLE_USER",
+           "literal": true,
+           "scope": "method",
+           "subject": ""
+          },
+          {
+           "attribute": "IsGranted",
+           "citation": "[demo.app:src/Controller/BlogController.php:11]",
+           "guard": "ROLE_READER",
+           "literal": true,
+           "scope": "class",
+           "subject": ""
+          }
+         ],
+         "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.show()",
+         "label": ".show()",
+         "source_file": "src/Controller/BlogController.php"
+        }
+       ],
+       "http_methods": [
+        "GET"
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog/{slug}",
+       "path": "/blog/{slug}",
+       "route_complete": true,
+       "route_name": "blog_show",
+       "source_file": "src/Controller/BlogController.php"
+      },
+      {
+       "citation": "[demo.app:src/Controller/BlogController.php:39]",
+       "guards": [],
+       "handlers": [
+        {
+         "access_checks": [
+          {
+           "call": "canEdit",
+           "check": "canEdit",
+           "citation": "[demo.app:src/Controller/BlogController.php:44]",
+           "conditional": null,
+           "kind": "pattern"
+          },
+          {
+           "call": "isGranted",
+           "check": "ROLE_EDITOR",
+           "citation": "[demo.app:src/Controller/BlogController.php:42]",
+           "conditional": true,
+           "kind": "framework"
+          }
+         ],
+         "citation": "[demo.app:src/Controller/BlogController.php:40]",
+         "class": "BlogController",
+         "guards": [
+          {
+           "attribute": "IsGranted",
+           "citation": "[demo.app:src/Controller/BlogController.php:11]",
+           "guard": "ROLE_READER",
+           "literal": true,
+           "scope": "class",
+           "subject": ""
+          }
+         ],
+         "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.edit()",
+         "label": ".edit()",
+         "source_file": "src/Controller/BlogController.php"
+        }
+       ],
+       "http_methods": [
+        "GET",
+        "POST"
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog/{slug}/edit",
+       "path": "/blog/{slug}/edit",
+       "route_complete": true,
+       "route_name": "blog_edit",
+       "source_file": "src/Controller/BlogController.php"
+      },
+      {
+       "citation": "[demo.app:src/Controller/BlogController.php:50]",
+       "guards": [],
+       "handlers": [],
+       "http_methods": [
+        "GET"
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog/archive",
+       "path": "/blog/archive",
+       "route_complete": false,
+       "route_name": "blog_archive",
+       "source_file": "src/Controller/BlogController.php"
+      }
+     ],
+     "source_file": "src/Controller/BlogController.php"
+    }
+   ],
+   "coverage": {
+    "guarded_or_framework_checked": 3,
+    "no_indexed_check": 1,
+    "pattern_check_only": 0,
+    "routes": 4
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "class",
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "repo": "demo.app",
+   "resolved": true,
+   "route_count": 4,
+   "suggestions": [],
+   "target": "BlogController",
+   "truncated": false
+  },
+  "Missing.php": {
+   "complete": false,
+   "controllers": [],
+   "coverage": {
+    "guarded_or_framework_checked": 0,
+    "no_indexed_check": 0,
+    "pattern_check_only": 0,
+    "routes": 0
+   },
+   "degraded": [
+    "node_not_found"
+   ],
+   "generation_id": "gen-routes-legacy",
+   "match": null,
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "repo": "demo.app",
+   "resolved": false,
+   "route_count": 0,
+   "suggestions": [
+    "src/Controller/Admin/StatsController.php"
+   ],
+   "target": "Missing.php",
+   "truncated": false
+  },
+  "config/routes.yaml": {
+   "complete": true,
+   "controllers": [
+    {
+     "classes": [
+      {
+       "guards": [],
+       "label": "C"
+      }
+     ],
+     "routes": [
+      {
+       "citation": "[demo.app:config/routes.yaml:3]",
+       "guards": [],
+       "handlers": [
+        {
+         "access_checks": [
+          {
+           "call": "canEdit",
+           "check": "canEdit",
+           "citation": "[demo.app:src/C.php:9]",
+           "conditional": false,
+           "kind": "pattern"
+          }
+         ],
+         "citation": "[demo.app:src/C.php:8]",
+         "class": "C",
+         "guards": [],
+         "key": "demo.app\u001fsrc/C.php\u001f.legacy()",
+         "label": ".legacy()",
+         "source_file": "src/C.php"
+        }
+       ],
+       "http_methods": [
+        "GET"
+       ],
+       "key": "demo.app\u001fconfig/routes.yaml\u001f/legacy/{id}",
+       "path": "/legacy/{id}",
+       "route_complete": true,
+       "route_name": "legacy_show",
+       "source_file": "config/routes.yaml"
+      }
+     ],
+     "source_file": "config/routes.yaml"
+    }
+   ],
+   "coverage": {
+    "guarded_or_framework_checked": 0,
+    "no_indexed_check": 0,
+    "pattern_check_only": 1,
+    "routes": 1
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "file",
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "repo": "demo.app",
+   "resolved": true,
+   "route_count": 1,
+   "suggestions": [],
+   "target": "config/routes.yaml",
+   "truncated": false
+  },
+  "src/C.php": {
+   "complete": false,
+   "controllers": [],
+   "coverage": {
+    "guarded_or_framework_checked": 0,
+    "no_indexed_check": 0,
+    "pattern_check_only": 0,
+    "routes": 0
+   },
+   "degraded": [
+    "node_not_found"
+   ],
+   "generation_id": "gen-routes-legacy",
+   "match": null,
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "repo": "demo.app",
+   "resolved": false,
+   "route_count": 0,
+   "suggestions": [
+    "src/Controller/BlogController.php",
+    "src/Controller/Admin/StatsController.php"
+   ],
+   "target": "src/C.php",
+   "truncated": false
+  },
+  "src/Controller": {
+   "complete": true,
+   "controllers": [
+    {
+     "classes": [
+      {
+       "guards": [],
+       "label": "StatsController"
+      }
+     ],
+     "routes": [
+      {
+       "citation": "[demo.app:src/Controller/Admin/StatsController.php:14]",
+       "guards": [
+        {
+         "attribute": "access_control",
+         "citation": "[demo.app:config/packages/security.yaml:?]",
+         "guard": "roles: [ROLE_ADMIN]",
+         "literal": null,
+         "scope": "route",
+         "subject": ""
+        }
+       ],
+       "handlers": [
+        {
+         "access_checks": [],
+         "citation": "[demo.app:src/Controller/Admin/StatsController.php:15]",
+         "class": "StatsController",
+         "guards": [],
+         "key": "demo.app\u001fsrc/Controller/Admin/StatsController.php\u001f.stats()",
+         "label": ".stats()",
+         "source_file": "src/Controller/Admin/StatsController.php"
+        }
+       ],
+       "http_methods": [
+        "GET"
+       ],
+       "key": "demo.app\u001fsrc/Controller/Admin/StatsController.php\u001f/admin/stats",
+       "path": "/admin/stats",
+       "route_complete": true,
+       "route_name": "admin_stats",
+       "source_file": "src/Controller/Admin/StatsController.php"
+      }
+     ],
+     "source_file": "src/Controller/Admin/StatsController.php"
+    },
+    {
+     "classes": [
+      {
+       "guards": [
+        {
+         "attribute": "IsGranted",
+         "citation": "[demo.app:src/Controller/BlogController.php:11]",
+         "guard": "ROLE_READER",
+         "literal": true,
+         "scope": "class",
+         "subject": ""
+        }
+       ],
+       "label": "BlogController"
+      }
+     ],
+     "routes": [
+      {
+       "citation": "[demo.app:src/Controller/BlogController.php:19]",
+       "guards": [],
+       "handlers": [
+        {
+         "access_checks": [],
+         "citation": "[demo.app:src/Controller/BlogController.php:20]",
+         "class": "BlogController",
+         "guards": [
+          {
+           "attribute": "IsGranted",
+           "citation": "[demo.app:src/Controller/BlogController.php:11]",
+           "guard": "ROLE_READER",
+           "literal": true,
+           "scope": "class",
+           "subject": ""
+          }
+         ],
+         "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.index()",
+         "label": ".index()",
+         "source_file": "src/Controller/BlogController.php"
+        }
+       ],
+       "http_methods": [
+        "GET"
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog",
+       "path": "/blog",
+       "route_complete": true,
+       "route_name": "blog_index",
+       "source_file": "src/Controller/BlogController.php"
+      },
+      {
+       "citation": "[demo.app:src/Controller/BlogController.php:29]",
+       "guards": [],
+       "handlers": [
+        {
+         "access_checks": [],
+         "citation": "[demo.app:src/Controller/BlogController.php:30]",
+         "class": "BlogController",
+         "guards": [
+          {
+           "attribute": "IsGranted",
+           "citation": "[demo.app:src/Controller/BlogController.php:28]",
+           "guard": "ROLE_USER",
+           "literal": true,
+           "scope": "method",
+           "subject": ""
+          },
+          {
+           "attribute": "IsGranted",
+           "citation": "[demo.app:src/Controller/BlogController.php:11]",
+           "guard": "ROLE_READER",
+           "literal": true,
+           "scope": "class",
+           "subject": ""
+          }
+         ],
+         "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.show()",
+         "label": ".show()",
+         "source_file": "src/Controller/BlogController.php"
+        }
+       ],
+       "http_methods": [
+        "GET"
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog/{slug}",
+       "path": "/blog/{slug}",
+       "route_complete": true,
+       "route_name": "blog_show",
+       "source_file": "src/Controller/BlogController.php"
+      },
+      {
+       "citation": "[demo.app:src/Controller/BlogController.php:39]",
+       "guards": [],
+       "handlers": [
+        {
+         "access_checks": [
+          {
+           "call": "canEdit",
+           "check": "canEdit",
+           "citation": "[demo.app:src/Controller/BlogController.php:44]",
+           "conditional": null,
+           "kind": "pattern"
+          },
+          {
+           "call": "isGranted",
+           "check": "ROLE_EDITOR",
+           "citation": "[demo.app:src/Controller/BlogController.php:42]",
+           "conditional": true,
+           "kind": "framework"
+          }
+         ],
+         "citation": "[demo.app:src/Controller/BlogController.php:40]",
+         "class": "BlogController",
+         "guards": [
+          {
+           "attribute": "IsGranted",
+           "citation": "[demo.app:src/Controller/BlogController.php:11]",
+           "guard": "ROLE_READER",
+           "literal": true,
+           "scope": "class",
+           "subject": ""
+          }
+         ],
+         "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.edit()",
+         "label": ".edit()",
+         "source_file": "src/Controller/BlogController.php"
+        }
+       ],
+       "http_methods": [
+        "GET",
+        "POST"
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog/{slug}/edit",
+       "path": "/blog/{slug}/edit",
+       "route_complete": true,
+       "route_name": "blog_edit",
+       "source_file": "src/Controller/BlogController.php"
+      },
+      {
+       "citation": "[demo.app:src/Controller/BlogController.php:50]",
+       "guards": [],
+       "handlers": [],
+       "http_methods": [
+        "GET"
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog/archive",
+       "path": "/blog/archive",
+       "route_complete": false,
+       "route_name": "blog_archive",
+       "source_file": "src/Controller/BlogController.php"
+      }
+     ],
+     "source_file": "src/Controller/BlogController.php"
+    }
+   ],
+   "coverage": {
+    "guarded_or_framework_checked": 4,
+    "no_indexed_check": 1,
+    "pattern_check_only": 0,
+    "routes": 5
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "directory",
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "repo": "demo.app",
+   "resolved": true,
+   "route_count": 5,
+   "suggestions": [],
+   "target": "src/Controller",
+   "truncated": false
+  },
+  "src/Controller/BlogController.php": {
+   "complete": true,
+   "controllers": [
+    {
+     "classes": [
+      {
+       "guards": [
+        {
+         "attribute": "IsGranted",
+         "citation": "[demo.app:src/Controller/BlogController.php:11]",
+         "guard": "ROLE_READER",
+         "literal": true,
+         "scope": "class",
+         "subject": ""
+        }
+       ],
+       "label": "BlogController"
+      }
+     ],
+     "routes": [
+      {
+       "citation": "[demo.app:src/Controller/BlogController.php:19]",
+       "guards": [],
+       "handlers": [
+        {
+         "access_checks": [],
+         "citation": "[demo.app:src/Controller/BlogController.php:20]",
+         "class": "BlogController",
+         "guards": [
+          {
+           "attribute": "IsGranted",
+           "citation": "[demo.app:src/Controller/BlogController.php:11]",
+           "guard": "ROLE_READER",
+           "literal": true,
+           "scope": "class",
+           "subject": ""
+          }
+         ],
+         "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.index()",
+         "label": ".index()",
+         "source_file": "src/Controller/BlogController.php"
+        }
+       ],
+       "http_methods": [
+        "GET"
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog",
+       "path": "/blog",
+       "route_complete": true,
+       "route_name": "blog_index",
+       "source_file": "src/Controller/BlogController.php"
+      },
+      {
+       "citation": "[demo.app:src/Controller/BlogController.php:29]",
+       "guards": [],
+       "handlers": [
+        {
+         "access_checks": [],
+         "citation": "[demo.app:src/Controller/BlogController.php:30]",
+         "class": "BlogController",
+         "guards": [
+          {
+           "attribute": "IsGranted",
+           "citation": "[demo.app:src/Controller/BlogController.php:28]",
+           "guard": "ROLE_USER",
+           "literal": true,
+           "scope": "method",
+           "subject": ""
+          },
+          {
+           "attribute": "IsGranted",
+           "citation": "[demo.app:src/Controller/BlogController.php:11]",
+           "guard": "ROLE_READER",
+           "literal": true,
+           "scope": "class",
+           "subject": ""
+          }
+         ],
+         "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.show()",
+         "label": ".show()",
+         "source_file": "src/Controller/BlogController.php"
+        }
+       ],
+       "http_methods": [
+        "GET"
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog/{slug}",
+       "path": "/blog/{slug}",
+       "route_complete": true,
+       "route_name": "blog_show",
+       "source_file": "src/Controller/BlogController.php"
+      },
+      {
+       "citation": "[demo.app:src/Controller/BlogController.php:39]",
+       "guards": [],
+       "handlers": [
+        {
+         "access_checks": [
+          {
+           "call": "canEdit",
+           "check": "canEdit",
+           "citation": "[demo.app:src/Controller/BlogController.php:44]",
+           "conditional": null,
+           "kind": "pattern"
+          },
+          {
+           "call": "isGranted",
+           "check": "ROLE_EDITOR",
+           "citation": "[demo.app:src/Controller/BlogController.php:42]",
+           "conditional": true,
+           "kind": "framework"
+          }
+         ],
+         "citation": "[demo.app:src/Controller/BlogController.php:40]",
+         "class": "BlogController",
+         "guards": [
+          {
+           "attribute": "IsGranted",
+           "citation": "[demo.app:src/Controller/BlogController.php:11]",
+           "guard": "ROLE_READER",
+           "literal": true,
+           "scope": "class",
+           "subject": ""
+          }
+         ],
+         "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.edit()",
+         "label": ".edit()",
+         "source_file": "src/Controller/BlogController.php"
+        }
+       ],
+       "http_methods": [
+        "GET",
+        "POST"
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog/{slug}/edit",
+       "path": "/blog/{slug}/edit",
+       "route_complete": true,
+       "route_name": "blog_edit",
+       "source_file": "src/Controller/BlogController.php"
+      },
+      {
+       "citation": "[demo.app:src/Controller/BlogController.php:50]",
+       "guards": [],
+       "handlers": [],
+       "http_methods": [
+        "GET"
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog/archive",
+       "path": "/blog/archive",
+       "route_complete": false,
+       "route_name": "blog_archive",
+       "source_file": "src/Controller/BlogController.php"
+      }
+     ],
+     "source_file": "src/Controller/BlogController.php"
+    }
+   ],
+   "coverage": {
+    "guarded_or_framework_checked": 3,
+    "no_indexed_check": 1,
+    "pattern_check_only": 0,
+    "routes": 4
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "file",
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "repo": "demo.app",
+   "resolved": true,
+   "route_count": 4,
+   "suggestions": [],
+   "target": "src/Controller/BlogController.php",
+   "truncated": false
+  }
+ },
+ "route_handler": {
+  "/admin": {
+   "complete": true,
+   "count": 1,
+   "coverage": {
+    "guarded_or_framework_checked": 1,
+    "no_indexed_check": 0,
+    "pattern_check_only": 0,
+    "routes": 1
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "path_prefix",
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "query": "/admin",
+   "repo": "demo.app",
+   "resolved": true,
+   "routes": [
+    {
+     "citation": "[demo.app:src/Controller/Admin/StatsController.php:14]",
+     "guards": [
+      {
+       "attribute": "access_control",
+       "citation": "[demo.app:config/packages/security.yaml:?]",
+       "guard": "roles: [ROLE_ADMIN]",
+       "literal": null,
+       "scope": "route",
+       "subject": ""
+      }
+     ],
+     "handlers": [
+      {
+       "access_checks": [],
+       "citation": "[demo.app:src/Controller/Admin/StatsController.php:15]",
+       "class": "StatsController",
+       "guards": [],
+       "key": "demo.app\u001fsrc/Controller/Admin/StatsController.php\u001f.stats()",
+       "label": ".stats()",
+       "source_file": "src/Controller/Admin/StatsController.php"
+      }
+     ],
+     "http_methods": [
+      "GET"
+     ],
+     "key": "demo.app\u001fsrc/Controller/Admin/StatsController.php\u001f/admin/stats",
+     "path": "/admin/stats",
+     "route_complete": true,
+     "route_name": "admin_stats",
+     "source_file": "src/Controller/Admin/StatsController.php"
+    }
+   ],
+   "suggestions": [],
+   "truncated": false
+  },
+  "/blog": {
+   "complete": true,
+   "count": 1,
+   "coverage": {
+    "guarded_or_framework_checked": 1,
+    "no_indexed_check": 0,
+    "pattern_check_only": 0,
+    "routes": 1
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "path",
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "query": "/blog",
+   "repo": "demo.app",
+   "resolved": true,
+   "routes": [
+    {
+     "citation": "[demo.app:src/Controller/BlogController.php:19]",
+     "guards": [],
+     "handlers": [
+      {
+       "access_checks": [],
+       "citation": "[demo.app:src/Controller/BlogController.php:20]",
+       "class": "BlogController",
+       "guards": [
+        {
+         "attribute": "IsGranted",
+         "citation": "[demo.app:src/Controller/BlogController.php:11]",
+         "guard": "ROLE_READER",
+         "literal": true,
+         "scope": "class",
+         "subject": ""
+        }
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.index()",
+       "label": ".index()",
+       "source_file": "src/Controller/BlogController.php"
+      }
+     ],
+     "http_methods": [
+      "GET"
+     ],
+     "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog",
+     "path": "/blog",
+     "route_complete": true,
+     "route_name": "blog_index",
+     "source_file": "src/Controller/BlogController.php"
+    }
+   ],
+   "suggestions": [],
+   "truncated": false
+  },
+  "/blog/hello": {
+   "complete": true,
+   "count": 1,
+   "coverage": {
+    "guarded_or_framework_checked": 1,
+    "no_indexed_check": 0,
+    "pattern_check_only": 0,
+    "routes": 1
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "path_pattern",
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "query": "/blog/hello",
+   "repo": "demo.app",
+   "resolved": true,
+   "routes": [
+    {
+     "citation": "[demo.app:src/Controller/BlogController.php:29]",
+     "guards": [],
+     "handlers": [
+      {
+       "access_checks": [],
+       "citation": "[demo.app:src/Controller/BlogController.php:30]",
+       "class": "BlogController",
+       "guards": [
+        {
+         "attribute": "IsGranted",
+         "citation": "[demo.app:src/Controller/BlogController.php:28]",
+         "guard": "ROLE_USER",
+         "literal": true,
+         "scope": "method",
+         "subject": ""
+        },
+        {
+         "attribute": "IsGranted",
+         "citation": "[demo.app:src/Controller/BlogController.php:11]",
+         "guard": "ROLE_READER",
+         "literal": true,
+         "scope": "class",
+         "subject": ""
+        }
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.show()",
+       "label": ".show()",
+       "source_file": "src/Controller/BlogController.php"
+      }
+     ],
+     "http_methods": [
+      "GET"
+     ],
+     "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog/{slug}",
+     "path": "/blog/{slug}",
+     "route_complete": true,
+     "route_name": "blog_show",
+     "source_file": "src/Controller/BlogController.php"
+    }
+   ],
+   "suggestions": [],
+   "truncated": false
+  },
+  "/blog/hello/edit": {
+   "complete": true,
+   "count": 1,
+   "coverage": {
+    "guarded_or_framework_checked": 1,
+    "no_indexed_check": 0,
+    "pattern_check_only": 0,
+    "routes": 1
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "path_pattern",
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "query": "/blog/hello/edit",
+   "repo": "demo.app",
+   "resolved": true,
+   "routes": [
+    {
+     "citation": "[demo.app:src/Controller/BlogController.php:39]",
+     "guards": [],
+     "handlers": [
+      {
+       "access_checks": [
+        {
+         "call": "canEdit",
+         "check": "canEdit",
+         "citation": "[demo.app:src/Controller/BlogController.php:44]",
+         "conditional": null,
+         "kind": "pattern"
+        },
+        {
+         "call": "isGranted",
+         "check": "ROLE_EDITOR",
+         "citation": "[demo.app:src/Controller/BlogController.php:42]",
+         "conditional": true,
+         "kind": "framework"
+        }
+       ],
+       "citation": "[demo.app:src/Controller/BlogController.php:40]",
+       "class": "BlogController",
+       "guards": [
+        {
+         "attribute": "IsGranted",
+         "citation": "[demo.app:src/Controller/BlogController.php:11]",
+         "guard": "ROLE_READER",
+         "literal": true,
+         "scope": "class",
+         "subject": ""
+        }
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.edit()",
+       "label": ".edit()",
+       "source_file": "src/Controller/BlogController.php"
+      }
+     ],
+     "http_methods": [
+      "GET",
+      "POST"
+     ],
+     "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog/{slug}/edit",
+     "path": "/blog/{slug}/edit",
+     "route_complete": true,
+     "route_name": "blog_edit",
+     "source_file": "src/Controller/BlogController.php"
+    }
+   ],
+   "suggestions": [],
+   "truncated": false
+  },
+  "/blog/hello/edit/extra/x": {
+   "complete": true,
+   "count": 1,
+   "coverage": {
+    "guarded_or_framework_checked": 1,
+    "no_indexed_check": 0,
+    "pattern_check_only": 0,
+    "routes": 1
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "ancestor_prefix",
+   "notes": [
+    "No indexed route matches the full path; these are the longest indexed routes whose path is a prefix of it. The exact route may be missing from the index: confirm in source.",
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "query": "/blog/hello/edit/extra/x",
+   "repo": "demo.app",
+   "resolved": true,
+   "routes": [
+    {
+     "citation": "[demo.app:src/Controller/BlogController.php:39]",
+     "guards": [],
+     "handlers": [
+      {
+       "access_checks": [
+        {
+         "call": "canEdit",
+         "check": "canEdit",
+         "citation": "[demo.app:src/Controller/BlogController.php:44]",
+         "conditional": null,
+         "kind": "pattern"
+        },
+        {
+         "call": "isGranted",
+         "check": "ROLE_EDITOR",
+         "citation": "[demo.app:src/Controller/BlogController.php:42]",
+         "conditional": true,
+         "kind": "framework"
+        }
+       ],
+       "citation": "[demo.app:src/Controller/BlogController.php:40]",
+       "class": "BlogController",
+       "guards": [
+        {
+         "attribute": "IsGranted",
+         "citation": "[demo.app:src/Controller/BlogController.php:11]",
+         "guard": "ROLE_READER",
+         "literal": true,
+         "scope": "class",
+         "subject": ""
+        }
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.edit()",
+       "label": ".edit()",
+       "source_file": "src/Controller/BlogController.php"
+      }
+     ],
+     "http_methods": [
+      "GET",
+      "POST"
+     ],
+     "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog/{slug}/edit",
+     "path": "/blog/{slug}/edit",
+     "route_complete": true,
+     "route_name": "blog_edit",
+     "source_file": "src/Controller/BlogController.php"
+    }
+   ],
+   "suggestions": [
+    "/blog/{slug}/edit",
+    "blog_edit",
+    "blog_index",
+    "/blog/{slug}",
+    "/blog/archive",
+    "blog_show",
+    "/blog"
+   ],
+   "truncated": false
+  },
+  "/blog/{slug}": {
+   "complete": true,
+   "count": 1,
+   "coverage": {
+    "guarded_or_framework_checked": 1,
+    "no_indexed_check": 0,
+    "pattern_check_only": 0,
+    "routes": 1
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "path",
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "query": "/blog/{slug}",
+   "repo": "demo.app",
+   "resolved": true,
+   "routes": [
+    {
+     "citation": "[demo.app:src/Controller/BlogController.php:29]",
+     "guards": [],
+     "handlers": [
+      {
+       "access_checks": [],
+       "citation": "[demo.app:src/Controller/BlogController.php:30]",
+       "class": "BlogController",
+       "guards": [
+        {
+         "attribute": "IsGranted",
+         "citation": "[demo.app:src/Controller/BlogController.php:28]",
+         "guard": "ROLE_USER",
+         "literal": true,
+         "scope": "method",
+         "subject": ""
+        },
+        {
+         "attribute": "IsGranted",
+         "citation": "[demo.app:src/Controller/BlogController.php:11]",
+         "guard": "ROLE_READER",
+         "literal": true,
+         "scope": "class",
+         "subject": ""
+        }
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.show()",
+       "label": ".show()",
+       "source_file": "src/Controller/BlogController.php"
+      }
+     ],
+     "http_methods": [
+      "GET"
+     ],
+     "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog/{slug}",
+     "path": "/blog/{slug}",
+     "route_complete": true,
+     "route_name": "blog_show",
+     "source_file": "src/Controller/BlogController.php"
+    }
+   ],
+   "suggestions": [],
+   "truncated": false
+  },
+  "/legacy/5": {
+   "complete": true,
+   "count": 1,
+   "coverage": {
+    "guarded_or_framework_checked": 0,
+    "no_indexed_check": 0,
+    "pattern_check_only": 1,
+    "routes": 1
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "path_pattern",
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "query": "/legacy/5",
+   "repo": "demo.app",
+   "resolved": true,
+   "routes": [
+    {
+     "citation": "[demo.app:config/routes.yaml:3]",
+     "guards": [],
+     "handlers": [
+      {
+       "access_checks": [
+        {
+         "call": "canEdit",
+         "check": "canEdit",
+         "citation": "[demo.app:src/C.php:9]",
+         "conditional": false,
+         "kind": "pattern"
+        }
+       ],
+       "citation": "[demo.app:src/C.php:8]",
+       "class": "C",
+       "guards": [],
+       "key": "demo.app\u001fsrc/C.php\u001f.legacy()",
+       "label": ".legacy()",
+       "source_file": "src/C.php"
+      }
+     ],
+     "http_methods": [
+      "GET"
+     ],
+     "key": "demo.app\u001fconfig/routes.yaml\u001f/legacy/{id}",
+     "path": "/legacy/{id}",
+     "route_complete": true,
+     "route_name": "legacy_show",
+     "source_file": "config/routes.yaml"
+    }
+   ],
+   "suggestions": [],
+   "truncated": false
+  },
+  "blog_index": {
+   "complete": true,
+   "count": 1,
+   "coverage": {
+    "guarded_or_framework_checked": 1,
+    "no_indexed_check": 0,
+    "pattern_check_only": 0,
+    "routes": 1
+   },
+   "degraded": [],
+   "generation_id": "gen-routes-legacy",
+   "match": "route_name",
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "query": "blog_index",
+   "repo": "demo.app",
+   "resolved": true,
+   "routes": [
+    {
+     "citation": "[demo.app:src/Controller/BlogController.php:19]",
+     "guards": [],
+     "handlers": [
+      {
+       "access_checks": [],
+       "citation": "[demo.app:src/Controller/BlogController.php:20]",
+       "class": "BlogController",
+       "guards": [
+        {
+         "attribute": "IsGranted",
+         "citation": "[demo.app:src/Controller/BlogController.php:11]",
+         "guard": "ROLE_READER",
+         "literal": true,
+         "scope": "class",
+         "subject": ""
+        }
+       ],
+       "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f.index()",
+       "label": ".index()",
+       "source_file": "src/Controller/BlogController.php"
+      }
+     ],
+     "http_methods": [
+      "GET"
+     ],
+     "key": "demo.app\u001fsrc/Controller/BlogController.php\u001f/blog",
+     "path": "/blog",
+     "route_complete": true,
+     "route_name": "blog_index",
+     "source_file": "src/Controller/BlogController.php"
+    }
+   ],
+   "suggestions": [],
+   "truncated": false
+  },
+  "nope-route": {
+   "complete": false,
+   "count": 0,
+   "coverage": {
+    "guarded_or_framework_checked": 0,
+    "no_indexed_check": 0,
+    "pattern_check_only": 0,
+    "routes": 0
+   },
+   "degraded": [
+    "node_not_found"
+   ],
+   "generation_id": "gen-routes-legacy",
+   "match": null,
+   "notes": [
+    "Routes come from attribute extraction (#[Route]); routes declared in YAML/XML config or registered at runtime are not indexed.",
+    "Not modelled: access_control rules that could not be proved to match a route, firewalls, voters' own logic, and checks in called services, helpers or listeners. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it."
+   ],
+   "query": "nope-route",
+   "repo": "demo.app",
+   "resolved": false,
+   "routes": [],
+   "suggestions": [
+    "blog_edit"
+   ],
+   "truncated": false
+  }
+ }
+}

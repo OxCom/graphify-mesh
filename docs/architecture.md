@@ -258,6 +258,12 @@ discovery
   delete the directories that in-memory generation came from. stdio servers pick
   up the new code with the next client session.
 
+  Lexical scoring is field boost x idf, summed per query word, with one score
+  per word per (key, field) (`server/retrieval.py:lexical_candidates`). The
+  lexical stage writes no field-length table. A bundle from an older dev build
+  that carries `field_lengths` / `avg_field_lengths` still loads: the server
+  ignores those keys.
+
   Config keys are addressed by their dotted path (`config_keys.config_key_paths`).
   A key that itself contains `.`, such as the Kubernetes label
   `app.kubernetes.io/name`, can produce the same path as a nested key. Such

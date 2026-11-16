@@ -1,0 +1,2244 @@
+{
+ "route_handler": {
+  "/admin/users": {
+   "resolved": true,
+   "repo": "demo.app",
+   "query": "/admin/users",
+   "match": "path",
+   "generation_id": "gen-routes-v2",
+   "routes": [
+    {
+     "path": "/admin/users",
+     "route_name": "admin_users",
+     "http_methods": [
+      "GET"
+     ],
+     "route_complete": true,
+     "key": "demo.app\u001fsrc/Controller/Admin/UserController.php\u001f/admin/users",
+     "source_file": "src/Controller/Admin/UserController.php",
+     "citation": "[demo.app:src/Controller/Admin/UserController.php:19]",
+     "guards": [],
+     "handlers": [
+      {
+       "key": "demo.app\u001fsrc/Controller/Admin/UserController.php\u001f.list()",
+       "label": ".list()",
+       "source_file": "src/Controller/Admin/UserController.php",
+       "citation": "[demo.app:src/Controller/Admin/UserController.php:20]",
+       "class": "UserController",
+       "guards": [
+        {
+         "guard": "ROLE_ADMIN",
+         "scope": "class",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:src/Controller/Admin/UserController.php:11]",
+         "kind": "authorization",
+         "provider": "symfony",
+         "via": "attribute",
+         "key": "ROLE_ADMIN"
+        }
+       ],
+       "access_checks": [],
+       "via": "attribute",
+       "provider": "symfony"
+      }
+     ],
+     "provider": "symfony",
+     "handler_kind": "method",
+     "route_template": "/admin/users",
+     "route_template_reason": "",
+     "declared_in": "src/Controller/Admin/UserController.php",
+     "effective_guards": [
+      {
+       "guard": "ROLE_ADMIN",
+       "kind": "authorization",
+       "key": "ROLE_ADMIN",
+       "provider": "symfony"
+      }
+     ],
+     "authorization_state": "covered",
+     "authorization_reason": "",
+     "mesh_reason": ""
+    }
+   ],
+   "count": 1,
+   "coverage": {
+    "routes": 1,
+    "authorization_covered": 1,
+    "authentication_only": 0,
+    "public_declared": 0,
+    "undecided": 0,
+    "framework_check_only": 0,
+    "pattern_check_only": 0,
+    "no_indexed_check": 0,
+    "undecided_reasons": {}
+   },
+   "truncated": false,
+   "complete": true,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "Symfony: access_control rules that could not be proved to match a route, firewalls and voters' own logic are not modelled.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [],
+   "route_schema": 2
+  },
+  "/posts/{id?}": {
+   "resolved": true,
+   "repo": "demo.app",
+   "query": "/posts/{id?}",
+   "match": "path",
+   "generation_id": "gen-routes-v2",
+   "routes": [
+    {
+     "path": "/posts/{id?}",
+     "route_name": "posts.show",
+     "http_methods": [
+      "GET"
+     ],
+     "route_complete": true,
+     "key": "demo.app\u001froutes/web.php\u001f/posts/{id?}",
+     "source_file": "routes/web.php",
+     "citation": "[demo.app:routes/web.php:6]",
+     "guards": [],
+     "handlers": [
+      {
+       "key": "demo.app\u001fapp/Http/Controllers/PostController.php\u001f.show()",
+       "label": ".show()",
+       "source_file": "app/Http/Controllers/PostController.php",
+       "citation": "[demo.app:app/Http/Controllers/PostController.php:22]",
+       "class": "PostController",
+       "guards": [],
+       "access_checks": [
+        {
+         "check": "Gate::authorize",
+         "call": "Gate::authorize",
+         "kind": "framework",
+         "conditional": false,
+         "citation": "[demo.app:app/Http/Controllers/PostController.php:24]",
+         "guard_kind": "unknown",
+         "provider": "laravel"
+        }
+       ],
+       "via": "route_file",
+       "provider": "laravel"
+      }
+     ],
+     "provider": "laravel",
+     "handler_kind": "method",
+     "route_template": "/posts/{id?}",
+     "route_template_reason": "",
+     "declared_in": "routes/web.php",
+     "effective_guards": [],
+     "authorization_state": "no_proven_authorization",
+     "authorization_reason": "",
+     "mesh_reason": ""
+    }
+   ],
+   "count": 1,
+   "coverage": {
+    "routes": 1,
+    "authorization_covered": 0,
+    "authentication_only": 0,
+    "public_declared": 0,
+    "undecided": 1,
+    "framework_check_only": 0,
+    "pattern_check_only": 0,
+    "no_indexed_check": 0,
+    "undecided_reasons": {
+     "access-check-kind-unknown": 1
+    }
+   },
+   "truncated": false,
+   "complete": true,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [],
+   "route_schema": 2
+  },
+  "/legacy/{slug}": {
+   "resolved": true,
+   "repo": "demo.app",
+   "query": "/legacy/{slug}",
+   "match": "path",
+   "generation_id": "gen-routes-v2",
+   "routes": [
+    {
+     "path": "/legacy/{slug}",
+     "route_name": "legacy",
+     "http_methods": [
+      "GET"
+     ],
+     "route_complete": true,
+     "key": "demo.app\u001froutes/web.php\u001f/legacy/{slug}",
+     "source_file": "routes/web.php",
+     "citation": "[demo.app:routes/web.php:10]",
+     "guards": [],
+     "handlers": [],
+     "provider": "laravel",
+     "handler_kind": "unresolved",
+     "route_template": "",
+     "route_template_reason": "route-template-unparsed",
+     "declared_in": "routes/web.php",
+     "effective_guards": [],
+     "authorization_state": "no_proven_authorization",
+     "authorization_reason": "",
+     "mesh_reason": ""
+    }
+   ],
+   "count": 1,
+   "coverage": {
+    "routes": 1,
+    "authorization_covered": 0,
+    "authentication_only": 0,
+    "public_declared": 0,
+    "undecided": 0,
+    "framework_check_only": 0,
+    "pattern_check_only": 0,
+    "no_indexed_check": 1,
+    "undecided_reasons": {}
+   },
+   "truncated": false,
+   "complete": true,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [],
+   "route_schema": 2
+  },
+  "posts.index": {
+   "resolved": true,
+   "repo": "demo.app",
+   "query": "posts.index",
+   "match": "route_name",
+   "generation_id": "gen-routes-v2",
+   "routes": [
+    {
+     "path": "/posts",
+     "route_name": "posts.index",
+     "http_methods": [
+      "GET"
+     ],
+     "route_complete": true,
+     "key": "demo.app\u001froutes/web.php\u001f/posts",
+     "source_file": "routes/web.php",
+     "citation": "[demo.app:routes/web.php:5]",
+     "guards": [
+      {
+       "guard": "auth",
+       "scope": "route",
+       "attribute": null,
+       "literal": true,
+       "subject": "",
+       "citation": "[demo.app:routes/web.php:5]",
+       "kind": "authentication",
+       "provider": "laravel",
+       "via": "middleware",
+       "key": "auth"
+      },
+      {
+       "guard": "throttle:60,1",
+       "scope": "route",
+       "attribute": null,
+       "literal": true,
+       "subject": "",
+       "citation": "[demo.app:routes/web.php:5]",
+       "kind": "middleware",
+       "provider": "laravel",
+       "via": "middleware",
+       "key": "throttle:60,1"
+      }
+     ],
+     "handlers": [
+      {
+       "key": "demo.app\u001fapp/Http/Controllers/PostController.php\u001f.index()",
+       "label": ".index()",
+       "source_file": "app/Http/Controllers/PostController.php",
+       "citation": "[demo.app:app/Http/Controllers/PostController.php:14]",
+       "class": "PostController",
+       "guards": [],
+       "access_checks": [],
+       "via": "route_file",
+       "provider": "laravel"
+      }
+     ],
+     "provider": "laravel",
+     "handler_kind": "method",
+     "route_template": "/posts",
+     "route_template_reason": "",
+     "declared_in": "routes/web.php",
+     "effective_guards": [
+      {
+       "guard": "auth",
+       "kind": "authentication",
+       "key": "auth",
+       "provider": "laravel"
+      },
+      {
+       "guard": "throttle:60,1",
+       "kind": "middleware",
+       "key": "throttle:60,1",
+       "provider": "laravel"
+      }
+     ],
+     "authorization_state": "no_proven_authorization",
+     "authorization_reason": "",
+     "mesh_reason": ""
+    }
+   ],
+   "count": 1,
+   "coverage": {
+    "routes": 1,
+    "authorization_covered": 0,
+    "authentication_only": 1,
+    "public_declared": 0,
+    "undecided": 0,
+    "framework_check_only": 0,
+    "pattern_check_only": 0,
+    "no_indexed_check": 0,
+    "undecided_reasons": {}
+   },
+   "truncated": false,
+   "complete": true,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [],
+   "route_schema": 2
+  },
+  "/admin/users/42": {
+   "resolved": true,
+   "repo": "demo.app",
+   "query": "/admin/users/42",
+   "match": "path_pattern",
+   "generation_id": "gen-routes-v2",
+   "routes": [
+    {
+     "path": "/admin/users/{id}",
+     "route_name": "admin_user_delete",
+     "http_methods": [
+      "DELETE"
+     ],
+     "route_complete": true,
+     "key": "demo.app\u001fsrc/Controller/Admin/UserController.php\u001f/admin/users/{id}",
+     "source_file": "src/Controller/Admin/UserController.php",
+     "citation": "[demo.app:src/Controller/Admin/UserController.php:39]",
+     "guards": [],
+     "handlers": [
+      {
+       "key": "demo.app\u001fsrc/Controller/Admin/UserController.php\u001f.delete()",
+       "label": ".delete()",
+       "source_file": "src/Controller/Admin/UserController.php",
+       "citation": "[demo.app:src/Controller/Admin/UserController.php:40]",
+       "class": "UserController",
+       "guards": [
+        {
+         "guard": "post.owner",
+         "scope": "method",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:src/Controller/Admin/UserController.php:38]",
+         "kind": "unknown",
+         "provider": "symfony",
+         "via": "attribute",
+         "key": "post.owner"
+        },
+        {
+         "guard": "ROLE_ADMIN",
+         "scope": "class",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:src/Controller/Admin/UserController.php:11]",
+         "kind": "authorization",
+         "provider": "symfony",
+         "via": "attribute",
+         "key": "ROLE_ADMIN"
+        }
+       ],
+       "access_checks": [],
+       "via": "attribute",
+       "provider": "symfony"
+      }
+     ],
+     "provider": "symfony",
+     "handler_kind": "method",
+     "route_template": "/admin/users/{id}",
+     "route_template_reason": "",
+     "declared_in": "src/Controller/Admin/UserController.php",
+     "effective_guards": [
+      {
+       "guard": "ROLE_ADMIN",
+       "kind": "authorization",
+       "key": "ROLE_ADMIN",
+       "provider": "symfony"
+      },
+      {
+       "guard": "post.owner",
+       "kind": "unknown",
+       "key": "post.owner",
+       "provider": "symfony"
+      }
+     ],
+     "authorization_state": "undecided",
+     "authorization_reason": "voter-undecided",
+     "mesh_reason": ""
+    }
+   ],
+   "count": 1,
+   "coverage": {
+    "routes": 1,
+    "authorization_covered": 0,
+    "authentication_only": 0,
+    "public_declared": 0,
+    "undecided": 1,
+    "framework_check_only": 0,
+    "pattern_check_only": 0,
+    "no_indexed_check": 0,
+    "undecided_reasons": {
+     "voter-undecided": 1
+    }
+   },
+   "truncated": false,
+   "complete": false,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "Symfony: access_control rules that could not be proved to match a route, firewalls and voters' own logic are not modelled.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [
+    "route_template_missing"
+   ],
+   "route_schema": 2
+  },
+  "/posts/7": {
+   "resolved": true,
+   "repo": "demo.app",
+   "query": "/posts/7",
+   "match": "path_pattern",
+   "generation_id": "gen-routes-v2",
+   "routes": [
+    {
+     "path": "/posts/{id?}",
+     "route_name": "posts.show",
+     "http_methods": [
+      "GET"
+     ],
+     "route_complete": true,
+     "key": "demo.app\u001froutes/web.php\u001f/posts/{id?}",
+     "source_file": "routes/web.php",
+     "citation": "[demo.app:routes/web.php:6]",
+     "guards": [],
+     "handlers": [
+      {
+       "key": "demo.app\u001fapp/Http/Controllers/PostController.php\u001f.show()",
+       "label": ".show()",
+       "source_file": "app/Http/Controllers/PostController.php",
+       "citation": "[demo.app:app/Http/Controllers/PostController.php:22]",
+       "class": "PostController",
+       "guards": [],
+       "access_checks": [
+        {
+         "check": "Gate::authorize",
+         "call": "Gate::authorize",
+         "kind": "framework",
+         "conditional": false,
+         "citation": "[demo.app:app/Http/Controllers/PostController.php:24]",
+         "guard_kind": "unknown",
+         "provider": "laravel"
+        }
+       ],
+       "via": "route_file",
+       "provider": "laravel"
+      }
+     ],
+     "provider": "laravel",
+     "handler_kind": "method",
+     "route_template": "/posts/{id?}",
+     "route_template_reason": "",
+     "declared_in": "routes/web.php",
+     "effective_guards": [],
+     "authorization_state": "no_proven_authorization",
+     "authorization_reason": "",
+     "mesh_reason": ""
+    }
+   ],
+   "count": 1,
+   "coverage": {
+    "routes": 1,
+    "authorization_covered": 0,
+    "authentication_only": 0,
+    "public_declared": 0,
+    "undecided": 1,
+    "framework_check_only": 0,
+    "pattern_check_only": 0,
+    "no_indexed_check": 0,
+    "undecided_reasons": {
+     "access-check-kind-unknown": 1
+    }
+   },
+   "truncated": false,
+   "complete": false,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [
+    "route_template_missing"
+   ],
+   "route_schema": 2
+  },
+  "/posts": {
+   "resolved": true,
+   "repo": "demo.app",
+   "query": "/posts",
+   "match": "path",
+   "generation_id": "gen-routes-v2",
+   "routes": [
+    {
+     "path": "/posts",
+     "route_name": "posts.index",
+     "http_methods": [
+      "GET"
+     ],
+     "route_complete": true,
+     "key": "demo.app\u001froutes/web.php\u001f/posts",
+     "source_file": "routes/web.php",
+     "citation": "[demo.app:routes/web.php:5]",
+     "guards": [
+      {
+       "guard": "auth",
+       "scope": "route",
+       "attribute": null,
+       "literal": true,
+       "subject": "",
+       "citation": "[demo.app:routes/web.php:5]",
+       "kind": "authentication",
+       "provider": "laravel",
+       "via": "middleware",
+       "key": "auth"
+      },
+      {
+       "guard": "throttle:60,1",
+       "scope": "route",
+       "attribute": null,
+       "literal": true,
+       "subject": "",
+       "citation": "[demo.app:routes/web.php:5]",
+       "kind": "middleware",
+       "provider": "laravel",
+       "via": "middleware",
+       "key": "throttle:60,1"
+      }
+     ],
+     "handlers": [
+      {
+       "key": "demo.app\u001fapp/Http/Controllers/PostController.php\u001f.index()",
+       "label": ".index()",
+       "source_file": "app/Http/Controllers/PostController.php",
+       "citation": "[demo.app:app/Http/Controllers/PostController.php:14]",
+       "class": "PostController",
+       "guards": [],
+       "access_checks": [],
+       "via": "route_file",
+       "provider": "laravel"
+      }
+     ],
+     "provider": "laravel",
+     "handler_kind": "method",
+     "route_template": "/posts",
+     "route_template_reason": "",
+     "declared_in": "routes/web.php",
+     "effective_guards": [
+      {
+       "guard": "auth",
+       "kind": "authentication",
+       "key": "auth",
+       "provider": "laravel"
+      },
+      {
+       "guard": "throttle:60,1",
+       "kind": "middleware",
+       "key": "throttle:60,1",
+       "provider": "laravel"
+      }
+     ],
+     "authorization_state": "no_proven_authorization",
+     "authorization_reason": "",
+     "mesh_reason": ""
+    }
+   ],
+   "count": 1,
+   "coverage": {
+    "routes": 1,
+    "authorization_covered": 0,
+    "authentication_only": 1,
+    "public_declared": 0,
+    "undecided": 0,
+    "framework_check_only": 0,
+    "pattern_check_only": 0,
+    "no_indexed_check": 0,
+    "undecided_reasons": {}
+   },
+   "truncated": false,
+   "complete": true,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [],
+   "route_schema": 2
+  },
+  "/admin/reports": {
+   "resolved": true,
+   "repo": "demo.app",
+   "query": "/admin/reports",
+   "match": "path_prefix",
+   "generation_id": "gen-routes-v2",
+   "routes": [
+    {
+     "path": "/admin/reports/{id}",
+     "route_name": "admin_report_show",
+     "http_methods": [
+      "GET"
+     ],
+     "route_complete": true,
+     "key": "demo.app\u001fsrc/Controller/Admin/ReportController.php\u001f/admin/reports/{id}",
+     "source_file": "src/Controller/Admin/ReportController.php",
+     "citation": "[demo.app:src/Controller/Admin/ReportController.php:14]",
+     "guards": [
+      {
+       "guard": "IS_AUTHENTICATED_FULLY",
+       "scope": "route",
+       "attribute": null,
+       "literal": true,
+       "subject": "",
+       "citation": "[demo.app:config/packages/security.yaml:30]",
+       "kind": "authentication",
+       "provider": "symfony",
+       "via": "access_control",
+       "key": "IS_AUTHENTICATED_FULLY"
+      }
+     ],
+     "handlers": [
+      {
+       "key": "demo.app\u001fsrc/Controller/Admin/ReportController.php\u001f.show()",
+       "label": ".show()",
+       "source_file": "src/Controller/Admin/ReportController.php",
+       "citation": "[demo.app:src/Controller/Admin/ReportController.php:15]",
+       "class": "ReportController",
+       "guards": [],
+       "access_checks": [
+        {
+         "check": "ROLE_AUDITOR",
+         "call": "isGranted",
+         "kind": "framework",
+         "conditional": false,
+         "citation": "[demo.app:src/Controller/Admin/ReportController.php:17]",
+         "guard_kind": "authorization",
+         "provider": "symfony"
+        }
+       ],
+       "via": "attribute",
+       "provider": "symfony"
+      }
+     ],
+     "provider": "symfony",
+     "handler_kind": "method",
+     "route_template": "/admin/reports/{id}",
+     "route_template_reason": "",
+     "declared_in": "src/Controller/Admin/ReportController.php",
+     "effective_guards": [
+      {
+       "guard": "IS_AUTHENTICATED_FULLY",
+       "kind": "authentication",
+       "key": "IS_AUTHENTICATED_FULLY",
+       "provider": "symfony"
+      }
+     ],
+     "authorization_state": "no_proven_authorization",
+     "authorization_reason": "",
+     "mesh_reason": ""
+    },
+    {
+     "path": "/admin/reports/{id}/export",
+     "route_name": "admin_report_export",
+     "http_methods": [
+      "GET"
+     ],
+     "route_complete": true,
+     "key": "demo.app\u001fsrc/Controller/Admin/ReportController.php\u001f/admin/reports/{id}/export",
+     "source_file": "src/Controller/Admin/ReportController.php",
+     "citation": "[demo.app:src/Controller/Admin/ReportController.php:24]",
+     "guards": [
+      {
+       "guard": "IS_AUTHENTICATED_FULLY",
+       "scope": "route",
+       "attribute": null,
+       "literal": true,
+       "subject": "",
+       "citation": "[demo.app:config/packages/security.yaml:30]",
+       "kind": "authentication",
+       "provider": "symfony",
+       "via": "access_control",
+       "key": "IS_AUTHENTICATED_FULLY"
+      }
+     ],
+     "handlers": [
+      {
+       "key": "demo.app\u001fsrc/Controller/Admin/ReportController.php\u001f.export()",
+       "label": ".export()",
+       "source_file": "src/Controller/Admin/ReportController.php",
+       "citation": "[demo.app:src/Controller/Admin/ReportController.php:25]",
+       "class": "ReportController",
+       "guards": [],
+       "access_checks": [
+        {
+         "check": "canExport",
+         "call": "canExport",
+         "kind": "pattern",
+         "conditional": false,
+         "citation": "[demo.app:src/Controller/Admin/ReportController.php:28]",
+         "guard_kind": "authorization",
+         "provider": "symfony"
+        },
+        {
+         "check": "Report::EXPORT",
+         "call": "isGranted",
+         "kind": "framework",
+         "conditional": false,
+         "citation": "[demo.app:src/Controller/Admin/ReportController.php:27]",
+         "guard_kind": "unknown",
+         "provider": "symfony"
+        }
+       ],
+       "via": "attribute",
+       "provider": "symfony"
+      }
+     ],
+     "provider": "symfony",
+     "handler_kind": "method",
+     "route_template": "/admin/reports/{id}/export",
+     "route_template_reason": "",
+     "declared_in": "src/Controller/Admin/ReportController.php",
+     "effective_guards": [
+      {
+       "guard": "IS_AUTHENTICATED_FULLY",
+       "kind": "authentication",
+       "key": "IS_AUTHENTICATED_FULLY",
+       "provider": "symfony"
+      }
+     ],
+     "authorization_state": "no_proven_authorization",
+     "authorization_reason": "",
+     "mesh_reason": ""
+    }
+   ],
+   "count": 2,
+   "coverage": {
+    "routes": 2,
+    "authorization_covered": 0,
+    "authentication_only": 1,
+    "public_declared": 0,
+    "undecided": 0,
+    "framework_check_only": 1,
+    "pattern_check_only": 0,
+    "no_indexed_check": 0,
+    "undecided_reasons": {}
+   },
+   "truncated": false,
+   "complete": false,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "Symfony: access_control rules that could not be proved to match a route, firewalls and voters' own logic are not modelled.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [
+    "route_template_missing"
+   ],
+   "route_schema": 2
+  },
+  "/": {
+   "resolved": true,
+   "repo": "demo.app",
+   "query": "/",
+   "match": "path_pattern",
+   "generation_id": "gen-routes-v2",
+   "routes": [
+    {
+     "path": "/{slug?}",
+     "route_name": "pages.show",
+     "http_methods": [
+      "GET"
+     ],
+     "route_complete": true,
+     "key": "demo.app\u001froutes/web.php\u001f/{slug?}",
+     "source_file": "routes/web.php",
+     "citation": "[demo.app:routes/web.php:11]",
+     "guards": [],
+     "handlers": [
+      {
+       "key": "demo.app\u001fapp/Http/Controllers/PageController.php\u001f.show()",
+       "label": ".show()",
+       "source_file": "app/Http/Controllers/PageController.php",
+       "citation": "[demo.app:app/Http/Controllers/PageController.php:12]",
+       "class": "PageController",
+       "guards": [],
+       "access_checks": [],
+       "via": "route_file",
+       "provider": "laravel"
+      }
+     ],
+     "provider": "laravel",
+     "handler_kind": "method",
+     "route_template": "/{slug?}",
+     "route_template_reason": "",
+     "declared_in": "routes/web.php",
+     "effective_guards": [],
+     "authorization_state": "no_proven_authorization",
+     "authorization_reason": "",
+     "mesh_reason": ""
+    }
+   ],
+   "count": 1,
+   "coverage": {
+    "routes": 1,
+    "authorization_covered": 0,
+    "authentication_only": 0,
+    "public_declared": 0,
+    "undecided": 0,
+    "framework_check_only": 0,
+    "pattern_check_only": 0,
+    "no_indexed_check": 1,
+    "undecided_reasons": {}
+   },
+   "truncated": false,
+   "complete": false,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [
+    "route_template_missing"
+   ],
+   "route_schema": 2
+  },
+  "/admin/users/42/edit/history": {
+   "resolved": true,
+   "repo": "demo.app",
+   "query": "/admin/users/42/edit/history",
+   "match": "ancestor_prefix",
+   "generation_id": "gen-routes-v2",
+   "routes": [
+    {
+     "path": "/admin/users/{id}/edit",
+     "route_name": "admin_user_edit",
+     "http_methods": [
+      "GET",
+      "POST"
+     ],
+     "route_complete": true,
+     "key": "demo.app\u001fsrc/Controller/Admin/UserController.php\u001f/admin/users/{id}/edit",
+     "source_file": "src/Controller/Admin/UserController.php",
+     "citation": "[demo.app:src/Controller/Admin/UserController.php:29]",
+     "guards": [],
+     "handlers": [
+      {
+       "key": "demo.app\u001fsrc/Controller/Admin/UserController.php\u001f.edit()",
+       "label": ".edit()",
+       "source_file": "src/Controller/Admin/UserController.php",
+       "citation": "[demo.app:src/Controller/Admin/UserController.php:30]",
+       "class": "UserController",
+       "guards": [
+        {
+         "guard": "ROLE_ADMIN",
+         "scope": "class",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:src/Controller/Admin/UserController.php:11]",
+         "kind": "authorization",
+         "provider": "symfony",
+         "via": "attribute",
+         "key": "ROLE_ADMIN"
+        }
+       ],
+       "access_checks": [
+        {
+         "check": "ROLE_AUDITOR",
+         "call": "denyAccessUnlessGranted",
+         "kind": "framework",
+         "conditional": false,
+         "citation": "[demo.app:src/Controller/Admin/UserController.php:32]",
+         "guard_kind": "authorization",
+         "provider": "symfony"
+        }
+       ],
+       "via": "attribute",
+       "provider": "symfony"
+      }
+     ],
+     "provider": "symfony",
+     "handler_kind": "method",
+     "route_template": "/admin/users/{id}/edit",
+     "route_template_reason": "",
+     "declared_in": "src/Controller/Admin/UserController.php",
+     "effective_guards": [
+      {
+       "guard": "ROLE_ADMIN",
+       "kind": "authorization",
+       "key": "ROLE_ADMIN",
+       "provider": "symfony"
+      }
+     ],
+     "authorization_state": "covered",
+     "authorization_reason": "",
+     "mesh_reason": ""
+    }
+   ],
+   "count": 1,
+   "coverage": {
+    "routes": 1,
+    "authorization_covered": 1,
+    "authentication_only": 0,
+    "public_declared": 0,
+    "undecided": 0,
+    "framework_check_only": 0,
+    "pattern_check_only": 0,
+    "no_indexed_check": 0,
+    "undecided_reasons": {}
+   },
+   "truncated": false,
+   "complete": false,
+   "suggestions": [
+    "/admin/users/{id}/edit",
+    "/admin/users/{id}",
+    "admin_user_edit",
+    "/admin/users",
+    "admin_users",
+    "admin_user_delete",
+    "/admin/reports/{id}",
+    "/admin/reports/{id}/export"
+   ],
+   "notes": [
+    "No indexed route matches the full path; these are the longest indexed routes whose path is a prefix of it. The exact route may be missing from the index: confirm in source.",
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "Symfony: access_control rules that could not be proved to match a route, firewalls and voters' own logic are not modelled.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [
+    "route_template_missing"
+   ],
+   "route_schema": 2
+  },
+  "missing.route": {
+   "resolved": false,
+   "repo": "demo.app",
+   "query": "missing.route",
+   "match": null,
+   "generation_id": "gen-routes-v2",
+   "routes": [],
+   "count": 0,
+   "coverage": {
+    "routes": 0,
+    "authorization_covered": 0,
+    "authentication_only": 0,
+    "public_declared": 0,
+    "undecided": 0,
+    "framework_check_only": 0,
+    "pattern_check_only": 0,
+    "no_indexed_check": 0,
+    "undecided_reasons": {}
+   },
+   "truncated": false,
+   "complete": false,
+   "suggestions": [
+    "posts.index",
+    "admin_users",
+    "admin_user_delete",
+    "/admin/users",
+    "admin_user_edit",
+    "admin_report_show",
+    "/admin/users/{id}",
+    "admin_report_export"
+   ],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [
+    "node_not_found"
+   ],
+   "route_schema": 2
+  }
+ },
+ "controller_outline": {
+  "app/Http/Controllers/PostController.php": {
+   "resolved": true,
+   "repo": "demo.app",
+   "target": "app/Http/Controllers/PostController.php",
+   "match": "file",
+   "generation_id": "gen-routes-v2",
+   "controllers": [
+    {
+     "source_file": "app/Http/Controllers/PostController.php",
+     "classes": [
+      {
+       "label": "PostController",
+       "guards": []
+      }
+     ],
+     "routes": [
+      {
+       "path": "/posts",
+       "route_name": "posts.index",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001froutes/web.php\u001f/posts",
+       "source_file": "routes/web.php",
+       "citation": "[demo.app:routes/web.php:5]",
+       "guards": [
+        {
+         "guard": "auth",
+         "scope": "route",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:routes/web.php:5]",
+         "kind": "authentication",
+         "provider": "laravel",
+         "via": "middleware",
+         "key": "auth"
+        },
+        {
+         "guard": "throttle:60,1",
+         "scope": "route",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:routes/web.php:5]",
+         "kind": "middleware",
+         "provider": "laravel",
+         "via": "middleware",
+         "key": "throttle:60,1"
+        }
+       ],
+       "handlers": [
+        {
+         "key": "demo.app\u001fapp/Http/Controllers/PostController.php\u001f.index()",
+         "label": ".index()",
+         "source_file": "app/Http/Controllers/PostController.php",
+         "citation": "[demo.app:app/Http/Controllers/PostController.php:14]",
+         "class": "PostController",
+         "guards": [],
+         "access_checks": [],
+         "via": "route_file",
+         "provider": "laravel"
+        }
+       ],
+       "provider": "laravel",
+       "handler_kind": "method",
+       "route_template": "/posts",
+       "route_template_reason": "",
+       "declared_in": "routes/web.php",
+       "effective_guards": [
+        {
+         "guard": "auth",
+         "kind": "authentication",
+         "key": "auth",
+         "provider": "laravel"
+        },
+        {
+         "guard": "throttle:60,1",
+         "kind": "middleware",
+         "key": "throttle:60,1",
+         "provider": "laravel"
+        }
+       ],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      },
+      {
+       "path": "/posts/{id?}",
+       "route_name": "posts.show",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001froutes/web.php\u001f/posts/{id?}",
+       "source_file": "routes/web.php",
+       "citation": "[demo.app:routes/web.php:6]",
+       "guards": [],
+       "handlers": [
+        {
+         "key": "demo.app\u001fapp/Http/Controllers/PostController.php\u001f.show()",
+         "label": ".show()",
+         "source_file": "app/Http/Controllers/PostController.php",
+         "citation": "[demo.app:app/Http/Controllers/PostController.php:22]",
+         "class": "PostController",
+         "guards": [],
+         "access_checks": [
+          {
+           "check": "Gate::authorize",
+           "call": "Gate::authorize",
+           "kind": "framework",
+           "conditional": false,
+           "citation": "[demo.app:app/Http/Controllers/PostController.php:24]",
+           "guard_kind": "unknown",
+           "provider": "laravel"
+          }
+         ],
+         "via": "route_file",
+         "provider": "laravel"
+        }
+       ],
+       "provider": "laravel",
+       "handler_kind": "method",
+       "route_template": "/posts/{id?}",
+       "route_template_reason": "",
+       "declared_in": "routes/web.php",
+       "effective_guards": [],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      },
+      {
+       "path": "/drafts",
+       "route_name": "drafts",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001froutes/web.php\u001f/drafts",
+       "source_file": "routes/web.php",
+       "citation": "[demo.app:routes/web.php:7]",
+       "guards": [],
+       "handlers": [
+        {
+         "key": "demo.app\u001fapp/Http/Controllers/PostController.php\u001f.drafts()",
+         "label": ".drafts()",
+         "source_file": "app/Http/Controllers/PostController.php",
+         "citation": "[demo.app:app/Http/Controllers/PostController.php:30]",
+         "class": "PostController",
+         "guards": [],
+         "access_checks": [
+          {
+           "check": "canDraft",
+           "call": "canDraft",
+           "kind": "pattern",
+           "conditional": false,
+           "citation": "[demo.app:app/Http/Controllers/PostController.php:32]",
+           "guard_kind": "authorization",
+           "provider": "laravel"
+          }
+         ],
+         "via": "route_file",
+         "provider": "laravel"
+        }
+       ],
+       "provider": "laravel",
+       "handler_kind": "method",
+       "route_template": "/drafts",
+       "route_template_reason": "",
+       "declared_in": "routes/web.php",
+       "effective_guards": [],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      },
+      {
+       "path": "/feed",
+       "route_name": "feed",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001froutes/web.php\u001f/feed",
+       "source_file": "routes/web.php",
+       "citation": "[demo.app:routes/web.php:8]",
+       "guards": [
+        {
+         "guard": "guest",
+         "scope": "route",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:routes/web.php:8]",
+         "kind": "public",
+         "provider": "laravel",
+         "via": "middleware",
+         "key": "guest"
+        }
+       ],
+       "handlers": [
+        {
+         "key": "demo.app\u001fapp/Http/Controllers/PostController.php\u001f.feed()",
+         "label": ".feed()",
+         "source_file": "app/Http/Controllers/PostController.php",
+         "citation": "[demo.app:app/Http/Controllers/PostController.php:38]",
+         "class": "PostController",
+         "guards": [],
+         "access_checks": [],
+         "via": "route_file",
+         "provider": "laravel"
+        }
+       ],
+       "provider": "laravel",
+       "handler_kind": "method",
+       "route_template": "/feed",
+       "route_template_reason": "",
+       "declared_in": "routes/web.php",
+       "effective_guards": [
+        {
+         "guard": "guest",
+         "kind": "public",
+         "key": "guest",
+         "provider": "laravel"
+        }
+       ],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      }
+     ]
+    }
+   ],
+   "route_count": 4,
+   "coverage": {
+    "routes": 4,
+    "authorization_covered": 0,
+    "authentication_only": 1,
+    "public_declared": 1,
+    "undecided": 1,
+    "framework_check_only": 0,
+    "pattern_check_only": 1,
+    "no_indexed_check": 0,
+    "undecided_reasons": {
+     "access-check-kind-unknown": 1
+    }
+   },
+   "truncated": false,
+   "complete": true,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [],
+   "route_schema": 2
+  },
+  "routes/web.php": {
+   "resolved": true,
+   "repo": "demo.app",
+   "target": "routes/web.php",
+   "match": "file",
+   "generation_id": "gen-routes-v2",
+   "controllers": [
+    {
+     "source_file": "routes/web.php",
+     "classes": [],
+     "routes": [
+      {
+       "path": "/health",
+       "route_name": "health",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001froutes/web.php\u001f/health",
+       "source_file": "routes/web.php",
+       "citation": "[demo.app:routes/web.php:9]",
+       "guards": [],
+       "handlers": [],
+       "provider": "laravel",
+       "handler_kind": "closure",
+       "route_template": "/health",
+       "route_template_reason": "",
+       "declared_in": "routes/web.php",
+       "effective_guards": [],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      },
+      {
+       "path": "/legacy/{slug}",
+       "route_name": "legacy",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001froutes/web.php\u001f/legacy/{slug}",
+       "source_file": "routes/web.php",
+       "citation": "[demo.app:routes/web.php:10]",
+       "guards": [],
+       "handlers": [],
+       "provider": "laravel",
+       "handler_kind": "unresolved",
+       "route_template": "",
+       "route_template_reason": "route-template-unparsed",
+       "declared_in": "routes/web.php",
+       "effective_guards": [],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      }
+     ]
+    }
+   ],
+   "route_count": 2,
+   "coverage": {
+    "routes": 2,
+    "authorization_covered": 0,
+    "authentication_only": 0,
+    "public_declared": 0,
+    "undecided": 0,
+    "framework_check_only": 0,
+    "pattern_check_only": 0,
+    "no_indexed_check": 2,
+    "undecided_reasons": {}
+   },
+   "truncated": false,
+   "complete": true,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [],
+   "route_schema": 2
+  },
+  "src/Controller/Admin": {
+   "resolved": true,
+   "repo": "demo.app",
+   "target": "src/Controller/Admin",
+   "match": "directory",
+   "generation_id": "gen-routes-v2",
+   "controllers": [
+    {
+     "source_file": "src/Controller/Admin/ReportController.php",
+     "classes": [
+      {
+       "label": "ReportController",
+       "guards": []
+      }
+     ],
+     "routes": [
+      {
+       "path": "/admin/reports/{id}",
+       "route_name": "admin_report_show",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001fsrc/Controller/Admin/ReportController.php\u001f/admin/reports/{id}",
+       "source_file": "src/Controller/Admin/ReportController.php",
+       "citation": "[demo.app:src/Controller/Admin/ReportController.php:14]",
+       "guards": [
+        {
+         "guard": "IS_AUTHENTICATED_FULLY",
+         "scope": "route",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:config/packages/security.yaml:30]",
+         "kind": "authentication",
+         "provider": "symfony",
+         "via": "access_control",
+         "key": "IS_AUTHENTICATED_FULLY"
+        }
+       ],
+       "handlers": [
+        {
+         "key": "demo.app\u001fsrc/Controller/Admin/ReportController.php\u001f.show()",
+         "label": ".show()",
+         "source_file": "src/Controller/Admin/ReportController.php",
+         "citation": "[demo.app:src/Controller/Admin/ReportController.php:15]",
+         "class": "ReportController",
+         "guards": [],
+         "access_checks": [
+          {
+           "check": "ROLE_AUDITOR",
+           "call": "isGranted",
+           "kind": "framework",
+           "conditional": false,
+           "citation": "[demo.app:src/Controller/Admin/ReportController.php:17]",
+           "guard_kind": "authorization",
+           "provider": "symfony"
+          }
+         ],
+         "via": "attribute",
+         "provider": "symfony"
+        }
+       ],
+       "provider": "symfony",
+       "handler_kind": "method",
+       "route_template": "/admin/reports/{id}",
+       "route_template_reason": "",
+       "declared_in": "src/Controller/Admin/ReportController.php",
+       "effective_guards": [
+        {
+         "guard": "IS_AUTHENTICATED_FULLY",
+         "kind": "authentication",
+         "key": "IS_AUTHENTICATED_FULLY",
+         "provider": "symfony"
+        }
+       ],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      },
+      {
+       "path": "/admin/reports/{id}/export",
+       "route_name": "admin_report_export",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001fsrc/Controller/Admin/ReportController.php\u001f/admin/reports/{id}/export",
+       "source_file": "src/Controller/Admin/ReportController.php",
+       "citation": "[demo.app:src/Controller/Admin/ReportController.php:24]",
+       "guards": [
+        {
+         "guard": "IS_AUTHENTICATED_FULLY",
+         "scope": "route",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:config/packages/security.yaml:30]",
+         "kind": "authentication",
+         "provider": "symfony",
+         "via": "access_control",
+         "key": "IS_AUTHENTICATED_FULLY"
+        }
+       ],
+       "handlers": [
+        {
+         "key": "demo.app\u001fsrc/Controller/Admin/ReportController.php\u001f.export()",
+         "label": ".export()",
+         "source_file": "src/Controller/Admin/ReportController.php",
+         "citation": "[demo.app:src/Controller/Admin/ReportController.php:25]",
+         "class": "ReportController",
+         "guards": [],
+         "access_checks": [
+          {
+           "check": "canExport",
+           "call": "canExport",
+           "kind": "pattern",
+           "conditional": false,
+           "citation": "[demo.app:src/Controller/Admin/ReportController.php:28]",
+           "guard_kind": "authorization",
+           "provider": "symfony"
+          },
+          {
+           "check": "Report::EXPORT",
+           "call": "isGranted",
+           "kind": "framework",
+           "conditional": false,
+           "citation": "[demo.app:src/Controller/Admin/ReportController.php:27]",
+           "guard_kind": "unknown",
+           "provider": "symfony"
+          }
+         ],
+         "via": "attribute",
+         "provider": "symfony"
+        }
+       ],
+       "provider": "symfony",
+       "handler_kind": "method",
+       "route_template": "/admin/reports/{id}/export",
+       "route_template_reason": "",
+       "declared_in": "src/Controller/Admin/ReportController.php",
+       "effective_guards": [
+        {
+         "guard": "IS_AUTHENTICATED_FULLY",
+         "kind": "authentication",
+         "key": "IS_AUTHENTICATED_FULLY",
+         "provider": "symfony"
+        }
+       ],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      }
+     ]
+    },
+    {
+     "source_file": "src/Controller/Admin/UserController.php",
+     "classes": [
+      {
+       "label": "UserController",
+       "guards": [
+        {
+         "guard": "ROLE_ADMIN",
+         "scope": "class",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:src/Controller/Admin/UserController.php:11]",
+         "kind": "authorization",
+         "provider": "symfony",
+         "via": "attribute",
+         "key": "ROLE_ADMIN"
+        }
+       ]
+      }
+     ],
+     "routes": [
+      {
+       "path": "/admin/users",
+       "route_name": "admin_users",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001fsrc/Controller/Admin/UserController.php\u001f/admin/users",
+       "source_file": "src/Controller/Admin/UserController.php",
+       "citation": "[demo.app:src/Controller/Admin/UserController.php:19]",
+       "guards": [],
+       "handlers": [
+        {
+         "key": "demo.app\u001fsrc/Controller/Admin/UserController.php\u001f.list()",
+         "label": ".list()",
+         "source_file": "src/Controller/Admin/UserController.php",
+         "citation": "[demo.app:src/Controller/Admin/UserController.php:20]",
+         "class": "UserController",
+         "guards": [
+          {
+           "guard": "ROLE_ADMIN",
+           "scope": "class",
+           "attribute": null,
+           "literal": true,
+           "subject": "",
+           "citation": "[demo.app:src/Controller/Admin/UserController.php:11]",
+           "kind": "authorization",
+           "provider": "symfony",
+           "via": "attribute",
+           "key": "ROLE_ADMIN"
+          }
+         ],
+         "access_checks": [],
+         "via": "attribute",
+         "provider": "symfony"
+        }
+       ],
+       "provider": "symfony",
+       "handler_kind": "method",
+       "route_template": "/admin/users",
+       "route_template_reason": "",
+       "declared_in": "src/Controller/Admin/UserController.php",
+       "effective_guards": [
+        {
+         "guard": "ROLE_ADMIN",
+         "kind": "authorization",
+         "key": "ROLE_ADMIN",
+         "provider": "symfony"
+        }
+       ],
+       "authorization_state": "covered",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      },
+      {
+       "path": "/admin/users/{id}/edit",
+       "route_name": "admin_user_edit",
+       "http_methods": [
+        "GET",
+        "POST"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001fsrc/Controller/Admin/UserController.php\u001f/admin/users/{id}/edit",
+       "source_file": "src/Controller/Admin/UserController.php",
+       "citation": "[demo.app:src/Controller/Admin/UserController.php:29]",
+       "guards": [],
+       "handlers": [
+        {
+         "key": "demo.app\u001fsrc/Controller/Admin/UserController.php\u001f.edit()",
+         "label": ".edit()",
+         "source_file": "src/Controller/Admin/UserController.php",
+         "citation": "[demo.app:src/Controller/Admin/UserController.php:30]",
+         "class": "UserController",
+         "guards": [
+          {
+           "guard": "ROLE_ADMIN",
+           "scope": "class",
+           "attribute": null,
+           "literal": true,
+           "subject": "",
+           "citation": "[demo.app:src/Controller/Admin/UserController.php:11]",
+           "kind": "authorization",
+           "provider": "symfony",
+           "via": "attribute",
+           "key": "ROLE_ADMIN"
+          }
+         ],
+         "access_checks": [
+          {
+           "check": "ROLE_AUDITOR",
+           "call": "denyAccessUnlessGranted",
+           "kind": "framework",
+           "conditional": false,
+           "citation": "[demo.app:src/Controller/Admin/UserController.php:32]",
+           "guard_kind": "authorization",
+           "provider": "symfony"
+          }
+         ],
+         "via": "attribute",
+         "provider": "symfony"
+        }
+       ],
+       "provider": "symfony",
+       "handler_kind": "method",
+       "route_template": "/admin/users/{id}/edit",
+       "route_template_reason": "",
+       "declared_in": "src/Controller/Admin/UserController.php",
+       "effective_guards": [
+        {
+         "guard": "ROLE_ADMIN",
+         "kind": "authorization",
+         "key": "ROLE_ADMIN",
+         "provider": "symfony"
+        }
+       ],
+       "authorization_state": "covered",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      },
+      {
+       "path": "/admin/users/{id}",
+       "route_name": "admin_user_delete",
+       "http_methods": [
+        "DELETE"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001fsrc/Controller/Admin/UserController.php\u001f/admin/users/{id}",
+       "source_file": "src/Controller/Admin/UserController.php",
+       "citation": "[demo.app:src/Controller/Admin/UserController.php:39]",
+       "guards": [],
+       "handlers": [
+        {
+         "key": "demo.app\u001fsrc/Controller/Admin/UserController.php\u001f.delete()",
+         "label": ".delete()",
+         "source_file": "src/Controller/Admin/UserController.php",
+         "citation": "[demo.app:src/Controller/Admin/UserController.php:40]",
+         "class": "UserController",
+         "guards": [
+          {
+           "guard": "post.owner",
+           "scope": "method",
+           "attribute": null,
+           "literal": true,
+           "subject": "",
+           "citation": "[demo.app:src/Controller/Admin/UserController.php:38]",
+           "kind": "unknown",
+           "provider": "symfony",
+           "via": "attribute",
+           "key": "post.owner"
+          },
+          {
+           "guard": "ROLE_ADMIN",
+           "scope": "class",
+           "attribute": null,
+           "literal": true,
+           "subject": "",
+           "citation": "[demo.app:src/Controller/Admin/UserController.php:11]",
+           "kind": "authorization",
+           "provider": "symfony",
+           "via": "attribute",
+           "key": "ROLE_ADMIN"
+          }
+         ],
+         "access_checks": [],
+         "via": "attribute",
+         "provider": "symfony"
+        }
+       ],
+       "provider": "symfony",
+       "handler_kind": "method",
+       "route_template": "/admin/users/{id}",
+       "route_template_reason": "",
+       "declared_in": "src/Controller/Admin/UserController.php",
+       "effective_guards": [
+        {
+         "guard": "ROLE_ADMIN",
+         "kind": "authorization",
+         "key": "ROLE_ADMIN",
+         "provider": "symfony"
+        },
+        {
+         "guard": "post.owner",
+         "kind": "unknown",
+         "key": "post.owner",
+         "provider": "symfony"
+        }
+       ],
+       "authorization_state": "undecided",
+       "authorization_reason": "voter-undecided",
+       "mesh_reason": ""
+      }
+     ]
+    }
+   ],
+   "route_count": 5,
+   "coverage": {
+    "routes": 5,
+    "authorization_covered": 2,
+    "authentication_only": 1,
+    "public_declared": 0,
+    "undecided": 1,
+    "framework_check_only": 1,
+    "pattern_check_only": 0,
+    "no_indexed_check": 0,
+    "undecided_reasons": {
+     "voter-undecided": 1
+    }
+   },
+   "truncated": false,
+   "complete": true,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "Symfony: access_control rules that could not be proved to match a route, firewalls and voters' own logic are not modelled.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [],
+   "route_schema": 2
+  },
+  "PostController": {
+   "resolved": true,
+   "repo": "demo.app",
+   "target": "PostController",
+   "match": "class",
+   "generation_id": "gen-routes-v2",
+   "controllers": [
+    {
+     "source_file": "app/Http/Controllers/PostController.php",
+     "classes": [
+      {
+       "label": "PostController",
+       "guards": []
+      }
+     ],
+     "routes": [
+      {
+       "path": "/posts",
+       "route_name": "posts.index",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001froutes/web.php\u001f/posts",
+       "source_file": "routes/web.php",
+       "citation": "[demo.app:routes/web.php:5]",
+       "guards": [
+        {
+         "guard": "auth",
+         "scope": "route",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:routes/web.php:5]",
+         "kind": "authentication",
+         "provider": "laravel",
+         "via": "middleware",
+         "key": "auth"
+        },
+        {
+         "guard": "throttle:60,1",
+         "scope": "route",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:routes/web.php:5]",
+         "kind": "middleware",
+         "provider": "laravel",
+         "via": "middleware",
+         "key": "throttle:60,1"
+        }
+       ],
+       "handlers": [
+        {
+         "key": "demo.app\u001fapp/Http/Controllers/PostController.php\u001f.index()",
+         "label": ".index()",
+         "source_file": "app/Http/Controllers/PostController.php",
+         "citation": "[demo.app:app/Http/Controllers/PostController.php:14]",
+         "class": "PostController",
+         "guards": [],
+         "access_checks": [],
+         "via": "route_file",
+         "provider": "laravel"
+        }
+       ],
+       "provider": "laravel",
+       "handler_kind": "method",
+       "route_template": "/posts",
+       "route_template_reason": "",
+       "declared_in": "routes/web.php",
+       "effective_guards": [
+        {
+         "guard": "auth",
+         "kind": "authentication",
+         "key": "auth",
+         "provider": "laravel"
+        },
+        {
+         "guard": "throttle:60,1",
+         "kind": "middleware",
+         "key": "throttle:60,1",
+         "provider": "laravel"
+        }
+       ],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      },
+      {
+       "path": "/posts/{id?}",
+       "route_name": "posts.show",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001froutes/web.php\u001f/posts/{id?}",
+       "source_file": "routes/web.php",
+       "citation": "[demo.app:routes/web.php:6]",
+       "guards": [],
+       "handlers": [
+        {
+         "key": "demo.app\u001fapp/Http/Controllers/PostController.php\u001f.show()",
+         "label": ".show()",
+         "source_file": "app/Http/Controllers/PostController.php",
+         "citation": "[demo.app:app/Http/Controllers/PostController.php:22]",
+         "class": "PostController",
+         "guards": [],
+         "access_checks": [
+          {
+           "check": "Gate::authorize",
+           "call": "Gate::authorize",
+           "kind": "framework",
+           "conditional": false,
+           "citation": "[demo.app:app/Http/Controllers/PostController.php:24]",
+           "guard_kind": "unknown",
+           "provider": "laravel"
+          }
+         ],
+         "via": "route_file",
+         "provider": "laravel"
+        }
+       ],
+       "provider": "laravel",
+       "handler_kind": "method",
+       "route_template": "/posts/{id?}",
+       "route_template_reason": "",
+       "declared_in": "routes/web.php",
+       "effective_guards": [],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      },
+      {
+       "path": "/drafts",
+       "route_name": "drafts",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001froutes/web.php\u001f/drafts",
+       "source_file": "routes/web.php",
+       "citation": "[demo.app:routes/web.php:7]",
+       "guards": [],
+       "handlers": [
+        {
+         "key": "demo.app\u001fapp/Http/Controllers/PostController.php\u001f.drafts()",
+         "label": ".drafts()",
+         "source_file": "app/Http/Controllers/PostController.php",
+         "citation": "[demo.app:app/Http/Controllers/PostController.php:30]",
+         "class": "PostController",
+         "guards": [],
+         "access_checks": [
+          {
+           "check": "canDraft",
+           "call": "canDraft",
+           "kind": "pattern",
+           "conditional": false,
+           "citation": "[demo.app:app/Http/Controllers/PostController.php:32]",
+           "guard_kind": "authorization",
+           "provider": "laravel"
+          }
+         ],
+         "via": "route_file",
+         "provider": "laravel"
+        }
+       ],
+       "provider": "laravel",
+       "handler_kind": "method",
+       "route_template": "/drafts",
+       "route_template_reason": "",
+       "declared_in": "routes/web.php",
+       "effective_guards": [],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      },
+      {
+       "path": "/feed",
+       "route_name": "feed",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001froutes/web.php\u001f/feed",
+       "source_file": "routes/web.php",
+       "citation": "[demo.app:routes/web.php:8]",
+       "guards": [
+        {
+         "guard": "guest",
+         "scope": "route",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:routes/web.php:8]",
+         "kind": "public",
+         "provider": "laravel",
+         "via": "middleware",
+         "key": "guest"
+        }
+       ],
+       "handlers": [
+        {
+         "key": "demo.app\u001fapp/Http/Controllers/PostController.php\u001f.feed()",
+         "label": ".feed()",
+         "source_file": "app/Http/Controllers/PostController.php",
+         "citation": "[demo.app:app/Http/Controllers/PostController.php:38]",
+         "class": "PostController",
+         "guards": [],
+         "access_checks": [],
+         "via": "route_file",
+         "provider": "laravel"
+        }
+       ],
+       "provider": "laravel",
+       "handler_kind": "method",
+       "route_template": "/feed",
+       "route_template_reason": "",
+       "declared_in": "routes/web.php",
+       "effective_guards": [
+        {
+         "guard": "guest",
+         "kind": "public",
+         "key": "guest",
+         "provider": "laravel"
+        }
+       ],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      }
+     ]
+    }
+   ],
+   "route_count": 4,
+   "coverage": {
+    "routes": 4,
+    "authorization_covered": 0,
+    "authentication_only": 1,
+    "public_declared": 1,
+    "undecided": 1,
+    "framework_check_only": 0,
+    "pattern_check_only": 1,
+    "no_indexed_check": 0,
+    "undecided_reasons": {
+     "access-check-kind-unknown": 1
+    }
+   },
+   "truncated": false,
+   "complete": true,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [],
+   "route_schema": 2
+  },
+  "App\\Controller\\Admin\\ReportController": {
+   "resolved": true,
+   "repo": "demo.app",
+   "target": "App\\Controller\\Admin\\ReportController",
+   "match": "class",
+   "generation_id": "gen-routes-v2",
+   "controllers": [
+    {
+     "source_file": "src/Controller/Admin/ReportController.php",
+     "classes": [
+      {
+       "label": "ReportController",
+       "guards": []
+      }
+     ],
+     "routes": [
+      {
+       "path": "/admin/reports/{id}",
+       "route_name": "admin_report_show",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001fsrc/Controller/Admin/ReportController.php\u001f/admin/reports/{id}",
+       "source_file": "src/Controller/Admin/ReportController.php",
+       "citation": "[demo.app:src/Controller/Admin/ReportController.php:14]",
+       "guards": [
+        {
+         "guard": "IS_AUTHENTICATED_FULLY",
+         "scope": "route",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:config/packages/security.yaml:30]",
+         "kind": "authentication",
+         "provider": "symfony",
+         "via": "access_control",
+         "key": "IS_AUTHENTICATED_FULLY"
+        }
+       ],
+       "handlers": [
+        {
+         "key": "demo.app\u001fsrc/Controller/Admin/ReportController.php\u001f.show()",
+         "label": ".show()",
+         "source_file": "src/Controller/Admin/ReportController.php",
+         "citation": "[demo.app:src/Controller/Admin/ReportController.php:15]",
+         "class": "ReportController",
+         "guards": [],
+         "access_checks": [
+          {
+           "check": "ROLE_AUDITOR",
+           "call": "isGranted",
+           "kind": "framework",
+           "conditional": false,
+           "citation": "[demo.app:src/Controller/Admin/ReportController.php:17]",
+           "guard_kind": "authorization",
+           "provider": "symfony"
+          }
+         ],
+         "via": "attribute",
+         "provider": "symfony"
+        }
+       ],
+       "provider": "symfony",
+       "handler_kind": "method",
+       "route_template": "/admin/reports/{id}",
+       "route_template_reason": "",
+       "declared_in": "src/Controller/Admin/ReportController.php",
+       "effective_guards": [
+        {
+         "guard": "IS_AUTHENTICATED_FULLY",
+         "kind": "authentication",
+         "key": "IS_AUTHENTICATED_FULLY",
+         "provider": "symfony"
+        }
+       ],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      },
+      {
+       "path": "/admin/reports/{id}/export",
+       "route_name": "admin_report_export",
+       "http_methods": [
+        "GET"
+       ],
+       "route_complete": true,
+       "key": "demo.app\u001fsrc/Controller/Admin/ReportController.php\u001f/admin/reports/{id}/export",
+       "source_file": "src/Controller/Admin/ReportController.php",
+       "citation": "[demo.app:src/Controller/Admin/ReportController.php:24]",
+       "guards": [
+        {
+         "guard": "IS_AUTHENTICATED_FULLY",
+         "scope": "route",
+         "attribute": null,
+         "literal": true,
+         "subject": "",
+         "citation": "[demo.app:config/packages/security.yaml:30]",
+         "kind": "authentication",
+         "provider": "symfony",
+         "via": "access_control",
+         "key": "IS_AUTHENTICATED_FULLY"
+        }
+       ],
+       "handlers": [
+        {
+         "key": "demo.app\u001fsrc/Controller/Admin/ReportController.php\u001f.export()",
+         "label": ".export()",
+         "source_file": "src/Controller/Admin/ReportController.php",
+         "citation": "[demo.app:src/Controller/Admin/ReportController.php:25]",
+         "class": "ReportController",
+         "guards": [],
+         "access_checks": [
+          {
+           "check": "canExport",
+           "call": "canExport",
+           "kind": "pattern",
+           "conditional": false,
+           "citation": "[demo.app:src/Controller/Admin/ReportController.php:28]",
+           "guard_kind": "authorization",
+           "provider": "symfony"
+          },
+          {
+           "check": "Report::EXPORT",
+           "call": "isGranted",
+           "kind": "framework",
+           "conditional": false,
+           "citation": "[demo.app:src/Controller/Admin/ReportController.php:27]",
+           "guard_kind": "unknown",
+           "provider": "symfony"
+          }
+         ],
+         "via": "attribute",
+         "provider": "symfony"
+        }
+       ],
+       "provider": "symfony",
+       "handler_kind": "method",
+       "route_template": "/admin/reports/{id}/export",
+       "route_template_reason": "",
+       "declared_in": "src/Controller/Admin/ReportController.php",
+       "effective_guards": [
+        {
+         "guard": "IS_AUTHENTICATED_FULLY",
+         "kind": "authentication",
+         "key": "IS_AUTHENTICATED_FULLY",
+         "provider": "symfony"
+        }
+       ],
+       "authorization_state": "no_proven_authorization",
+       "authorization_reason": "",
+       "mesh_reason": ""
+      }
+     ]
+    }
+   ],
+   "route_count": 2,
+   "coverage": {
+    "routes": 2,
+    "authorization_covered": 0,
+    "authentication_only": 1,
+    "public_declared": 0,
+    "undecided": 0,
+    "framework_check_only": 1,
+    "pattern_check_only": 0,
+    "no_indexed_check": 0,
+    "undecided_reasons": {}
+   },
+   "truncated": false,
+   "complete": true,
+   "suggestions": [],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "Symfony: access_control rules that could not be proved to match a route, firewalls and voters' own logic are not modelled.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [],
+   "route_schema": 2
+  },
+  "Missing.php": {
+   "resolved": false,
+   "repo": "demo.app",
+   "target": "Missing.php",
+   "match": null,
+   "generation_id": "gen-routes-v2",
+   "controllers": [],
+   "route_count": 0,
+   "coverage": {
+    "routes": 0,
+    "authorization_covered": 0,
+    "authentication_only": 0,
+    "public_declared": 0,
+    "undecided": 0,
+    "framework_check_only": 0,
+    "pattern_check_only": 0,
+    "no_indexed_check": 0,
+    "undecided_reasons": {}
+   },
+   "truncated": false,
+   "complete": false,
+   "suggestions": [
+    "routes/web.php",
+    "src/Controller/Admin/UserController.php",
+    "app/Http/Controllers/PostController.php"
+   ],
+   "notes": [
+    "Routes come from what the extractor indexed for each provider (attributes, route files, route config); routes registered at runtime are not indexed.",
+    "Not modelled: guards that could not be proved to apply to a route, and checks in called services, helpers, listeners or middleware bodies. An empty guards/access_checks list means nothing was indexed for that route, not that it has no access control.",
+    "A guard with scope 'class' comes from the controller class and applies to every action in it.",
+    "coverage reads each route's authorization_state from the extractor: no_proven_authorization means no authorization guard was proved, not that the route is open."
+   ],
+   "degraded": [
+    "node_not_found"
+   ],
+   "route_schema": 2
+  }
+ },
+ "whole": {
+  "routes": 12,
+  "authorization_covered": 2,
+  "authentication_only": 2,
+  "public_declared": 1,
+  "undecided": 2,
+  "framework_check_only": 1,
+  "pattern_check_only": 1,
+  "no_indexed_check": 3,
+  "undecided_reasons": {
+   "access-check-kind-unknown": 1,
+   "voter-undecided": 1
+  }
+ }
+}

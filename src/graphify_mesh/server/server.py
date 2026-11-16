@@ -514,7 +514,9 @@ class GraphifyMeshServer:
                 query=route,
                 degraded=["repo_not_registered"],
             ).as_dict()
-        return routes_mod.route_handler(route, entry.repo_id, self._generation()).as_dict()
+        return routes_mod.route_handler(
+            route, entry.repo_id, self._generation(), repo_root=str(entry.root)
+        ).as_dict()
 
     def tool_controller_outline(self, arguments: dict) -> dict:
         target = arguments.get("target")
