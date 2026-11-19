@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import threading
 from pathlib import Path
 
 import pytest
 
-from graphify_mesh.sync import repo_tags
+from graphify_mesh.sync import graphify_cli, repo_tags
 from graphify_mesh.sync.config import (
     CLASSIFICATION_TABLES,
     CLASSIFICATION_VERSION,
@@ -372,3 +373,140 @@ class TestPipeline:
         assert _row(run(_settings(env)))["action"] == ACTION_UPDATE
         entry = load_state(path)[PIPELINE_REPO]
         assert entry[DIGEST_RECIPE_KEY] == digest_recipe("0.9.104")
+
+
+def _ignore_hash(root: Path, rules: IgnoreRules = RULES) -> str:
+    return compute_source_manifest(root, ignore_rules=rules).ignore_hash
+
+
+class TestIgnoreHash:
+    """SourceDigest.ignore_hash: the pipeline forces a full rebuild when it moves."""
+
+    def test_graphifyignore_line_changes_it_and_removal_restores_it(self, repo):
+        before = _ignore_hash(repo)
+        assert before
+
+        original = (repo / ".graphifyignore").read_text(encoding="utf-8")
+        (repo / ".graphifyignore").write_text(original + "src/\n", encoding="utf-8")
+        assert _ignore_hash(repo) != before
+
+        (repo / ".graphifyignore").write_text(original, encoding="utf-8")
+        assert _ignore_hash(repo) == before
+
+    def test_nested_ignore_file_counts(self, repo):
+        before = _ignore_hash(repo)
+        (repo / "src" / ".graphifyignore").write_text("app.py\n", encoding="utf-8")
+        assert _ignore_hash(repo) != before
+
+    def test_gitignore_counts_only_when_honoured(self, repo):
+        honoured = IgnoreRules(RULES.extra_excludes, gitignore=True)
+        not_honoured = IgnoreRules(RULES.extra_excludes, gitignore=False)
+        before_on = _ignore_hash(repo, honoured)
+        before_off = _ignore_hash(repo, not_honoured)
+        assert before_on != before_off, "the gitignore switch itself is a rule"
+
+        with (repo / ".gitignore").open("a", encoding="utf-8") as fh:
+            fh.write("README.md\n")
+
+        assert _ignore_hash(repo, honoured) != before_on
+        assert _ignore_hash(repo, not_honoured) == before_off
+
+    def test_persisted_excludes_count(self, repo):
+        more = IgnoreRules((*RULES.extra_excludes, "src/"))
+        assert _ignore_hash(repo, more) != _ignore_hash(repo)
+
+    def test_unrelated_source_edit_leaves_it(self, repo):
+        before = _ignore_hash(repo)
+        _edit(repo, "src/app.py")
+        (repo / "src" / "new.py").write_text("x = 2\n", encoding="utf-8")
+        assert _ignore_hash(repo) == before
+
+    def test_new_file_beside_an_unchanged_ignore_file_leaves_it(self, repo):
+        (repo / "scratch").mkdir()
+        (repo / "scratch" / ".gitignore").write_text("*.log\n", encoding="utf-8")
+        before = _ignore_hash(repo)
+        (repo / "scratch" / "x.py").write_text("x = 1\n", encoding="utf-8")
+        assert _ignore_hash(repo) == before
+
+    def test_symlinked_dir_outside_the_repo_is_not_read(self, repo, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / ".graphifyignore").write_text("a/\n", encoding="utf-8")
+        (outside / "b.py").write_text("x = 1\n", encoding="utf-8")
+        (repo / "linked").symlink_to(outside, target_is_directory=True)
+        before = _ignore_hash(repo)
+        (outside / ".graphifyignore").write_text("b/\n", encoding="utf-8")
+        assert _ignore_hash(repo) == before
+
+    def test_table_that_ignores_no_files_has_none(self, repo):
+        assert compute_source_manifest(repo, LEGACY_CLASSIFICATION_V2).ignore_hash == ""
+
+    def test_migration_walk_matches_the_steady_walk(self, repo):
+        """A legacy table descends var/cache, which graphify prunes; an ignore
+        file found there must not move the hash, or the run after the migration
+        is accepted rebuilds again."""
+        (repo / "var" / "cache" / ".gitignore").write_text("*.php\n", encoding="utf-8")
+        # A descended dir holding only an uncategorized file next to its rules.
+        (repo / "pkg" / "sub").mkdir(parents=True)
+        (repo / "pkg" / ".graphifyignore").write_text("sub/\n", encoding="utf-8")
+        (repo / "pkg" / "notes.ini").write_text("[a]\n", encoding="utf-8")
+        (repo / "pkg" / "sub" / "settings.ini").write_text("[b]\n", encoding="utf-8")
+        steady = compute_source_manifests(repo, (CURRENT_CLASSIFICATION,), RULES)[0]
+        migrating = compute_source_manifests(
+            repo, (CURRENT_CLASSIFICATION, LEGACY_CLASSIFICATION_V2), RULES
+        )
+        assert migrating[0].ignore_hash == steady.ignore_hash
+        assert migrating[1].ignore_hash == ""
+
+    def test_not_part_of_the_stored_digest(self, repo):
+        digest = compute_source_manifest(repo, ignore_rules=RULES)
+        assert "ignore_hash" not in digest.to_dict()
+
+
+def _graph_sources(root: Path) -> set[str]:
+    graph = json.loads((root / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    return {
+        str(node.get("source_file") or "").replace("\\", "/") for node in graph.get("nodes", [])
+    }
+
+
+def _under_tests(sources: set[str]) -> bool:
+    return any(s == "tests" or s.startswith("tests/") or "/tests/" in s for s in sources)
+
+
+def test_real_graphify_force_update_drops_newly_ignored_files(tmp_path, monkeypatch):
+    """The bug: incremental `update` keeps nodes of a newly ignored file;
+    `update --force`, which the pipeline now runs on an ignore change, drops them."""
+    graphify_bin = shutil.which("graphify") or ""
+    if not graphify_bin:
+        pytest.skip("the real `graphify` binary is not on PATH")
+    monkeypatch.delenv(graphify_cli.CHILD_SANDBOX_VAR, raising=False)
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write(
+        root,
+        {
+            "src/a.py": "def alpha():\n    return 1\n",
+            "tests/test_a.py": "def test_alpha():\n    assert True\n",
+        },
+    )
+    _git(root, "init", "-q", ".")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "init")
+    collection = root / "graphify-out"
+    home = tmp_path / "home"
+
+    def update(force: bool = False) -> set[str]:
+        result = graphify_cli.run_update(graphify_bin, root, collection, home, force=force)
+        assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        return _graph_sources(root)
+
+    assert _under_tests(update()), "precondition: tests/ is extracted"
+
+    (root / ".graphifyignore").write_text("tests/\n", encoding="utf-8")
+    sources = update(force=True)
+    assert not _under_tests(sources), sorted(sources)
+    assert any(s.endswith("src/a.py") for s in sources)
+
+    (root / ".graphifyignore").write_text("", encoding="utf-8")
+    assert _under_tests(update()), "removing the rule brings the nodes back"

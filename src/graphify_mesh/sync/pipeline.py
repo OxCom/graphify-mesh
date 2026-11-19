@@ -98,6 +98,7 @@ from graphify_mesh.sync.sync_project import (
     CLASSIFICATION_VERSION_KEY,
     DIGEST_RECIPE_KEY,
     GRAPH_HASH_KEY,
+    IGNORE_RULES_KEY,
     STATUS_BOOTSTRAP_FAILED,
     STATUS_FAILED,
     STATUS_INFRA_FAILED,
@@ -1172,6 +1173,8 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     registry_grants: dict[str, str | None] = {}
     # Per-repo `update --force` decision for apply_action.
     force_rebuilds: dict[str, bool] = {}
+    # Per-repo: the ignore rules differ from the accepted ones (IGNORE_RULES_KEY).
+    ignore_changes: dict[str, bool] = {}
     # Digests under the old table for repos still migrating. Refusals are
     # recorded against these, so a held refusal keeps matching until accepted.
     legacy_manifests: dict[str, SourceDigest] = {}
@@ -1261,6 +1264,17 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             # State written before GRAPH_HASH_KEY existed has no hash: the skip
             # path below seeds it, rather than rebuilding every repo once.
             drifted = accepted_hash is not None and on_disk_hash != accepted_hash
+            # Incremental `update` keeps the nodes of a file that became ignored,
+            # so a rules change forces a full rebuild. A missing key is not a
+            # change: it is seeded below, because --producer-changed relaxes
+            # graphify-shrink-check and must not reach every repo at once.
+            recorded_ignore_hash = (prior_state or {}).get(IGNORE_RULES_KEY)
+            ignore_changed = (
+                has_graph
+                and recorded_ignore_hash is not None
+                and recorded_ignore_hash != current_manifest.ignore_hash
+            )
+            ignore_changes[entry.repo_id] = ignore_changed
             # --allow-shrink forces only the update it releases: the one held on
             # this key. Forcing every update in the run disabled graphify's own
             # guards for repos the operator never looked at. A drifted graph is
@@ -1268,6 +1282,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             # extraction of every unchanged source file.
             force_rebuilds[entry.repo_id] = (
                 upgraded
+                or ignore_changed
                 or drifted
                 or (
                     settings.allow_shrink
@@ -1283,7 +1298,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 ast_only=settings.ast_only,
                 refusal_key=hold_key,
                 allow_shrink=settings.allow_shrink,
-                producer_changed=upgraded,
+                producer_changed=upgraded or ignore_changed,
                 legacy_manifest=legacy_manifest,
                 recipe_changed=recipe_changed,
                 active_version=active_version,
@@ -1328,6 +1343,13 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                     }
                     if recipe:
                         state[entry.repo_id][DIGEST_RECIPE_KEY] = recipe
+                if prior_state is not None and IGNORE_RULES_KEY not in prior_state:
+                    # Seed only an absent key. A present, different one is a
+                    # rules change whose rebuild is held, and must keep retrying.
+                    state[entry.repo_id] = {
+                        **(state.get(entry.repo_id) or prior_state),
+                        IGNORE_RULES_KEY: current_manifest.ignore_hash,
+                    }
                 if drifted:
                     # The rebuild that would replace the rewritten file is held
                     # by an earlier refusal. Count the repo as suspect so the
@@ -1395,7 +1417,10 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 # used, so a writable bind can never land outside them.
                 sandbox_policy=sandbox_policy,
                 builder=entry.builder,
-                producer_changed=_producer_changed(
+                # An ignore-rules change drops files on purpose; the shrink
+                # check explains that loss only with --producer-changed.
+                producer_changed=ignore_changes.get(entry.repo_id, False)
+                or _producer_changed(
                     state.get(entry.repo_id),
                     producer_for(action, entry.builder),
                     repo_versions[entry.repo_id].graphify,
@@ -1536,6 +1561,9 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 accepted_graph_hash = outcome.graph_content_hash or file_content_hash(graph_path)
                 if accepted_graph_hash:
                     accepted[GRAPH_HASH_KEY] = accepted_graph_hash
+                # Written only with accepted state: a refused or failed rebuild
+                # keeps the old fingerprint and retries next run.
+                accepted[IGNORE_RULES_KEY] = outcome.new_manifest.ignore_hash
                 versions = repo_versions[entry.repo_id]
                 if versions.graphify:
                     accepted["graphify_version"] = versions.graphify

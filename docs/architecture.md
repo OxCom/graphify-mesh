@@ -132,7 +132,8 @@ discovery
   with `graph.json`, and a refused `update` is held while the attempt id,
   producer and policy stay the same. Since graphify 0.9.102 `update` is
   incremental, so the mesh adds `--force` (graphify's full rebuild, which also
-  waives graphify's own shrink guard) in three cases only: the recorded graphify
+  waives graphify's own shrink guard) in these cases, plus the ignore-rules case
+  below and a `graph.json` changed outside the sync: the recorded graphify
   or graphify-php version differs from the installed one, or no graphify version
   is recorded yet; `--allow-shrink` releases this repo's held refusal; or an
   `allow_shrink_once` token names this attempt, and is then spent on any
@@ -151,6 +152,28 @@ discovery
   update cannot re-resolve PHP calls from unchanged files, so the force decision
   above matters only for plain graphify repos; the mesh guard still judges PHP
   rebuilds.
+
+  A change of a repo's ignore rules also forces that rebuild, because an
+  incremental `update` keeps the nodes of a file that became ignored. The digest
+  walk fingerprints the rules (`SourceDigest.ignore_hash`, built by
+  `GraphifyIgnoreRules.fingerprint` in `sync/state.py`) from the ignore files of
+  every directory graphify descends (symlinked directories excluded), plus the
+  persisted `--exclude` list and
+  `gitignore` switch, and accepted state records it as `ignore_rules_hash`
+  (`IGNORE_RULES_KEY` in `sync/sync_project.py`). A different value
+  turns a skip into `update --force` and passes `--producer-changed` to
+  `graphify-shrink-check`, which then explains the loss; the `count` policy and
+  the count-floor fallback ignore that flag, so a shrinking rebuild there needs
+  `--allow-shrink` or a grant (`sync/pipeline.py`). A missing value is not a
+  change: an accepted run or a skip seeds it with the current fingerprint, so
+  graphs that already carry nodes of ignored files keep them until the next
+  rules change. A skip held by a refusal keeps a present, older value, so the
+  rebuild retries. Known limitation: a failing `git ls-files` drops `.gitignore`
+  rules from both the digest and the fingerprint, so a git outage on an
+  unchanged repo forces one rebuild, and its recovery forces another. Known
+  limitation: a file untracked with `git rm --cached` becomes subject to
+  `.gitignore` without any ignore file changing, so the fingerprint does not
+  move and its nodes stay until a rebuild.
 
   **Operator note, first run after deploying classification v2.** Every repo
   whose tree holds files that changed category (YAML, JSON, package manifests,

@@ -4,6 +4,26 @@
 
 ### Features and behavior changes
 
+- Changed: `graphifyy` is pinned to `==0.9.112` (was `>=0.9.95,<1.0`). The
+  sync treats a new graphify version as a producer upgrade and force-rebuilds
+  every repo with `--producer-changed`; with a range, a routine
+  `pipx install --force` moved 0.9.104 to 0.9.112 and rebuilt all 25 repos.
+  Raise the pin on purpose and expect one full forced run.
+- Fixed: a change to a repo's ignore rules (`.graphifyignore`, an honoured
+  `.gitignore`, the persisted `--exclude` list) now removes the nodes of files
+  that became ignored. Incremental `graphify update` kept them: reproduced on
+  0.9.103 and 0.9.105, where `--force` drops them. The digest walk fingerprints
+  the rules, state records it as `ignore_rules_hash`, and a changed value runs
+  `update --force` with `--producer-changed` for graphify-shrink-check. A repo
+  with no recorded value is seeded, not rebuilt.
+- Changed: `search` demotes Storybook stories (`*.stories.*`, `.storybook/`),
+  fixtures (`DataFixtures/`, `fixtures/`), mocks (`__mocks__/`, `mocks/`), e2e
+  dirs (`cypress/`, `e2e/`, `playwright/`) and `__snapshots__/` the same way it
+  demotes tests, unless the query names them (`story`, `stories` and
+  `storybook` join the opt-in words). Replay eval of 79 logged
+  queries, k=5: top-1 38 to 39, top-3 55 to 55, absent 15 to 16 on the first
+  opened file. "NavTabs centered alignment" now ranks `index.tsx` first; a
+  typography query that wanted `index.stories.tsx` drops out of the top 5.
 - Added: symbol-anchored ranking in `search`. A query token whose exact alias
   (`t` or `.t()`) names at most 10 nodes makes them anchor candidates, scored
   by the idf of the other query tokens in their own fields and depth-1

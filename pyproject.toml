@@ -57,7 +57,11 @@ dependencies = [
     #   SQLite migrations: 0 -> 114 nodes and 186 edges. The pipeline stamps
     #   its presence per repo with .sql files (producer_versions
     #   "tree_sitter_sql"), so installing or removing it rebuilds those repos once.
-    "graphifyy[ollama,sql]>=0.9.95,<1.0",
+    # Exact pin since 2026-11-19: the sync records the graphify version per repo,
+    #   and a new version forces `update --force` with `--producer-changed` on
+    #   every repo. A range let `pipx install --force` move 0.9.104 -> 0.9.112
+    #   unasked and rebuild all 25 repos. Bump this deliberately, in a run of its own.
+    "graphifyy[ollama,sql]==0.9.112",
     # openai floor is 1.55.3: httpx 0.28 removed `proxies=`, which openai
     #   passed until that release, so an older client raises TypeError when the
     #   client is CONSTRUCTED — swallowed by generate_community_labels into

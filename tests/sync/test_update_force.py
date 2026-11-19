@@ -19,12 +19,13 @@ from pathlib import Path
 
 import pytest
 
-from graphify_mesh.sync import clustering, graphify_cli, repo_tags, sync_project
+from graphify_mesh.sync import clustering, graphify_cli, pipeline, repo_tags, sync_project
 from graphify_mesh.sync.pipeline import _producer_changed, run
 from graphify_mesh.sync.state import SourceDigest, load_state, save_state
 from graphify_mesh.sync.sync_project import (
     ACTION_SKIP,
     ACTION_UPDATE,
+    IGNORE_RULES_KEY,
     STATUS_FAILED,
     STATUS_SHRINK_REFUSED,
     STATUS_UPDATED,
@@ -422,3 +423,125 @@ def test_dry_run_reports_no_outage_and_probes_no_backend(repo, caplog):
     assert "unhealthy warning is expected" not in caplog.text
     assert "naming: dry run — labeling skipped" in caplog.text
     assert report.labeling_reason.startswith("dry run")
+
+
+@pytest.fixture
+def apply_calls(monkeypatch):
+    """Every apply_action call the pipeline makes, as (action, producer_changed, force)."""
+    calls: list[tuple[str, bool, bool]] = []
+    real = pipeline.apply_action
+
+    def recording(*args, **kwargs):
+        calls.append((args[4], kwargs["producer_changed"], kwargs["force_rebuild"]))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "apply_action", recording)
+    return calls
+
+
+def _add_ignore_rule(root: Path, line: str = "legacy/\n") -> None:
+    with (root / ".graphifyignore").open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def test_ignore_rules_change_forces_a_full_update(repo, apply_calls):
+    """Incremental update keeps nodes of newly ignored files: the rules change
+    must force the rebuild and let graphify-shrink-check explain the loss."""
+    env, root, _collection = repo
+    run(_settings(env))
+    old_hash = _state(env)[IGNORE_RULES_KEY]
+    assert old_hash, "accepted state records the fingerprint"
+    _add_ignore_rule(root)
+
+    report = run(_settings(env))
+
+    assert _row(report)["action"] == ACTION_UPDATE, "unchanged source still rebuilds"
+    assert _row(report)["status"] == STATUS_UPDATED
+    assert "--force" in _updates(env)[-1]["argv"]
+    assert apply_calls[-1] == (ACTION_UPDATE, True, True)
+    assert _state(env)[IGNORE_RULES_KEY] not in ("", old_hash)
+    calls = len(_updates(env))
+    assert _row(run(_settings(env)))["action"] == ACTION_SKIP
+    assert len(_updates(env)) == calls
+
+
+def test_unchanged_ignore_rules_do_not_force_or_flag(repo, apply_calls):
+    env, root, _collection = repo
+    run(_settings(env))
+    (root / "app.php").write_text("<?php\n", encoding="utf-8")
+
+    run(_settings(env))
+
+    assert "--force" not in _updates(env)[-1]["argv"]
+    assert apply_calls[-1] == (ACTION_UPDATE, False, False)
+
+
+def test_missing_ignore_rules_key_is_seeded_without_a_rebuild(repo, apply_calls):
+    """State from before the key existed: no forced rebuild, which would pass
+    --producer-changed to every repo at once; the skip seeds the key."""
+    env, _root, _collection = repo
+    run(_settings(env))
+    recorded = _state(env)[IGNORE_RULES_KEY]
+    _rewrite_state(env, **{IGNORE_RULES_KEY: None})
+    calls = len(_updates(env))
+    applied = len(apply_calls)
+
+    report = run(_settings(env))
+
+    assert _row(report)["action"] == ACTION_SKIP
+    assert len(_updates(env)) == calls
+    assert len(apply_calls) == applied
+    assert _state(env)[IGNORE_RULES_KEY] == recorded
+    assert _row(run(_settings(env)))["action"] == ACTION_SKIP
+
+
+def test_missing_key_with_a_code_change_updates_unforced_and_seeds(repo, apply_calls):
+    env, root, _collection = repo
+    run(_settings(env))
+    recorded = _state(env)[IGNORE_RULES_KEY]
+    _rewrite_state(env, **{IGNORE_RULES_KEY: None})
+    (root / "app.php").write_text("<?php\n", encoding="utf-8")
+
+    run(_settings(env))
+
+    assert "--force" not in _updates(env)[-1]["argv"]
+    assert apply_calls[-1] == (ACTION_UPDATE, False, False)
+    assert _state(env)[IGNORE_RULES_KEY] == recorded
+
+
+def test_held_ignore_rebuild_keeps_the_old_fingerprint_on_skip(repo):
+    """A present, different key whose rebuild is held must not be overwritten."""
+    env, root, collection = repo
+    run(_settings(env))
+    old_hash = _state(env)[IGNORE_RULES_KEY]
+    env.set_control(collection, "shrink")
+    _add_ignore_rule(root)
+    assert _row(run(_settings(env)))["status"] == STATUS_SHRINK_REFUSED
+    assert _row(run(_settings(env)))["action"] == ACTION_SKIP, "precondition: held"
+    assert _row(run(_settings(env)))["action"] == ACTION_SKIP
+    assert _state(env)[IGNORE_RULES_KEY] == old_hash
+
+
+def test_refused_ignore_rebuild_keeps_the_old_fingerprint(repo):
+    env, root, collection = repo
+    run(_settings(env))
+    old_hash = _state(env)[IGNORE_RULES_KEY]
+    env.set_control(collection, "shrink")
+    _add_ignore_rule(root)
+
+    report = run(_settings(env))
+
+    assert _row(report)["status"] == STATUS_SHRINK_REFUSED
+    assert _state(env)[IGNORE_RULES_KEY] == old_hash, "a refusal must retry, not adopt"
+
+
+def test_dry_run_does_not_record_the_fingerprint(repo):
+    env, root, _collection = repo
+    run(_settings(env))
+    old_hash = _state(env)[IGNORE_RULES_KEY]
+    _add_ignore_rule(root)
+
+    report = run(_settings(env, dry_run=True))
+
+    assert _row(report)["action"] == ACTION_UPDATE
+    assert _state(env)[IGNORE_RULES_KEY] == old_hash

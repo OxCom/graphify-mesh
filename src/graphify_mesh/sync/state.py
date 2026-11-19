@@ -47,6 +47,11 @@ class SourceDigest:
     # partial-extract check looks each one up in graphify's manifest, which
     # keys in-root files the same way. Computed per walk, never serialized.
     semantic_paths: tuple[str, ...] = field(default=(), compare=False)
+    # Fingerprint of the ignore rules this walk applied (GraphifyIgnoreRules.
+    # fingerprint); "" for a table that does not honour them. Not serialized here: the
+    # pipeline stores it under its own state key, so stored digests and the
+    # attempt_id stay as they were.
+    ignore_hash: str = field(default="", compare=False)
 
     @property
     def attempt_id(self) -> str:
@@ -330,6 +335,10 @@ class GraphifyIgnoreRules:
             if line:
                 self._patterns.append((self._root, line))
                 self._explicit.append((self._root, line))
+        # Root, its ancestors up to the VCS root, info/exclude and --exclude:
+        # what fingerprint() hashes besides the directories below root.
+        self._base_patterns = list(self._patterns)
+        self._base_explicit = list(self._explicit)
         self._loaded: set[Path] = {self._root}
         self._linked: dict[Path, bool] = {}
         self._linked_root = getattr(upstream, "_linked_worktree_main_root", None)
@@ -392,6 +401,46 @@ class GraphifyIgnoreRules:
             )
         )
 
+    def fingerprint(self, rules: IgnoreRules, descended: Sequence[Path]) -> str:
+        """Hash of the ignore rules graphify applies, for the pipeline's rebuild check.
+
+        `descended` lists every directory below root that graphify descends
+        (walk paths). Their ignore files are read here, not taken from the lazy
+        loads above, which follow the files the walk happened to test. The
+        `.gitignore` and `.graphifyignore` lines stay apart: only the former
+        spare tracked files. Lines keep file order, because a later negation
+        overrides an earlier line.
+        """
+
+        def grouped(patterns: list[tuple[Path, str]]) -> list[list[object]]:
+            by_dir: dict[str, list[str]] = {}
+            for directory, line in patterns:
+                by_dir.setdefault(os.path.relpath(directory, self._root), []).append(line)
+            return [[d, by_dir[d]] for d in sorted(by_dir)]
+
+        below: list[list[object]] = []
+        for path in descended:
+            target = self._root.joinpath(
+                *Path(os.path.abspath(path)).relative_to(self._walk_root).parts
+            )
+            # O_NOFOLLOW guards only the last component; never read through a link.
+            if os.path.islink(path) or os.path.islink(target):
+                continue
+            git_lines = _ignore_file_lines(target / ".gitignore") if self._gitignore else []
+            own_lines = _ignore_file_lines(target / ".graphifyignore")
+            if git_lines or own_lines:
+                below.append([os.path.relpath(target, self._root), git_lines, own_lines])
+        payload = {
+            "excludes": list(rules.extra_excludes),
+            "gitignore": rules.gitignore,
+            "effective_gitignore": self._gitignore,
+            "lineage_patterns": grouped(self._base_patterns),
+            "lineage_explicit": grouped(self._base_explicit),
+            "below": sorted(below, key=lambda item: str(item[0])),
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:16]
+
 
 def compute_source_manifest(
     root: Path,
@@ -439,10 +488,14 @@ def compute_source_manifests(
 
     content_digests = _use_content_digests()
     honours = [table.honours_ignore_rules for table in tables]
-    ignore = GraphifyIgnoreRules(root, ignore_rules or IgnoreRules()) if any(honours) else None
+    effective_rules = ignore_rules or IgnoreRules()
+    ignore = GraphifyIgnoreRules(root, effective_rules) if any(honours) else None
     # graphify scans root.resolve() and tests the absolute path for secrets.
     resolved_root = root.resolve()
 
+    # Directories graphify descends, per table that honours the ignore rules.
+    descended: list[set[Path] | None] = [{Path(root)} if honour else None for honour in honours]
+    dir_ignored: dict[Path, bool] = {}
     candidates: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         base = Path(dirpath)
@@ -460,6 +513,22 @@ def compute_source_manifests(
                 continue
             kept.append(d)
         dirnames[:] = kept
+        if ignore is not None:
+            # Per table, so a legacy table walked alongside (migration) cannot
+            # change the current table's ignore fingerprint.
+            for table, below in zip(tables, descended, strict=True):
+                if below is None or base not in below:
+                    continue
+                for d in kept:
+                    child = base / d
+                    if table.prunes(d):
+                        continue
+                    if child not in dir_ignored:
+                        dir_ignored[child] = ignore.ignores_dir(child)
+                    # A symlinked dir can point outside the repo: its ignore
+                    # files are not the repo's rules.
+                    if not dir_ignored[child] and not os.path.islink(child):
+                        below.add(child)
         for filename in filenames:
             candidates.append(base / filename)
 
@@ -523,6 +592,13 @@ def compute_source_manifests(
             h.update(b"\n")
         return h.hexdigest()[:16]
 
+    # A table that does not honour the rules is not affected by them: "".
+    ignore_hashes = [
+        ignore.fingerprint(effective_rules, sorted(below - {Path(root)}))
+        if ignore is not None and below is not None
+        else ""
+        for below in descended
+    ]
     return tuple(
         SourceDigest(
             code_hash=_hash(code_entries[i]),
@@ -530,6 +606,7 @@ def compute_source_manifests(
             file_count=counts[i],
             has_sql=has_sql[i],
             semantic_paths=tuple(semantic_paths[i]),
+            ignore_hash=ignore_hashes[i],
         )
         for i in range(len(tables))
     )

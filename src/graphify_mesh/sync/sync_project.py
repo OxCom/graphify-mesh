@@ -93,6 +93,10 @@ UNSTAMPED_DOCUMENTS_KEY = "unstamped_documents"
 # unchanged source digest skips the build, so without it a graph.json rewritten
 # by another program between runs was merged unchecked.
 GRAPH_HASH_KEY = "graph_content_hash"
+# Per-repo state key: fingerprint of the ignore rules the accepted digest was
+# taken under (SourceDigest.ignore_hash). Incremental `graphify update` keeps
+# the nodes of a file that became ignored, so a change forces a full rebuild.
+IGNORE_RULES_KEY = "ignore_rules_hash"
 
 
 def digest_recipe(
@@ -271,7 +275,8 @@ def decide_action(
 
     `producer_changed` is the pipeline's `_producer_upgraded`: a known version
     change of the program that builds this repo, or accepted state with no
-    graphify version recorded. It only makes an unchanged source update instead
+    graphify version recorded. The pipeline also sets it when the repo's ignore
+    rules changed (IGNORE_RULES_KEY). It only makes an unchanged source update instead
     of skip, under the same refusal hold. It does not pick `--force`; the
     pipeline passes that to `apply_action` as `force_rebuild`.
 
@@ -552,10 +557,11 @@ def apply_action(
     accepted with a warning instead of held again.
 
     `producer_changed` (the pipeline's `_producer_changed`, label switch
-    included) only tells graphify-shrink-check `--producer-changed`.
-    `force_rebuild` (a producer upgrade, or a --allow-shrink release of this
-    repo's held refusal) and a `shrink_grant` naming this attempt are the only
-    causes of `update --force`.
+    included, or a change of the repo's ignore rules) only tells
+    graphify-shrink-check `--producer-changed`.
+    `force_rebuild` (a producer upgrade, an ignore-rules change, a drifted
+    graph.json, or a --allow-shrink release of this repo's held refusal) and a
+    `shrink_grant` naming this attempt are the only causes of `update --force`.
 
     That decision matters only for builder graphify. graphify-php-build appends
     `--force` to every `update` itself, because an incremental update cannot

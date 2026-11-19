@@ -10,7 +10,9 @@ repos. Every path below is a placeholder — substitute your own.
   `graphify` binary and imports `graphify.build` at merge time. It's published
   on PyPI as `graphifyy` and is a declared dependency of this package, so
   `pip install graphify-mesh` (step 2 below) pulls it in automatically — no
-  separate install needed for the library import to work.
+  separate install needed for the library import to work. The dependency is
+  pinned exactly (`pyproject.toml`): a graphify version change makes the next
+  sync force-rebuild every repo, so raise the pin on purpose.
 
   You do still want the standalone `graphify` **command** on `PATH` if you
   plan to run ad-hoc queries yourself (outside the sync engine), or if the

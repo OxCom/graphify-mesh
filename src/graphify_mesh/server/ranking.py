@@ -70,18 +70,39 @@ STALE_SEMANTIC_PENALTY = 0.5
 # cover, often in their names, so they crowded source out of the top-k (cem.hub
 # probe "my team sub teams listing filter": 5 of 8 hits were test methods).
 # Applied only when the query does not ask for tests (`query_mentions_tests`).
-# 1.0 disables the demotion.
+# 1.0 disables the demotion. It also covers stories, fixtures, mocks, e2e specs, snapshots:
+# cem.styleguide "NavTabs centered alignment" ranked `index.stories.tsx` over `index.tsx`;
+# cem.hub "system parameter setting enable feature flag" put `SystemParameterFixture.php` first.
 TEST_PATH_PENALTY_FACTOR = 0.3
-TEST_DIR_NAMES = frozenset({"test", "tests", "__tests__", "spec", "specs", "testing"})
+TEST_DIR_NAMES = frozenset(
+    {
+        "test",
+        "tests",
+        "__tests__",
+        "spec",
+        "specs",
+        "testing",
+        "datafixtures",
+        "fixtures",
+        "__mocks__",
+        "mocks",
+        "cypress",
+        "e2e",
+        "playwright",
+        "__snapshots__",
+        ".storybook",
+    }
+)
 TEST_FILE_PATTERN = re.compile(
-    r"(^test_.*\.py$|_test\.(py|go)$|Test\.php$|Tests?\.(cs|java|kt)$|\.(test|spec)\.[cm]?[jt]sx?$)"
+    r"(^test_.*\.py$|_test\.(py|go)$|Test\.php$|Tests?\.(cs|java|kt)$|\.(test|spec)\.[cm]?[jt]sx?$"
+    r"|\.stories\.[^.]+$)"
 )
 # Matched against whole query words after camelCase, snake_case and path
 # splitting (`_query_words`), so "UserServiceTest" asks for tests while
 # "latest" and "majestic" do not.
 TEST_QUERY_PATTERN = re.compile(
     r"^(tests?|testing|testcases?|pytest|unittest|specs?|fixtures?|phpunit|jest|cypress|e2e"
-    r"|mock\w*)$",
+    r"|mock\w*|stor(y|ies)|storybook)$",
     re.IGNORECASE,
 )
 _QUERY_WORD_SPLIT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
@@ -182,8 +203,10 @@ def apply_penalties(
 
 
 def is_test_path(path: str) -> bool:
-    """True for a file under a test directory (`tests/`, `__tests__/`, `spec/`,
-    ...) or named like a test (`*Test.php`, `test_*.py`, `*.spec.ts`, ...)."""
+    """True for non-source code: a file under a test, stories, fixtures, mocks,
+    e2e or snapshot directory (`tests/`, `.storybook/`, `DataFixtures/`,
+    `__mocks__/`, `cypress/`, `__snapshots__/`, ...) or named like a test or
+    story (`*Test.php`, `test_*.py`, `*.spec.ts`, `*.stories.tsx`, ...)."""
     if not path:
         return False
     parts = path.replace("\\", "/").split("/")

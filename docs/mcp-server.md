@@ -195,12 +195,15 @@ schema version unchanged). Ranking multiplies a stale node's fused score by
 `STALE_SEMANTIC_PENALTY` (`server/ranking.py`, 0.5; 1.0 disables). Stale nodes are
 demoted, never dropped, and an exact-alias hit is flagged but not demoted.
 
-Test code is ranked below source unless the query asks for tests
+Test and other non-source code is ranked below source unless the query asks for it
 (`TEST_QUERY_PATTERN`: it contains `test`, `spec`/`specs`, `fixture`, `phpunit`,
-`jest`, `cypress`, `e2e` or `mock`, case-insensitive). A test node is one under
-a `test`, `tests`, `__tests__`, `spec`, `specs` or `testing` directory, or a file
-named like a test (`*Test.php`, `test_*.py`, `*_test.py`, `*_test.go`,
-`*.test.ts`, `*.spec.tsx`, ...; `server/ranking.py:is_test_path`). The lexical
+`jest`, `cypress`, `e2e`, `mock`, `story`/`stories` or `storybook`,
+case-insensitive). Such a node is one under a `test`, `tests`,
+`__tests__`, `spec`, `specs`, `testing`, `DataFixtures`, `fixtures`, `__mocks__`,
+`mocks`, `cypress`, `e2e`, `playwright`, `__snapshots__` or `.storybook`
+directory, or a file named like a test or a story (`*Test.php`, `test_*.py`,
+`*_test.py`, `*_test.go`, `*.test.ts`, `*.spec.tsx`, `*.stories.tsx`, ...;
+`server/ranking.py:is_test_path`). The lexical
 and vector retrievers split source from test before the depth cut: each keeps
 its best source nodes up to its depth from its whole score order, then its best
 `TEST_CANDIDATE_DEPTH` (10) test nodes behind them (`server/retrieval.py`).

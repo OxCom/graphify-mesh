@@ -35,4 +35,5 @@ LICENSE
 
 # Tests are excluded from the graph: they added nodes and edges without
 # answering code questions (2026-11-16).
-/tests/
+# 2026-11-19: tests are indexed and demoted at query time instead (graphify-mesh non-source demotion).
+# /tests/

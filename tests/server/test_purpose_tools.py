@@ -190,13 +190,38 @@ def test_is_test_path_and_query_detection():
         "pkg/x_test.go",
         "test_x.py",
         "web/a.spec.tsx",
+        "src/Components/NavTabs/index.stories.tsx",
+        "docs/Intro.stories.mdx",
+        ".storybook/preview.ts",
+        "src/DataFixtures/SystemParameterFixture.php",
+        "tests/fixtures/a.json",
+        "web/__mocks__/api.ts",
+        "src/mocks/handlers.ts",
+        "cypress/e2e/login.cy.ts",
+        "e2e/login.ts",
+        "playwright/home.ts",
+        "src/__snapshots__/a.snap",
     ):
         assert ranking.is_test_path(path), path
-    for path in ("src/Form/TeamsListingCriteria.php", "src/Testimonial.php", "", "src/latest.py"):
+    for path in (
+        "src/Form/TeamsListingCriteria.php",
+        "src/Testimonial.php",
+        "",
+        "src/latest.py",
+        "src/Components/NavTabs/index.tsx",
+        "src/history.ts",
+        "src/Storybook.php",
+        "src/Fixture.php",
+    ):
         assert not ranking.is_test_path(path), path
     assert ranking.query_mentions_tests("teams listing test")
     assert ranking.query_mentions_tests("phpunit TeamsTest")
+    assert ranking.query_mentions_tests("FileInput ImagePresentationStates story")
+    assert ranking.query_mentions_tests("storybook config")
     assert not ranking.query_mentions_tests("my team sub teams listing filter")
+    assert not ranking.query_mentions_tests("NavTabs centered alignment")
+    assert not ranking.query_mentions_tests("text break-word word wrap utility class typography")
+    assert not ranking.query_mentions_tests("system parameter setting enable feature flag")
 
 
 def _team_listing_generation():
