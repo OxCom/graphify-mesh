@@ -301,7 +301,7 @@ discovery
 
 ### Stage caches
 
-Three stages skip work for inputs that did not change. A cache never changes
+Four caches skip work for inputs that did not change. A cache never changes
 output: with the same inputs, a run with `GRAPHIFY_MESH_STAGE_CACHE=0` publishes
 byte-identical files (`tests/sync/test_stage_cache_equivalence.py`). Only
 per-run stamps differ: the overlay's generation id and `created_at`, and the
@@ -318,6 +318,18 @@ per-run stamps differ: the overlay's generation id and `created_at`, and the
 - **Lexical** caches one partial per repo under `cache/lexical/`. The key covers
   the graph.json sha256, `manifest.json`, the source digest, the repo root, a
   stat of every graphed source file and the tokenizer inputs.
+- **Overlay API scan** caches one repo's `provides_api` / `consumes_api` facts
+  under `cache/overlay_api/`. The key covers the repo id and root, the live
+  source digest, the ignore-rule fingerprint from the same walk, the graphify
+  version and `overlay_api.API_FACTS_RECIPE`. The scan reads only files the
+  source digest hashes, so a hit skips the walk. Only a content digest
+  (`GRAPHIFY_MESH_CONTENT_DIGEST` not `0`) taken under the current
+  classification table keys an entry. The digest keeps each code file's content
+  marker; the scan hashes the bytes it reads the same way. A scan is stored only
+  when it completed without a walk, stat or read failure, the digest has no
+  mtime marker, the scan read exactly the digest's code files with a scanned
+  suffix, and every marker matches. Each skip is logged at INFO and counted in
+  `stage_cache.api.skipped`.
 
 The graph.json sha256 comes from the same bytes the stages parsed. The embed,
 overlay and lexical stages share one read of each graph.json. The lexical stage

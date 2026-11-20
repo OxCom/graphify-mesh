@@ -474,8 +474,14 @@ def rank(
 
     anchor_hits: list[Hit] = []
     anchor_key_set: set[str] = set()
+    demote_tests = not ranking.query_mentions_tests(query)
     if remaining_slots > 0:
-        for key in anchors.anchor_keys(query, generation, repo_filter, exclude=selected_keys):
+        anchor_is_test = _test_key_fn(generation) if demote_tests else None
+        # A test-path pin on a non-test query would outrank the source it
+        # exercises; the fused block demotes tests the same way.
+        for key in anchors.anchor_keys(
+            query, generation, repo_filter, exclude=selected_keys, is_test=anchor_is_test
+        ):
             hit = _hit_from_key(key, generation, anchors.ANCHOR_MATCH_SCORE, "anchor")
             if hit:
                 anchor_hits.append(hit)
@@ -487,7 +493,6 @@ def rank(
 
     fused_hits: list[Hit] = []
     if remaining_slots > 0:
-        demote_tests = not ranking.query_mentions_tests(query)
         # Tests move behind source BEFORE each list is cut to its depth: cut
         # first, and test methods (which repeat the domain words in their
         # names) can fill the whole list and drop the source node entirely.

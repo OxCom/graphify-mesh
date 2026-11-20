@@ -4,6 +4,26 @@
 
 ### Features and behavior changes
 
+- Changed: symbol-anchor pins skip nodes whose source file is a test path
+  (`tests/`, `*.stories.tsx`, ...) unless the query mentions tests, matching
+  the test demotion already applied to fused results.
+- Changed: the overlay API scan (`provides_api` / `consumes_api`) now skips
+  every directory and file graphify itself skips (a dotfile named `.js` or
+  `.php` is no longer read): `.graphifyignore`,
+  `.gitignore`, the persisted `--exclude` list, graphify's skip-dir names and
+  likely-secret paths, the same rules as the source digest. Edges whose files
+  sit under such a path disappear from the overlay; published output differs
+  from earlier versions on purpose. Each repo is walked once per run instead
+  of twice.
+- Added: stage cache for the API scan under `<global_dir>/cache/overlay_api/`,
+  keyed on the repo's source digest and ignore-rule fingerprint. An unchanged
+  repo skips the walk and every read. Off when `GRAPHIFY_MESH_CONTENT_DIGEST=0`.
+  A scan is cached only when it matches the digest walk file for file, by
+  content hash: never after a read or walk failure, a file edited between the
+  two walks, or a digest with mtime markers. Each skip is logged at INFO and
+  counted in `stage_cache.api.skipped`. Output is byte-identical with the cache
+  on or off. Run report and `status.json` carry `stage_cache.api` hits and
+  misses.
 - Added: stage caches for the embedding, overlay and lexical stages under
   `<global_dir>/cache/`. An unchanged repo reuses its published shard without
   a re-hash. An unchanged repo pair reuses its exact-path overlay candidates,

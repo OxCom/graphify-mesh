@@ -324,3 +324,68 @@ def test_blocked_cold_run_leaves_cache_empty(make_scenario, monkeypatch):
     assert blocked.stage_cache["overlay"]["misses"] == 3
     assert scenario.cache_files() == set()
     assert scenario.staging_dirs() == []
+
+
+def _add_api_files(scenario: Scenario) -> None:
+    """A provides/consumes pair a -> b, and a second pair hidden by .graphifyignore."""
+    a, b = scenario.roots["a"], scenario.roots["b"]
+    for root in (a, b):
+        (root / ".graphifyignore").write_text(".superpowers/\n", encoding="utf-8")
+    for path, route in (
+        (a / "src" / "WidgetController.php", "/api/v1/widgets"),
+        (a / ".superpowers" / "DraftController.php", "/api/v1/drafts"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"<?php\nclass {path.stem}\n{{\n    #[Route('{route}', methods: ['GET'])]\n"
+            "    public function show() {}\n}\n",
+            encoding="utf-8",
+        )
+    (b / "src" / "client.ts").write_text("fetch('/api/v1/widgets');\n", encoding="utf-8")
+    (b / ".superpowers").mkdir()
+    (b / ".superpowers" / "draft.ts").write_text("fetch('/api/v1/drafts');\n", encoding="utf-8")
+    for root in (a, b):
+        _pin_mtimes(root)
+
+
+def test_api_facts_cache_publishes_cache_off_bytes(make_scenario):
+    reference = make_scenario()
+    _add_api_files(reference)
+    assert reference.run(False).published
+    reference.edit()
+    off = reference.run(False)
+    assert off.published, off.publish_blocked_reason
+    # Only the pair outside .superpowers/ is an edge.
+    assert off.overlay_edge_counts.get("provides_api") == 1
+    assert off.overlay_edge_counts.get("consumes_api") == 1
+    assert off.stage_cache["api"] == {"hits": 0, "misses": 0, "skipped": 0}
+    expected = reference.published()
+
+    scenario = make_scenario()
+    _add_api_files(scenario)
+    cold = scenario.run(True)
+    assert cold.published, cold.publish_blocked_reason
+    assert cold.stage_cache["api"] == {"hits": 0, "misses": 3, "skipped": 0}
+    scenario.edit()
+    warm = scenario.run(True)
+    assert warm.published, warm.publish_blocked_reason
+    assert warm.stage_cache["api"] == {"hits": 2, "misses": 1, "skipped": 0}
+    _assert_same(expected, scenario.published())
+    assert any(name.startswith("overlay_api/") for name in scenario.cache_files())
+
+    unchanged = scenario.run(True)
+    assert unchanged.published, unchanged.publish_blocked_reason
+    assert unchanged.stage_cache["api"] == {"hits": 3, "misses": 0, "skipped": 0}
+    _assert_same(expected, scenario.published())
+
+
+def test_api_facts_cache_is_off_without_content_digests(make_scenario, monkeypatch):
+    # An mtime/size digest misses an edit that keeps both: never key on it.
+    monkeypatch.setenv("GRAPHIFY_MESH_CONTENT_DIGEST", "0")
+    scenario = make_scenario()
+    _add_api_files(scenario)
+    first = scenario.run(True)
+    assert first.published, first.publish_blocked_reason
+    assert first.overlay_edge_counts.get("provides_api") == 1
+    assert first.stage_cache["api"] == {"hits": 0, "misses": 0, "skipped": 0}
+    assert not any(name.startswith("overlay_api/") for name in scenario.cache_files())

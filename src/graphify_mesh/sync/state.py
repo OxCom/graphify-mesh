@@ -13,7 +13,7 @@ import logging
 import os
 import stat as stat_mod
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,6 +52,13 @@ class SourceDigest:
     # pipeline stores it under its own state key, so stored digests and the
     # attempt_id stay as they were.
     ignore_hash: str = field(default="", compare=False)
+    # Root-relative POSIX path -> change marker of every file hashed as code.
+    # The overlay API cache checks the files it read against these. Computed
+    # per walk, never serialized.
+    code_markers: Mapping[str, str] = field(default_factory=dict, compare=False, repr=False)
+    # Whether any marker in this digest is an mtime, not a content hash
+    # (content digests off, or a file that could not be read).
+    mtime_markers: bool = field(default=False, compare=False)
 
     @property
     def attempt_id(self) -> str:
@@ -96,15 +103,21 @@ def _use_content_digests() -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _change_marker(path: Path, stat: os.stat_result, content_digests: bool) -> str:
-    """Per-file component of the manifest digest.
+def content_marker(data: bytes) -> str:
+    """The content form of a change marker: what `_change_marker` records for a
+    file holding exactly `data`."""
+    return hashlib.sha256(data).hexdigest()[:32]
+
+
+def _change_marker(path: Path, stat: os.stat_result, content_digests: bool) -> tuple[str, bool]:
+    """Per-file component of the manifest digest, and whether it is a content hash.
 
     Falls back to mtime when content is unreadable (races, permissions, a file
     deleted between walk and hash) so one bad file degrades that entry instead of
     aborting the whole manifest.
     """
     if not content_digests:
-        return str(stat.st_mtime_ns)
+        return str(stat.st_mtime_ns), False
     try:
         digest = file_content_hash(path)
     except OSError:
@@ -112,10 +125,11 @@ def _change_marker(path: Path, stat: os.stat_result, content_digests: bool) -> s
         # a device/FIFO that cannot be slurped. One bad file must degrade its own
         # entry to the mtime marker, never abort the whole manifest — an aborted
         # manifest would look like "no files" and cascade into a bootstrap.
-        return str(stat.st_mtime_ns)
+        return str(stat.st_mtime_ns), False
     if digest is None:
-        return str(stat.st_mtime_ns)
-    return digest[:32]
+        return str(stat.st_mtime_ns), False
+    # Same truncation as content_marker.
+    return digest[:32], True
 
 
 BUILD_CONFIG_FILENAME = ".graphify_build.json"
@@ -537,6 +551,8 @@ def compute_source_manifests(
     counts = [0 for _ in tables]
     has_sql = [False for _ in tables]
     semantic_paths: list[list[str]] = [[] for _ in tables]
+    code_markers: list[dict[str, str]] = [{} for _ in tables]
+    mtime_markers = [False for _ in tables]
     for path in sorted(candidates):
         # Kept identical to the rglob-era filter (checked against the FULL
         # path parts, filename included): a *file* named e.g. `vendor`, or a
@@ -572,10 +588,14 @@ def compute_source_manifests(
         except OSError:
             continue
         rel = str(path.relative_to(root))
-        entry = f"{rel}:{stat.st_size}:{_change_marker(path, stat, content_digests)}"
+        marker, from_content = _change_marker(path, stat, content_digests)
+        entry = f"{rel}:{stat.st_size}:{marker}"
         for i, category in enumerate(categories):
+            if category in ("code", "semantic") and not from_content:
+                mtime_markers[i] = True
             if category == "code":
                 code_entries[i].append(entry)
+                code_markers[i][path.relative_to(root).as_posix()] = marker
             elif category == "semantic":
                 semantic_entries[i].append(entry)
                 semantic_paths[i].append(path.relative_to(root).as_posix())
@@ -607,6 +627,8 @@ def compute_source_manifests(
             has_sql=has_sql[i],
             semantic_paths=tuple(semantic_paths[i]),
             ignore_hash=ignore_hashes[i],
+            code_markers=code_markers[i],
+            mtime_markers=mtime_markers[i],
         )
         for i in range(len(tables))
     )

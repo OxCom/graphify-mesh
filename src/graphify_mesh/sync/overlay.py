@@ -24,8 +24,8 @@ from pathlib import Path
 
 from graphify_mesh.sync.embed_similarity import PairCacheSource
 from graphify_mesh.sync.overlay_api import (
-    extract_consumer_literal_paths,
-    extract_symfony_route_providers,
+    ApiFactsSource,
+    collect_api_facts,
     match_provides_consumes_edges,
 )
 from graphify_mesh.sync.overlay_depends import (
@@ -36,6 +36,7 @@ from graphify_mesh.sync.overlay_depends import (
 )
 from graphify_mesh.sync.overlay_refs import OverlayEdge
 from graphify_mesh.sync.overlay_similar import compute_similar_approach_edges
+from graphify_mesh.sync.state import IgnoreRules
 from graphify_mesh.sync.vectors import RepoVectors
 
 log = logging.getLogger("graphify_mesh.sync.overlay")
@@ -102,6 +103,8 @@ def build_overlay(
     graphs_by_repo: dict[str, dict] | None = None,
     pair_cache: PairCacheSource | None = None,
     exact_max_rows: int | None = None,
+    ignore_rules_by_repo: dict[str, IgnoreRules] | None = None,
+    api_cache: ApiFactsSource | None = None,
 ) -> OverlayResult:
     """Runs all three WS4 ship-order stages (depends_on+manual,
     similar_approach, provides/consumes API) and returns every overlay edge
@@ -113,7 +116,11 @@ def build_overlay(
     `graphs_by_repo` may be passed in (pipeline.py already loads it once for
     the WS3 embed stage and reuses it here rather than reading every
     per-repo graph.json twice); if omitted it is loaded fresh from
-    `graph_paths_by_repo`, same as before WS3."""
+    `graph_paths_by_repo`, same as before WS3.
+
+    `ignore_rules_by_repo` holds each repo's persisted build options for the
+    API scan (state.read_build_ignore_rules); a missing repo gets graphify's
+    defaults. `api_cache` may serve an unchanged repo's API facts."""
     if graphs_by_repo is None:
         graphs_by_repo = load_graphs_by_repo(graph_paths_by_repo)
     edges: list[OverlayEdge] = []
@@ -146,15 +153,10 @@ def build_overlay(
 
     # 3. provides/consumes API (Symfony route attributes only — no
     # swagger/openapi spec exists in any registered repo, see overlay_api.py
-    # module docstring).
-    providers_by_repo = {
-        repo_id: extract_symfony_route_providers(repo_id, root)
-        for repo_id, root in repo_roots_by_id.items()
-    }
-    consumer_candidates_by_repo = {
-        repo_id: extract_consumer_literal_paths(repo_id, root)
-        for repo_id, root in repo_roots_by_id.items()
-    }
+    # module docstring). One walk per repo feeds both sides.
+    providers_by_repo, consumer_candidates_by_repo = collect_api_facts(
+        repo_roots_by_id, ignore_rules_by_repo, api_cache
+    )
     edges.extend(match_provides_consumes_edges(providers_by_repo, consumer_candidates_by_repo))
 
     counts: dict[str, int] = {}

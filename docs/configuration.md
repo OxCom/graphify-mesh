@@ -341,6 +341,7 @@ was blocked still reports them. On a dry run every cache counter is `0`.
 | `stage_cache.enabled` | `false` when `GRAPHIFY_MESH_STAGE_CACHE=0` or on a dry run. `stage_cache` is `{}` when the run stopped before the lexical stage. |
 | `stage_cache.overlay.hits` / `.misses` | Repo pairs whose exact-path candidates came from the cache, and pairs computed this run. Both stay `0` on the LSH path. |
 | `stage_cache.lexical.hits` / `.misses` | Repos whose lexical partial came from the cache, and repos built this run. A repo with no cache key is built without a lookup and counts as neither. A repo has no key when its graph was not loaded, it has no source digest, or its `manifest.json` exists but is unreadable. |
+| `stage_cache.api.hits` / `.misses` / `.skipped` | Repos whose overlay API facts came from the cache, repos scanned this run, and scanned repos whose facts were not stored because the scan did not match the source digest file for file (the reason is logged at INFO). A repo with no source digest under the current classification table, or any repo when `GRAPHIFY_MESH_CONTENT_DIGEST=0`, is scanned without a lookup and counts as none of these. |
 | `stage_cache.embedding.reused` | Repos whose published shard was reused without a re-hash because its `inputs_digest` matched. |
 
 ## `ServerConfig` fields (server)

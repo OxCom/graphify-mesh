@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from graphify_mesh.server import lexical_read, ranking
@@ -204,9 +205,12 @@ def anchor_keys(
     generation: Generation,
     repo_filter: frozenset[str] | None,
     exclude: set[str],
+    is_test: Callable[[str], bool] | None = None,
 ) -> list[str]:
     """Keys to pin right after the exact-alias hits, best first; `[]` when
-    no candidate is both above `ANCHOR_MIN_SCORE` and dominant."""
+    no candidate is both above `ANCHOR_MIN_SCORE` and dominant. Candidates
+    for which `is_test(key)` is true are dropped before the dominance check,
+    so they neither block a source pin nor take a pin slot."""
     tokens = list(dict.fromkeys(tokenize_text(query)))
     if len(tokens) < 2:
         return []
@@ -225,6 +229,8 @@ def anchor_keys(
         return []
 
     scores = _candidate_scores(tokens, via, generation, repo_filter)
+    if is_test is not None:
+        scores = [item for item in scores if not is_test(item[0])]
 
     pinned: list[str] = []
     for index, (key, score) in enumerate(scores):

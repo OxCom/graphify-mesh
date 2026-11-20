@@ -61,6 +61,62 @@ def test_dominant_anchor_is_pinned_first_with_anchor_match_type():
     assert all(h.match_type == "fused" for h in result.hits[1:])
 
 
+def _anchor_at(path: str) -> tuple[list[dict], list[dict], str]:
+    nodes, links = _controller("repo.a", "TeamsController")
+    nodes[0]["source_file"] = path
+    return nodes, links, key_for("repo.a", nodes[0])
+
+
+@pytest.mark.parametrize(
+    "path", ["tests/Controller/TeamsControllerTest.php", "src/Teams.stories.tsx"]
+)
+def test_test_path_anchor_is_not_pinned_for_non_test_query(path):
+    nodes, links, anchor_key = _anchor_at(path)
+    gen = build_generation(_fillers() + nodes, links=links)
+    # The candidate exists, so the drop happens in rank(), not in anchors.
+    assert anchors.anchor_keys(QUERY, gen, None, exclude=set()) == [anchor_key]
+
+    result = rank(QUERY, gen, None, k=5, embed_query_fn=fake_embed_query_fn())
+
+    assert all(h.match_type != "anchor" for h in result.hits)
+
+
+@pytest.mark.parametrize(
+    "path", ["tests/Controller/TeamsControllerTest.php", "src/Teams.stories.tsx"]
+)
+def test_test_path_anchor_is_pinned_when_query_mentions_tests(path):
+    nodes, links, anchor_key = _anchor_at(path)
+    gen = build_generation(_fillers() + nodes, links=links)
+
+    result = rank(QUERY + " tests", gen, None, k=5, embed_query_fn=fake_embed_query_fn())
+
+    assert (result.hits[0].key, result.hits[0].match_type) == (anchor_key, "anchor")
+
+
+def test_source_path_anchor_is_pinned_for_non_test_query():
+    nodes, links, anchor_key = _anchor_at("src/Controller/TeamsController.php")
+    gen = build_generation(_fillers() + nodes, links=links)
+
+    result = rank(QUERY, gen, None, k=5, embed_query_fn=fake_embed_query_fn())
+
+    assert (result.hits[0].key, result.hits[0].match_type) == (anchor_key, "anchor")
+
+
+def test_test_path_candidate_does_not_block_source_anchor_dominance():
+    src_nodes, src_links = _controller("repo.a", "TeamsController")
+    test_nodes, test_links = _controller("repo.a", "TeamsControllerTest")
+    test_nodes[0]["source_file"] = "tests/Controller/TeamsControllerTest.php"
+    gen = build_generation(_fillers() + src_nodes + test_nodes, links=src_links + test_links)
+    src_key = key_for("repo.a", src_nodes[0])
+
+    # Near-equal scores: the test twin blocks dominance when it stays in the pool.
+    assert anchors.anchor_keys(QUERY, gen, None, exclude=set()) == []
+
+    result = rank(QUERY, gen, None, k=5, embed_query_fn=fake_embed_query_fn())
+
+    assert (result.hits[0].key, result.hits[0].match_type) == (src_key, "anchor")
+
+
 def test_anchor_follows_exact_hits():
     exact = make_node("repo.a", QUERY, "src/misc/e.py", node_id="exact")
     nodes, links = _controller("repo.a", "TeamsController")

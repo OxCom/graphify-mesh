@@ -65,6 +65,7 @@ from graphify_mesh.sync.config import (
     CLASSIFICATION_VERSION,
     CODE_EXTENSIONS,
     CODE_FILENAMES,
+    CURRENT_CLASSIFICATION,
     FORBIDDEN_OVERLAY_RELATION_TYPES,
     IGNORED_FILENAMES,
     SEMANTIC_EXTENSIONS,
@@ -75,6 +76,7 @@ from graphify_mesh.sync.config import (
 from graphify_mesh.sync.discovery import assert_registry_containment, discover_filesystem, reconcile
 from graphify_mesh.sync.lexical_partial_cache import LexicalPartialCache
 from graphify_mesh.sync.locking import transaction_lock
+from graphify_mesh.sync.overlay_api_cache import ApiFactsCache, ApiSourceId
 from graphify_mesh.sync.overlay_pair_cache import OverlayPairCache
 from graphify_mesh.sync.registry import (
     BUILDER_GRAPHIFY,
@@ -87,7 +89,9 @@ from graphify_mesh.sync.registry import (
 from graphify_mesh.sync.stage_cache import PendingCacheWrites, sweep_staging_dirs
 from graphify_mesh.sync.state import (
     CLOCK_STATE_KEY,
+    IgnoreRules,
     SourceDigest,
+    _use_content_digests,
     compute_source_manifests,
     file_content_hash,
     load_state,
@@ -1209,6 +1213,13 @@ def _run_locked(
     # root lookup living in overlay.py.
     repo_roots_by_id: dict[str, Path] = {}
     source_digests_by_repo: dict[str, str] = {}
+    # API scan inputs: each repo's persisted build options, and its live digest
+    # walk that keys the API facts stage cache.
+    ignore_rules_by_repo: dict[str, IgnoreRules] = {}
+    api_source_ids_by_repo: dict[str, ApiSourceId] = {}
+    # An mtime/size digest misses an edit that keeps both: the API cache needs
+    # a content digest to key on.
+    api_cache_keyable = _use_content_digests()
     bootstrap_failed_repo_ids: set[str] = set()
 
     for repo_id in reconciliation.broken:
@@ -1217,6 +1228,7 @@ def _run_locked(
             graph_paths_by_repo[repo_id] = entry.collection_path / "graph.json"
         if entry is not None:
             repo_roots_by_id[repo_id] = entry.root
+            ignore_rules_by_repo[repo_id] = read_build_ignore_rules(entry.collection_path)
         report.project_actions.append(
             {"repo_id": repo_id, "action": "none", "status": "broken_symlink"}
         )
@@ -1281,11 +1293,12 @@ def _run_locked(
             legacy_table = _legacy_table(state.get(entry.repo_id), entry.repo_id, active_version)
             if legacy_table is not None and (entry.collection_path / "graph.json").exists():
                 tables = (active_table, legacy_table)
+            ignore_rules_by_repo[entry.repo_id] = read_build_ignore_rules(entry.collection_path)
             manifest_futures[entry.repo_id] = pool.submit(
                 compute_source_manifests,
                 _root_for(entry, reconciliation_dict),
                 tables,
-                read_build_ignore_rules(entry.collection_path),
+                ignore_rules_by_repo[entry.repo_id],
             )
         for i, entry in enumerate(active_repos, start=1):
             root = _root_for(entry, reconciliation_dict)
@@ -1297,6 +1310,10 @@ def _run_locked(
             # Live walk, not the accepted state: a deferred repo's state lags
             # the source its embedding snippets are read from.
             source_digests_by_repo[entry.repo_id] = current_manifest.attempt_id
+            # The API scan selects files under CURRENT_CLASSIFICATION; only a
+            # digest taken with that table covers every file it reads.
+            if api_cache_keyable and active_table == CURRENT_CLASSIFICATION:
+                api_source_ids_by_repo[entry.repo_id] = ApiSourceId.from_digest(current_manifest)
             prior_state = state.get(entry.repo_id)
             capabilities = (
                 {SQL_CAPABILITY_KEY: sql_capability}
@@ -1930,6 +1947,11 @@ def _run_locked(
     caches_on = settings.stage_cache and not settings.dry_run
     pair_cache = OverlayPairCache(settings.cache_dir, pending_cache) if caches_on else None
     lexical_cache = LexicalPartialCache(settings.cache_dir, pending_cache) if caches_on else None
+    api_cache = (
+        ApiFactsCache(settings.cache_dir, pending_cache, api_source_ids_by_repo)
+        if caches_on
+        else None
+    )
     embed_fast_reused = 0
     embedding_vectors_by_repo: dict[str, RepoVectors] = {}
     embedding_model_for_overlay = "unknown"
@@ -2054,6 +2076,8 @@ def _run_locked(
         graphs_by_repo=graphs_by_repo,
         pair_cache=pair_cache,
         exact_max_rows=settings.exact_max_rows,
+        ignore_rules_by_repo=ignore_rules_by_repo,
+        api_cache=api_cache,
     )
     report.overlay_rows = embed_similarity.comparable_row_count(embedding_vectors_by_repo or {})
     report.overlay_exact_max_rows = settings.exact_max_rows
@@ -2085,6 +2109,11 @@ def _run_locked(
         "lexical": {
             "hits": lexical_cache.hits if lexical_cache else 0,
             "misses": lexical_cache.misses if lexical_cache else 0,
+        },
+        "api": {
+            "hits": api_cache.hits if api_cache else 0,
+            "misses": api_cache.misses if api_cache else 0,
+            "skipped": api_cache.skipped if api_cache else 0,
         },
         "embedding": {"reused": embed_fast_reused},
     }
@@ -2285,7 +2314,7 @@ def _run_locked(
         pending_cache.flush()
     # GC only after the flush: entries this run staged must exist before
     # anything not in the used-key sets is removed.
-    for stage_cache_source in (pair_cache, lexical_cache):
+    for stage_cache_source in (pair_cache, lexical_cache, api_cache):
         if stage_cache_source is None:
             continue
         try:
