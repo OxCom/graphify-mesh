@@ -16,11 +16,13 @@ runs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from graphify_mesh.sync.embed_similarity import PairCacheSource
 from graphify_mesh.sync.overlay_api import (
     extract_consumer_literal_paths,
     extract_symfony_route_providers,
@@ -51,17 +53,42 @@ class OverlayResult:
 
 
 def load_graphs_by_repo(graph_paths_by_repo: dict[str, Path]) -> dict[str, dict]:
+    return load_graphs_and_sha256(graph_paths_by_repo)[0]
+
+
+def load_graphs_and_sha256(
+    graph_paths_by_repo: dict[str, Path],
+) -> tuple[dict[str, dict], dict[str, bytes]]:
+    """Per-repo graphs plus the sha256 of the exact bytes each was parsed from.
+    Cache keys take this digest, never a second read: graphify can rewrite
+    graph.json mid-run, which would file an old-graph result under a new key."""
     graphs: dict[str, dict] = {}
+    sha256_by_repo: dict[str, bytes] = {}
     for repo_id, path in graph_paths_by_repo.items():
         if not path.is_file():
             continue
         try:
-            graphs[repo_id] = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            raw = path.read_bytes()
+        except OSError as exc:
             log.warning(
                 "overlay: could not load per-repo graph for %s (%s): %s", repo_id, path, exc
             )
-    return graphs
+            continue
+        sha256 = hashlib.sha256(raw).digest()
+        # Drop the bytes before parsing: only the text and the parsed graph coexist.
+        text = raw.decode("utf-8")
+        del raw
+        try:
+            graphs[repo_id] = json.loads(text)
+        except json.JSONDecodeError as exc:
+            log.warning(
+                "overlay: could not load per-repo graph for %s (%s): %s", repo_id, path, exc
+            )
+            continue
+        finally:
+            del text
+        sha256_by_repo[repo_id] = sha256
+    return graphs, sha256_by_repo
 
 
 def build_overlay(
@@ -73,6 +100,8 @@ def build_overlay(
     embedding_vectors_by_repo: dict[str, RepoVectors] | None = None,
     embedding_model: str = "unknown",
     graphs_by_repo: dict[str, dict] | None = None,
+    pair_cache: PairCacheSource | None = None,
+    exact_max_rows: int | None = None,
 ) -> OverlayResult:
     """Runs all three WS4 ship-order stages (depends_on+manual,
     similar_approach, provides/consumes API) and returns every overlay edge
@@ -110,6 +139,8 @@ def build_overlay(
             embedding_vectors_by_repo=embedding_vectors_by_repo,
             top_k=similar_top_k,
             embedding_model=embedding_model,
+            pair_cache=pair_cache,
+            exact_max_rows=exact_max_rows,
         )
     )
 

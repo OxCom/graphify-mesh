@@ -241,6 +241,19 @@ where `graphify-mesh-sync.cron.env` is a shell-sourceable variant of the env
 file from step 1 (each line prefixed with `export `). Remember cron's `PATH` is
 minimal: use absolute paths for both the console script and `GRAPHIFY_BIN`.
 
+## Syncing one repo now
+
+`graphify-mesh-sync --once --repo <id>` rebuilds only the named repo and then
+publishes a full generation. Repeat `--repo` to select several repos. Other
+repos with a change are not rebuilt and their state is not touched. The run
+report lists them under `pending_repos`, and the next scheduled run syncs them.
+An unselected repo whose accepted `graph.json` was rewritten or deleted is
+different: it shows `graph_drift_held` or `graph_missing_held`, is not in
+`pending_repos`, and the run does not publish. Run a full sync to fix it.
+An unknown or disabled id, or an unreadable or malformed registry, exits `2`
+before the lock is taken. If the timer run
+holds the lock, the command exits `3` at once; retry it later.
+
 ## Adding or removing repos later
 
 The schedule handles content changes automatically; membership changes need two

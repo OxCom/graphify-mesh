@@ -29,6 +29,7 @@ from graphify_mesh.sync.config import (
 from graphify_mesh.sync.locking import LockHeldError
 from graphify_mesh.sync.perms import audit_config_permissions
 from graphify_mesh.sync.pipeline import run
+from graphify_mesh.sync.registry import load_registry
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -160,6 +161,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "care; never derive from repo count."
         ),
     )
+    parser.add_argument(
+        "--repo",
+        dest="repos",
+        action="append",
+        default=None,
+        metavar="ID",
+        help="Sync only this registered repo id; repeatable. Default: all repos.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)
 
@@ -171,6 +180,7 @@ def build_overrides(args: argparse.Namespace) -> dict:
         "dry_run": args.dry_run,
         "skip_embedding": args.skip_embedding,
         "allow_shrink": args.allow_shrink,
+        "only_repos": frozenset(args.repos or ()),
     }
     # Only an explicit flag overrides, either way: the absent case must not mask
     # GRAPHIFY_MESH_AST_ONLY=1, and --no-ast-only must beat it.
@@ -197,6 +207,29 @@ def build_overrides(args: argparse.Namespace) -> dict:
     return overrides
 
 
+def _check_selected_repos(settings: Settings) -> str | None:
+    """Error text when a --repo id is unknown or disabled, else None. Runs before
+    the transaction lock so a typo fails fast; skips the registry load when no
+    repo is selected."""
+    if not settings.only_repos:
+        return None
+    try:
+        registry = load_registry(settings.registry_path)
+    except (ValueError, OSError) as exc:
+        return f"cannot read registry: {exc}"
+    enabled = {entry.repo_id for entry in registry.repos if entry.enabled}
+    known = {entry.repo_id for entry in registry.repos}
+    problems = []
+    for repo_id in sorted(settings.only_repos):
+        if repo_id not in known:
+            problems.append(f"{repo_id} (unknown)")
+        elif repo_id not in enabled or repo_id in registry.disabled:
+            problems.append(f"{repo_id} (disabled)")
+    if not problems:
+        return None
+    return "cannot select repo(s): " + ", ".join(problems)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     logging.basicConfig(
@@ -216,6 +249,11 @@ def main(argv: list[str] | None = None) -> int:
     # way to check the configuration's permissions without publishing.
     audit_config_permissions(settings.registry_path, settings.manual_relations_path)
 
+    error = _check_selected_repos(settings)
+    if error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
     try:
         report = run(settings)
     except LockHeldError as exc:
@@ -230,6 +268,10 @@ def main(argv: list[str] | None = None) -> int:
                 "project_actions": report.project_actions,
                 "stale_repos": report.stale_repos,
                 "dirty_repos": report.dirty_repos,
+                "pending_repos": report.pending_repos,
+                "overlay_rows": report.overlay_rows,
+                "overlay_exact_max_rows": report.overlay_exact_max_rows,
+                "stage_cache": report.stage_cache,
                 "merge_ok": report.merge_ok,
                 "merge_error": report.merge_error,
                 "validation_ok": report.validation_ok,
@@ -238,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
                 "publish_blocked_reason": report.publish_blocked_reason,
                 "generation_id": report.generation_id,
                 "skipped_stages": report.skipped_stages,
+                "stage_rss": report.stage_rss,
             },
             indent=2,
         )

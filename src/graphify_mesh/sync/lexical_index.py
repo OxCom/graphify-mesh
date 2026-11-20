@@ -37,6 +37,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from graphify_mesh.sync.config_keys import (
     PATH_SEPARATOR,
@@ -44,6 +45,10 @@ from graphify_mesh.sync.config_keys import (
     is_file_node_label,
 )
 from graphify_mesh.sync.embedding import build_snippet, node_key, node_line
+from graphify_mesh.sync.stage_cache import CACHE_FORMAT
+
+if TYPE_CHECKING:
+    from graphify_mesh.sync.lexical_partial_cache import LexicalPartialCache
 
 log = logging.getLogger("graphify_mesh.sync.lexical_index")
 
@@ -90,6 +95,10 @@ LEXICAL_SCHEMA_VERSION = 4
 SUPPORTED_LEXICAL_SCHEMA_VERSIONS = frozenset({2, 3, 4})
 # First schema whose document keys carry config-key dotted paths.
 QUALIFIED_CONFIG_KEYS_SCHEMA = 4
+# Bump on any semantic change to what a cached per-repo partial holds
+# (`build_repo_partial`, its payload, the merge). Pinned by
+# tests/sync/test_lexical_recipe_guard.py.
+LEXICAL_PARTIAL_RECIPE = "lexical-partial-v3"
 
 
 def uses_qualified_config_keys(manifest: object, lexical: object) -> bool:
@@ -246,8 +255,38 @@ def stale_semantic_files(manifest_path: Path | None) -> set[str]:
     if manifest_path is None:
         return set()
     try:
-        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        manifest_bytes = manifest_path.read_bytes()
+    except OSError:
+        return set()
+    return _stale_semantic_files_from_bytes(manifest_bytes)
+
+
+@dataclass(frozen=True)
+class ManifestRead:
+    """One read of a repo's `manifest.json`, shared by the partial cache key and
+    `build_repo_partial` so both see the same bytes even if graphify rewrites it."""
+
+    raw: bytes | None  # None when absent or unreadable
+    readable: bool = True  # False when the file exists but could not be read
+
+
+def read_manifest(graph_path: Path | None) -> ManifestRead:
+    if graph_path is None:
+        return ManifestRead(None)
+    try:
+        return ManifestRead((graph_path.parent / MANIFEST_FILENAME).read_bytes())
+    except FileNotFoundError:
+        return ManifestRead(None)
+    except OSError:
+        return ManifestRead(None, readable=False)
+
+
+def _stale_semantic_files_from_bytes(manifest_bytes: bytes | None) -> set[str]:
+    if manifest_bytes is None:
+        return set()
+    try:
+        raw = json.loads(manifest_bytes.decode("utf-8"))
+    except ValueError:
         return set()
     if not isinstance(raw, dict):
         return set()
@@ -290,10 +329,256 @@ class LexicalIndexResult:
     stats: LexicalIndexStats = field(default_factory=LexicalIndexStats)
 
 
+@dataclass
+class RepoLexicalPartial:
+    """One repo's slice of the lexical index with doc ids local to the repo.
+
+    Global doc ids depend on every repo sorted before this one, so a partial
+    never stores them: `_merge_partial` offsets at assembly. Durable keys start
+    with the repo id, so the collision counters are exact per repo and sum.
+    """
+
+    repo_id: str
+    documents: list[str] = field(default_factory=list)
+    postings: dict[str, list[int]] = field(default_factory=dict)
+    alias_exact: dict[str, list[int]] = field(default_factory=dict)
+    node_ids: dict[str, str] = field(default_factory=dict)
+    stale_semantic: list[int] = field(default_factory=list)
+    key_collisions: int = 0
+    key_collision_nodes: int = 0
+    config_key_collisions: int = 0
+
+    def to_bytes(self) -> bytes:
+        # ensure_ascii keeps a lone surrogate from a graph label encodable.
+        payload = {
+            "recipe": LEXICAL_PARTIAL_RECIPE,
+            "format": CACHE_FORMAT,
+            "repo": self.repo_id,
+            "documents": self.documents,
+            "postings": self.postings,
+            "alias_exact": self.alias_exact,
+            "node_ids": self.node_ids,
+            "stale_semantic": self.stale_semantic,
+            "counters": [
+                self.key_collisions,
+                self.key_collision_nodes,
+                self.config_key_collisions,
+            ],
+        }
+        return json.dumps(payload, separators=(",", ":")).encode("ascii")
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> RepoLexicalPartial | None:
+        """None for anything that is not a well-formed partial of this recipe:
+        the merge relies on sorted, in-range ids, so a bad entry is a miss."""
+        try:
+            raw = json.loads(payload)
+        except ValueError:
+            return None
+        if not isinstance(raw, dict):
+            return None
+        if raw.get("recipe") != LEXICAL_PARTIAL_RECIPE or raw.get("format") != CACHE_FORMAT:
+            return None
+        repo_id = raw.get("repo")
+        documents = raw.get("documents")
+        node_ids = raw.get("node_ids")
+        counters = raw.get("counters")
+        if not isinstance(repo_id, str) or not isinstance(documents, list):
+            return None
+        if not all(isinstance(key, str) for key in documents):
+            return None
+        if not isinstance(node_ids, dict) or not all(
+            isinstance(value, str) for value in node_ids.values()
+        ):
+            return None
+        if not (
+            isinstance(counters, list)
+            and len(counters) == 3
+            and all(_is_count(value) for value in counters)
+        ):
+            return None
+        doc_count = len(documents)
+        postings = _sorted_id_table(raw.get("postings"), doc_count << FIELD_PACK_BITS)
+        alias_exact = _sorted_id_table(raw.get("alias_exact"), doc_count)
+        stale = raw.get("stale_semantic")
+        if not isinstance(stale, list) or not _is_sorted_ids(stale, doc_count):
+            return None
+        if postings is None or alias_exact is None:
+            return None
+        return cls(
+            repo_id=repo_id,
+            documents=documents,
+            postings=postings,
+            alias_exact=alias_exact,
+            node_ids=node_ids,
+            stale_semantic=stale,
+            key_collisions=counters[0],
+            key_collision_nodes=counters[1],
+            config_key_collisions=counters[2],
+        )
+
+
+def _is_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_sorted_ids(ids: object, limit: int) -> bool:
+    if not isinstance(ids, list):
+        return False
+    previous = -1
+    for value in ids:
+        if not _is_count(value) or value <= previous or value >= limit:
+            return False
+        previous = value
+    return True
+
+
+def _sorted_id_table(table: object, limit: int) -> dict[str, list[int]] | None:
+    if not isinstance(table, dict):
+        return None
+    for ids in table.values():
+        if not _is_sorted_ids(ids, limit):
+            return None
+    return table
+
+
+def build_repo_partial(
+    repo_id: str,
+    graph_data: dict,
+    source_root: Path | None,
+    graph_path: Path | None,
+    manifest: ManifestRead | None = None,
+) -> RepoLexicalPartial:
+    """Index one repo with doc ids counted from 0 in graph node order.
+    `manifest` is the read the cache key was built from; without one the
+    manifest next to `graph_path` is read here."""
+    if manifest is None:
+        manifest = read_manifest(graph_path)
+    stale_files = _stale_semantic_files_from_bytes(manifest.raw)
+    paths = config_key_paths(graph_data)
+    # Files that have a node naming the file itself: only that node gets
+    # the basename alias. A file without one (graphify emitted only its
+    # symbols) keeps the alias on every node, so it stays findable by name.
+    files_with_file_node = {
+        node.get("source_file")
+        for node in graph_data.get("nodes", [])
+        if isinstance(node, dict) and is_file_node_label(node.get("label"), node.get("source_file"))
+    }
+
+    postings: dict[str, set[int]] = {}
+    alias_exact: dict[str, set[int]] = {}
+    node_ids: dict[str, str] = {}
+    documents: list[str] = []
+    nodes_per_key: dict[str, int] = {}
+    config_keys_seen: set[str] = set()
+    stale_doc_ids: list[int] = []
+
+    for node in graph_data.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        qualified = paths.get(node.get("id"))
+        key = node_key(repo_id, node, qualified)
+        if key is None:
+            continue
+        nodes_per_key[key] = nodes_per_key.get(key, 0) + 1
+        if qualified is not None:
+            config_keys_seen.add(key)
+        label = qualified or node.get("label") or ""
+        source_file = node.get("source_file") or ""
+        snippet = build_snippet(source_root, source_file, node_line(node))
+
+        doc_id = len(documents)
+        documents.append(key)
+        doc_base = doc_id << FIELD_PACK_BITS
+        if node.get("_origin") == ORIGIN_SEMANTIC and source_file in stale_files:
+            stale_doc_ids.append(doc_id)
+
+        # A config key's own name is its label; its ancestors are where it
+        # lives, like the file path. Indexing the whole dotted path at label
+        # boost gave every nested key of a JSON schema or package.json the
+        # label weight of words such as `integration` or `policy`, which
+        # reordered code-query results (measured 2026-11-06).
+        bare_label = node.get("label") or ""
+        ancestors = (
+            qualified[: -len(bare_label) - 1]
+            if qualified and qualified.endswith(PATH_SEPARATOR + bare_label)
+            else ""
+        )
+        field_tokens = {
+            "label": set(tokenize_text(bare_label if qualified else label)),
+            "path": set(tokenize_text(source_file)) | set(tokenize_text(ancestors)),
+            "snippet": set(tokenize_text(snippet)) if snippet else set(),
+        }
+        for field_name, terms in field_tokens.items():
+            packed = doc_base | _FIELD_INDEX[field_name]
+            for term in terms:
+                postings.setdefault(term, set()).add(packed)
+
+        include_basename = source_file not in files_with_file_node or is_file_node_label(
+            node.get("label"), source_file
+        )
+        for alias in extract_alias_forms(label, source_file, include_basename):
+            alias_exact.setdefault(alias, set()).add(doc_id)
+
+        raw_id = node.get("id")
+        if raw_id:
+            node_ids[str(raw_id).lower()] = key
+
+    colliding = [key for key, count in nodes_per_key.items() if count > 1]
+    # Pop-as-converted (kept from the v2 OOM fix): each set is freed as soon
+    # as its sorted list exists, so the set and list forms never both peak.
+    return RepoLexicalPartial(
+        repo_id=repo_id,
+        documents=documents,
+        postings={term: sorted(postings.pop(term)) for term in list(postings)},
+        alias_exact={alias: sorted(alias_exact.pop(alias)) for alias in list(alias_exact)},
+        node_ids=node_ids,
+        stale_semantic=stale_doc_ids,
+        key_collisions=len(colliding),
+        key_collision_nodes=sum(nodes_per_key[key] for key in colliding),
+        config_key_collisions=sum(1 for key in colliding if key in config_keys_seen),
+    )
+
+
+def _merge_partial(
+    partial: RepoLexicalPartial,
+    postings: dict[str, list[int]],
+    alias_exact: dict[str, list[int]],
+    node_id_index: dict[str, str],
+    documents: list[list[str]],
+    stale_doc_ids: list[int],
+) -> None:
+    """Append one repo's partial at the current document count.
+
+    Repos merge in sorted order and every local id is below the repo's own
+    document count, so appending keeps each global id list sorted without a
+    re-sort."""
+    offset = len(documents)
+    packed_offset = offset << FIELD_PACK_BITS
+    repo_id = partial.repo_id
+    documents.extend([repo_id, key] for key in partial.documents)
+    for term, ids in partial.postings.items():
+        target = postings.get(term)
+        if target is None:
+            target = postings[term] = []
+        target.extend(packed + packed_offset for packed in ids)
+    for alias, ids in partial.alias_exact.items():
+        target = alias_exact.get(alias)
+        if target is None:
+            target = alias_exact[alias] = []
+        target.extend(doc_id + offset for doc_id in ids)
+    for raw_id, key in partial.node_ids.items():
+        node_id_index[f"{repo_id}\x1f{raw_id}"] = key
+    stale_doc_ids.extend(doc_id + offset for doc_id in partial.stale_semantic)
+
+
 def build_lexical_index(
     graphs_by_repo: dict[str, dict],
     repo_roots_by_id: dict[str, Path],
     graph_paths_by_repo: dict[str, Path] | None = None,
+    source_digests_by_repo: dict[str, str] | None = None,
+    partial_cache: LexicalPartialCache | None = None,
+    graph_sha256_by_repo: dict[str, bytes] | None = None,
 ) -> LexicalIndexResult:
     """Builds the full lexical-index bundle artifact for one generation.
 
@@ -307,98 +592,57 @@ def build_lexical_index(
     assigned in that iteration order, and every postings/alias entry list is
     sorted ints — nothing depends on dict iteration order or wall-clock time.
 
+    Each repo becomes a `RepoLexicalPartial` with local doc ids, built fresh or
+    read from `partial_cache`, and is merged and released before the next.
+    The cache key needs the repo's graph path, the sha256 of the bytes its
+    graph was parsed from (`graph_sha256_by_repo`) and its source digest
+    (`source_digests_by_repo`); a repo missing any is always built fresh.
+
     v3 memory layout: `(repo, key)` strings are stored ONCE in the
     `documents` table; postings/alias sets accumulate small ints only, so
     peak RSS no longer scales with (posting count x key string length).
     """
-    postings: dict[str, set[int]] = {}
-    alias_exact: dict[str, set[int]] = {}
+    postings: dict[str, list[int]] = {}
+    alias_exact: dict[str, list[int]] = {}
     node_id_index: dict[str, str] = {}
     documents: list[list[str]] = []
-
-    nodes_per_key: dict[str, int] = {}
-    config_keys_seen: set[str] = set()
     stale_doc_ids: list[int] = []
+    key_collisions = 0
+    key_collision_nodes = 0
+    config_key_collisions = 0
 
     for repo_id in sorted(graphs_by_repo.keys()):
         graph_data = graphs_by_repo[repo_id]
         source_root = repo_roots_by_id.get(repo_id)
         graph_path = (graph_paths_by_repo or {}).get(repo_id)
-        stale_files = stale_semantic_files(
-            graph_path.parent / MANIFEST_FILENAME if graph_path is not None else None
-        )
-        paths = config_key_paths(graph_data)
-        # Files that have a node naming the file itself: only that node gets
-        # the basename alias. A file without one (graphify emitted only its
-        # symbols) keeps the alias on every node, so it stays findable by name.
-        files_with_file_node = {
-            node.get("source_file")
-            for node in graph_data.get("nodes", [])
-            if isinstance(node, dict)
-            and is_file_node_label(node.get("label"), node.get("source_file"))
-        }
-
-        for node in graph_data.get("nodes", []):
-            if not isinstance(node, dict):
-                continue
-            qualified = paths.get(node.get("id"))
-            key = node_key(repo_id, node, qualified)
-            if key is None:
-                continue
-            nodes_per_key[key] = nodes_per_key.get(key, 0) + 1
-            if qualified is not None:
-                config_keys_seen.add(key)
-            label = qualified or node.get("label") or ""
-            source_file = node.get("source_file") or ""
-            snippet = build_snippet(source_root, source_file, node_line(node))
-
-            doc_id = len(documents)
-            documents.append([repo_id, key])
-            doc_base = doc_id << FIELD_PACK_BITS
-            if node.get("_origin") == ORIGIN_SEMANTIC and source_file in stale_files:
-                stale_doc_ids.append(doc_id)
-
-            # A config key's own name is its label; its ancestors are where it
-            # lives, like the file path. Indexing the whole dotted path at label
-            # boost gave every nested key of a JSON schema or package.json the
-            # label weight of words such as `integration` or `policy`, which
-            # reordered code-query results (measured 2026-11-06).
-            bare_label = node.get("label") or ""
-            ancestors = (
-                qualified[: -len(bare_label) - 1]
-                if qualified and qualified.endswith(PATH_SEPARATOR + bare_label)
-                else ""
+        manifest = read_manifest(graph_path)
+        cache_key = None
+        partial = None
+        if partial_cache is not None:
+            cache_key = partial_cache.key(
+                repo_id,
+                (graph_sha256_by_repo or {}).get(repo_id),
+                manifest,
+                (source_digests_by_repo or {}).get(repo_id),
+                graph_data,
+                source_root,
             )
-            field_tokens = {
-                "label": set(tokenize_text(bare_label if qualified else label)),
-                "path": set(tokenize_text(source_file)) | set(tokenize_text(ancestors)),
-                "snippet": set(tokenize_text(snippet)) if snippet else set(),
-            }
-            for field_name, terms in field_tokens.items():
-                packed = doc_base | _FIELD_INDEX[field_name]
-                for term in terms:
-                    postings.setdefault(term, set()).add(packed)
+            if cache_key is not None:
+                partial = partial_cache.read(cache_key, repo_id)
+        if partial is None:
+            partial = build_repo_partial(repo_id, graph_data, source_root, graph_path, manifest)
+            if partial_cache is not None and cache_key is not None:
+                partial_cache.stage(cache_key, partial)
+        _merge_partial(partial, postings, alias_exact, node_id_index, documents, stale_doc_ids)
+        key_collisions += partial.key_collisions
+        key_collision_nodes += partial.key_collision_nodes
+        config_key_collisions += partial.config_key_collisions
+        del partial
 
-            include_basename = source_file not in files_with_file_node or is_file_node_label(
-                node.get("label"), source_file
-            )
-            for alias in extract_alias_forms(label, source_file, include_basename):
-                alias_exact.setdefault(alias, set()).add(doc_id)
-
-            raw_id = node.get("id")
-            if raw_id:
-                node_id_index[f"{repo_id}\x1f{str(raw_id).lower()}"] = key
-
-    # Pop-as-converted (kept from the v2 OOM fix): each term's set is freed
-    # as soon as its sorted list is built, so accumulator and output never
-    # both peak. Entries are ints, so sorted() needs no key function.
-    sorted_postings: dict[str, list[int]] = {}
-    for term in sorted(postings.keys()):
-        sorted_postings[term] = sorted(postings.pop(term))
-
-    sorted_aliases: dict[str, list[int]] = {}
-    for alias in sorted(alias_exact.keys()):
-        sorted_aliases[alias] = sorted(alias_exact.pop(alias))
+    # Pop-as-moved: each term's list leaves the accumulator as it enters the
+    # sorted output, so the two never both hold it.
+    sorted_postings = {term: postings.pop(term) for term in sorted(postings)}
+    sorted_aliases = {alias: alias_exact.pop(alias) for alias in sorted(alias_exact)}
 
     data = {
         "schema_version": LEXICAL_SCHEMA_VERSION,
@@ -412,14 +656,13 @@ def build_lexical_index(
         "document_count": len(documents),
         "stale_semantic": stale_doc_ids,
     }
-    colliding = [key for key, count in nodes_per_key.items() if count > 1]
     stats = LexicalIndexStats(
         documents=len(documents),
         terms=len(sorted_postings),
         aliases=len(sorted_aliases),
-        key_collisions=len(colliding),
-        key_collision_nodes=sum(nodes_per_key[key] for key in colliding),
-        config_key_collisions=sum(1 for key in colliding if key in config_keys_seen),
+        key_collisions=key_collisions,
+        key_collision_nodes=key_collision_nodes,
+        config_key_collisions=config_key_collisions,
         stale_semantic_documents=len(stale_doc_ids),
     )
     # Measured, never fatal: code nodes can legitimately share

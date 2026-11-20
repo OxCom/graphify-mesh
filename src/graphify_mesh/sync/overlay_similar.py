@@ -38,6 +38,7 @@ from graphify_mesh.sync.embed_similarity import (
     LANGUAGE_FAMILIES,
     MIN_CALIBRATION_COPIES,
     SIMILARITY_THRESHOLD_DEFAULT,
+    PairCacheSource,
     mutual_top_k_pairs,
 )
 from graphify_mesh.sync.embedding import key_to_ref, node_key
@@ -217,6 +218,8 @@ def _embedding_pairs(
     top_k: int,
     threshold: float,
     embedding_model: str,
+    pair_cache: PairCacheSource | None = None,
+    exact_max_rows: int | None = None,
 ) -> tuple[list[OverlayEdge], set[str]]:
     total = sum(len(rv) for rv in embedding_vectors_by_repo.values())
     all_keys = {key for rv in embedding_vectors_by_repo.values() for key in rv.keys}
@@ -226,7 +229,11 @@ def _embedding_pairs(
     # Candidates are generated down to the floor, not to `threshold`: the admission
     # threshold is computed per repo pair below and can sit under the caller's value.
     pairs = mutual_top_k_pairs(
-        embedding_vectors_by_repo, top_k=top_k, threshold=min(threshold, CANDIDATE_FLOOR)
+        embedding_vectors_by_repo,
+        top_k=top_k,
+        threshold=min(threshold, CANDIDATE_FLOOR),
+        pair_cache=pair_cache,
+        exact_max_rows=exact_max_rows,
     )
 
     # First pass: each repo pair's identity level, from the copies it holds. A same-path
@@ -334,6 +341,8 @@ def compute_similar_approach_edges(
     top_k: int = 5,
     threshold: float = SIMILARITY_THRESHOLD_DEFAULT,
     embedding_model: str = "unknown",
+    pair_cache: PairCacheSource | None = None,
+    exact_max_rows: int | None = None,
 ) -> list[OverlayEdge]:
     """Mutual top-k cross-project similarity (WS4 item 2), backed by the WS3
     embedding index when available, falling back to the exact-match
@@ -350,12 +359,15 @@ def compute_similar_approach_edges(
         top_k: cap on edges emitted per node (both scoring paths).
         threshold: cosine similarity cutoff for the embedding path (C7:
             named, documented-untuned default; see embed_similarity.py).
+        pair_cache: per-repo-pair candidate cache for the exact path; `None`
+            computes every pair (see overlay_pair_cache.py).
+        exact_max_rows: exact-path row limit; `None` keeps the module default.
     """
     embedding_edges: list[OverlayEdge] = []
     embedded_keys: set[str] = set()
     if embedding_vectors_by_repo:
         embedding_edges, embedded_keys = _embedding_pairs(
-            embedding_vectors_by_repo, top_k, threshold, embedding_model
+            embedding_vectors_by_repo, top_k, threshold, embedding_model, pair_cache, exact_max_rows
         )
 
     fallback_edges = _fallback_exact_match_pairs(graphs_by_repo, embedded_keys, top_k)

@@ -28,9 +28,11 @@ override once real tuning data exists (see `overlay_similar.py` callers).
 from __future__ import annotations
 
 import heapq
+import io
 import logging
 import random
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
@@ -217,6 +219,9 @@ MAX_BUCKET_COMPARE_ROWS = 4096
 # with 12 hyperplanes two vectors at cosine 0.88 share a bucket 12.8% of the time.
 EXACT_MAX_ROWS = 80_000
 
+# Share of the limit above which the exact path logs a warning.
+EXACT_WARN_FRACTION = 0.9
+
 
 def cosine_similarity(a: list[float] | np.ndarray, b: list[float] | np.ndarray) -> float:
     # Mixed-dimension vectors (e.g. a shard embedded under two different
@@ -264,6 +269,207 @@ def _bucket_signature_batch(matrix: np.ndarray, planes: np.ndarray) -> list[str]
     return ["".join("1" if b else "0" for b in row) for row in bits]
 
 
+# Names the code that turns two vector matrices into a pair's candidates. Part of
+# every pair-cache key: bump it whenever normalization, dtype, the threshold
+# comparison or the per-row ordering below changes.
+PAIR_CANDIDATES_RECIPE = "exact-pair-top-k/1:l2-normalized-float32:score-desc-other-row-asc"
+
+
+@dataclass
+class PairCandidates:
+    """One repo pair's exact candidates: for each row of either side, its top-k
+    rows of the other side at or above the threshold, ordered by score
+    descending then other row ascending. Rows are LOCAL to their repo, never
+    global, so the entry stays valid when another repo changes size."""
+
+    count_a: int
+    count_b: int
+    a_row: np.ndarray  # int32, ascending
+    a_other: np.ndarray  # int32, row of repo b
+    a_score: np.ndarray  # float32
+    b_row: np.ndarray
+    b_other: np.ndarray
+    b_score: np.ndarray
+
+    def fits(self, count_a: int, count_b: int, top_k: int) -> bool:
+        """Whether this entry can describe the current matrices of the pair."""
+        if (self.count_a, self.count_b) != (count_a, count_b):
+            return False
+        for rows, others, scores, n_rows, n_others in (
+            (self.a_row, self.a_other, self.a_score, count_a, count_b),
+            (self.b_row, self.b_other, self.b_score, count_b, count_a),
+        ):
+            if not (rows.shape == others.shape == scores.shape) or rows.ndim != 1:
+                return False
+            if rows.size == 0:
+                continue
+            if rows.min() < 0 or rows.max() >= n_rows:
+                return False
+            if others.min() < 0 or others.max() >= n_others:
+                return False
+            if np.bincount(rows).max() > top_k:
+                return False
+        return True
+
+    def to_bytes(self) -> bytes:
+        # Rows are stored as a per-row count (the arrays are row-ascending), which
+        # is 2 bytes per row instead of 4 per candidate.
+        buffer = io.BytesIO()
+        np.savez(
+            buffer,
+            counts=np.asarray([self.count_a, self.count_b], dtype=np.int64),
+            a_counts=np.bincount(self.a_row, minlength=self.count_a).astype(np.uint16),
+            a_other=self.a_other.astype(np.int32, copy=False),
+            a_score=self.a_score.astype(np.float32, copy=False),
+            b_counts=np.bincount(self.b_row, minlength=self.count_b).astype(np.uint16),
+            b_other=self.b_other.astype(np.int32, copy=False),
+            b_score=self.b_score.astype(np.float32, copy=False),
+        )
+        return buffer.getvalue()
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> PairCandidates | None:
+        """None for anything that is not a well-formed entry; never raises."""
+        try:
+            with np.load(io.BytesIO(payload), allow_pickle=False) as data:
+                counts = data["counts"]
+                arrays = {name: data[name] for name in data.files if name != "counts"}
+            count_a, count_b = (int(value) for value in counts)
+            sides = {}
+            for side, n_rows in (("a", count_a), ("b", count_b)):
+                row_counts = arrays[f"{side}_counts"]
+                others = arrays[f"{side}_other"]
+                scores = arrays[f"{side}_score"]
+                if (
+                    row_counts.dtype != np.uint16
+                    or others.dtype != np.int32
+                    or scores.dtype != np.float32
+                    or row_counts.shape != (n_rows,)
+                    or int(row_counts.sum()) != others.size
+                ):
+                    return None
+                rows = np.repeat(np.arange(n_rows, dtype=np.int32), row_counts)
+                sides[side] = (rows, others, scores)
+        except Exception as exc:
+            log.debug("similar_approach: unreadable pair candidates ignored: %s", exc)
+            return None
+        return cls(count_a, count_b, *sides["a"], *sides["b"])
+
+
+class PairCache(Protocol):
+    """Per-repo-pair candidate store bound to one (top_k, threshold)."""
+
+    def read(self, repo_a: str, repo_b: str) -> PairCandidates | None: ...
+
+    def stage(self, repo_a: str, repo_b: str, candidates: PairCandidates) -> None: ...
+
+
+class PairCacheSource(Protocol):
+    """What callers hand to `mutual_top_k_pairs`: bound only on the exact path,
+    where the effective threshold is known."""
+
+    def bind(
+        self, vectors_by_repo: dict[str, RepoVectors], top_k: int, threshold: float
+    ) -> PairCache: ...
+
+
+def _top_k_per_row(
+    rows: np.ndarray, others: np.ndarray, scores: np.ndarray, top_k: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Keep each row's top_k by (score descending, other ascending), row-ascending."""
+    if rows.size == 0:
+        return rows, others, scores
+    order = np.lexsort((others, -scores, rows))
+    rows, others, scores = rows[order], others[order], scores[order]
+    starts = np.flatnonzero(np.r_[True, rows[1:] != rows[:-1]])
+    group_start = np.repeat(starts, np.diff(np.r_[starts, rows.size]))
+    keep = (np.arange(rows.size) - group_start) < top_k
+    return rows[keep], others[keep], scores[keep]
+
+
+def _concat_top_k(
+    parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]], top_k: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if not parts:
+        empty = np.zeros(0, dtype=np.int32)
+        return empty, empty.copy(), np.zeros(0, dtype=np.float32)
+    return _top_k_per_row(
+        np.concatenate([part[0] for part in parts]),
+        np.concatenate([part[1] for part in parts]),
+        np.concatenate([part[2] for part in parts]),
+        top_k,
+    )
+
+
+def _pair_candidates(
+    rv_a: RepoVectors, rv_b: RepoVectors, top_k: int, threshold: float
+) -> PairCandidates:
+    """The exact candidates of one repo pair, reduced block by block.
+
+    Every block is cut to its per-row top-k before it is kept, so what is kept is
+    at most top_k entries per row and chunk, never the pair's full hit list. The
+    transient is one block's hits and their sort (~30 MB for a fully dense block).
+    """
+    rows_a = rv_a.normalized()
+    rows_b = rv_b.normalized()
+    count_a = len(rv_a.keys)
+    count_b = len(rv_b.keys)
+    a_parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    b_parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    # Both sides are sliced, never materialized whole: `normalized()` is a lazy
+    # view precisely so the mmap'd shard is not pulled into RAM, and a `.T` on it
+    # would defeat that.
+    for start_a in range(0, count_a, BUCKET_CHUNK_ROWS):
+        end_a = min(start_a + BUCKET_CHUNK_ROWS, count_a)
+        block_a = rows_a[start_a:end_a]
+        chunk_a_parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        for start_b in range(0, count_b, BUCKET_CHUNK_ROWS):
+            end_b = min(start_b + BUCKET_CHUNK_ROWS, count_b)
+            sims = block_a @ rows_b[start_b:end_b].T
+            hit_rows, hit_cols = np.nonzero(sims >= threshold)
+            if not hit_rows.size:
+                continue
+            scores = sims[hit_rows, hit_cols].astype(np.float32, copy=False)
+            global_a = (hit_rows + start_a).astype(np.int32)
+            global_b = (hit_cols + start_b).astype(np.int32)
+            chunk_a_parts.append(_top_k_per_row(global_a, global_b, scores, top_k))
+            b_parts.append(_top_k_per_row(global_b, global_a, scores, top_k))
+        a_parts.append(_concat_top_k(chunk_a_parts, top_k))
+        b_parts = [_concat_top_k(b_parts, top_k)]
+    a_row, a_other, a_score = _concat_top_k(a_parts, top_k)
+    b_row, b_other, b_score = _concat_top_k(b_parts, top_k)
+    return PairCandidates(count_a, count_b, a_row, a_other, a_score, b_row, b_other, b_score)
+
+
+def _push_candidates(
+    candidates: dict[str, list[tuple[float, int, str]]],
+    keys: list[str],
+    base_owner: int,
+    base_other: int,
+    owner_rows: np.ndarray,
+    other_rows: np.ndarray,
+    scores: np.ndarray,
+    top_k: int,
+) -> None:
+    """Offer one side of a pair to the global per-key heaps.
+
+    The tie-break is the other row's GLOBAL position, recomputed from this run's
+    offsets. For any one owner it orders candidates exactly as the former
+    generation counter did (other repo sorted, then other row ascending), and it
+    makes the heap order total, so push order no longer matters.
+    """
+    for owner_row, other_row, score in zip(
+        owner_rows.tolist(), other_rows.tolist(), scores.tolist(), strict=True
+    ):
+        global_other = base_other + other_row
+        heap = candidates[keys[base_owner + owner_row]]
+        entry = (score, -global_other, keys[global_other])
+        if len(heap) < top_k:
+            heapq.heappush(heap, entry)
+        elif entry > heap[0]:
+            heapq.heapreplace(heap, entry)
+
+
 def _exact_pairs(
     vectors_by_repo: dict[str, RepoVectors],
     repo_ids: list[str],
@@ -271,16 +477,18 @@ def _exact_pairs(
     row_refs: list[tuple[str, int]],
     top_k: int,
     threshold: float,
+    pair_cache: PairCache | None = None,
 ) -> list[tuple[str, str, float]]:
     """Every cross-repo pair compared, no bucketing.
 
     Same contract as the LSH path: per-key top-k heaps ordered by
-    (score, -generation_rank), then the mutual filter, then a globally
-    descending sort. Only which pairs are *offered* to the heaps differs, and
-    here it is all of them, so the result is the exact mutual top-k set.
+    (score, -rank), then the mutual filter, then a globally descending sort.
+    Only which pairs are *offered* to the heaps differs, and here it is all of
+    them, so the result is the exact mutual top-k set.
 
-    Deterministic: repos in sorted order, rows ascending inside each, which is
-    the order `keys` and `row_refs` were built in.
+    A key's global top-k is the top-k of the union of its per-pair top-k lists,
+    so each repo pair is reduced on its own and may come from `pair_cache`.
+    One pair's arrays are alive at a time: read or computed, pushed, released.
     """
     offsets: dict[str, int] = {}
     cursor = 0
@@ -289,41 +497,44 @@ def _exact_pairs(
         cursor += len(vectors_by_repo[repo_id].keys)
 
     candidates: dict[str, list[tuple[float, int, str]]] = {key: [] for key in keys}
-    next_rank = 0
     for index_a, repo_a in enumerate(repo_ids):
-        rows_a = vectors_by_repo[repo_a].normalized()
         count_a = len(vectors_by_repo[repo_a].keys)
-        base_a = offsets[repo_a]
         for repo_b in repo_ids[index_a + 1 :]:
-            rows_b = vectors_by_repo[repo_b].normalized()
             count_b = len(vectors_by_repo[repo_b].keys)
+            pair = pair_cache.read(repo_a, repo_b) if pair_cache is not None else None
+            if pair is not None and not pair.fits(count_a, count_b, top_k):
+                log.debug(
+                    "similar_approach: cached candidates for %s<->%s do not fit, recomputing",
+                    repo_a,
+                    repo_b,
+                )
+                pair = None
+            if pair is None:
+                pair = _pair_candidates(
+                    vectors_by_repo[repo_a], vectors_by_repo[repo_b], top_k, threshold
+                )
+                if pair_cache is not None:
+                    pair_cache.stage(repo_a, repo_b, pair)
+            base_a = offsets[repo_a]
             base_b = offsets[repo_b]
-            # Both sides are sliced, never materialized whole: `normalized()` is a
-            # lazy view precisely so the mmap'd shard is not pulled into RAM, and
-            # a `.T` on it would defeat that. Memory here is one chunk x chunk
-            # block of float32.
-            for start_a in range(0, count_a, BUCKET_CHUNK_ROWS):
-                end_a = min(start_a + BUCKET_CHUNK_ROWS, count_a)
-                block_a = rows_a[start_a:end_a]
-                for start_b in range(0, count_b, BUCKET_CHUNK_ROWS):
-                    end_b = min(start_b + BUCKET_CHUNK_ROWS, count_b)
-                    sims = block_a @ rows_b[start_b:end_b].T
-                    hit_rows, hit_cols = np.nonzero(sims >= threshold)
-                    for local_row, local_col in zip(hit_rows, hit_cols, strict=True):
-                        key_a = keys[base_a + start_a + int(local_row)]
-                        key_b = keys[base_b + start_b + int(local_col)]
-                        score = float(sims[local_row, local_col])
-                        rank = next_rank
-                        next_rank += 1
-                        for owner_key, other_key in ((key_a, key_b), (key_b, key_a)):
-                            heap = candidates[owner_key]
-                            entry = (score, -rank, other_key)
-                            if len(heap) < top_k:
-                                heapq.heappush(heap, entry)
-                            elif heap and entry > heap[0]:
-                                heapq.heapreplace(heap, entry)
+            _push_candidates(
+                candidates, keys, base_a, base_b, pair.a_row, pair.a_other, pair.a_score, top_k
+            )
+            _push_candidates(
+                candidates, keys, base_b, base_a, pair.b_row, pair.b_other, pair.b_score, top_k
+            )
+            del pair
 
     return _mutual_from_candidates(candidates)
+
+
+def comparable_row_count(vectors_by_repo: dict[str, RepoVectors]) -> int:
+    """Rows `mutual_top_k_pairs` compares: those of repos sharing the first sorted repo's dim."""
+    repo_ids = sorted(repo_id for repo_id, rv in vectors_by_repo.items() if len(rv))
+    if not repo_ids:
+        return 0
+    dim = vectors_by_repo[repo_ids[0]].dim
+    return sum(len(vectors_by_repo[r]) for r in repo_ids if vectors_by_repo[r].dim == dim)
 
 
 def mutual_top_k_pairs(
@@ -332,6 +543,8 @@ def mutual_top_k_pairs(
     threshold: float = SIMILARITY_THRESHOLD_DEFAULT,
     num_planes: int = LSH_NUM_HYPERPLANES,
     seed: int = LSH_SEED,
+    pair_cache: PairCacheSource | None = None,
+    exact_max_rows: int | None = None,
 ) -> list[tuple[str, str, float]]:
     """Cross-repo-only mutual top-k similarity pairs.
 
@@ -343,6 +556,9 @@ def mutual_top_k_pairs(
             similarity.
         top_k: cap on candidates kept per node before the mutual filter.
         threshold: minimum cosine similarity to be a candidate at all.
+        pair_cache: per-repo-pair candidate cache, used on the exact path only.
+        exact_max_rows: row count up to which the exact path runs; `None` means
+            the module's EXACT_MAX_ROWS. Resolved per call so tests can patch it.
 
     Returns:
         List of (key_a, key_b, score) with key_a < key_b (deterministic
@@ -385,15 +601,34 @@ def mutual_top_k_pairs(
     if len(keys) < 2:
         return []
 
-    if len(keys) <= EXACT_MAX_ROWS:
-        return _exact_pairs(vectors_by_repo, kept_repo_ids, keys, row_refs, top_k, threshold)
+    limit = EXACT_MAX_ROWS if exact_max_rows is None else exact_max_rows
+    # Near-limit only: above the limit the LSH fallback logs its own warning.
+    if EXACT_WARN_FRACTION * limit < len(keys) <= limit:
+        log.warning(
+            "similar_approach: %d rows is %d%% of EXACT_MAX_ROWS=%d; above it overlay "
+            "falls back to LSH and the pair cache is not used",
+            len(keys),
+            round(100 * len(keys) / max(limit, 1)),
+            limit,
+        )
+
+    if len(keys) <= limit:
+        bound = (
+            pair_cache.bind(vectors_by_repo, top_k, threshold) if pair_cache is not None else None
+        )
+        return _exact_pairs(
+            vectors_by_repo, kept_repo_ids, keys, row_refs, top_k, threshold, pair_cache=bound
+        )
+
+    if pair_cache is not None:
+        log.info("overlay: LSH path, pair cache not used")
 
     log.warning(
         "similar_approach: %d rows exceeds EXACT_MAX_ROWS=%d — falling back to LSH "
         "bucketing, which compares only vectors sharing a bucket and loses most "
         "true pairs at this threshold",
         len(keys),
-        EXACT_MAX_ROWS,
+        limit,
     )
     planes = _planes_matrix(dim, num_planes, seed)
     # Signatures per repo straight off the RAW resident matrix — no combined

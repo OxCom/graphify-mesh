@@ -1,6 +1,6 @@
 # `graphify-mesh-sync --repo <id>`: fast single-repo refresh
 
-Status: draft for approval, 2026-11-19. No code before approval.
+Status: approved 2026-11-19.
 
 ## Intent
 

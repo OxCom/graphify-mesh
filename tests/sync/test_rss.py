@@ -64,6 +64,20 @@ def test_tracker_growth_is_never_negative_when_hwm_is_flat(monkeypatch):
     assert tracker.to_dict()["b"]["hwm_growth_kb"] == 0
 
 
+def test_tracker_records_wall_and_cpu_per_stage(monkeypatch):
+    clock = iter([10.0, 12.5, 20.0])  # __init__, mark a, mark b
+    cpu = iter([1.0, 1.5, 4.0])
+    monkeypatch.setattr(rss.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(rss, "_cpu_seconds", lambda: next(cpu))
+    monkeypatch.setattr(rss, "snapshot", lambda: rss.RssSnapshot(1, 1))
+    t = rss.StageRssTracker()
+    t.mark("a")
+    t.mark("b")
+    d = t.to_dict()
+    assert (d["a"]["wall_s"], d["a"]["cpu_s"]) == (2.5, 0.5)
+    assert (d["b"]["wall_s"], d["b"]["cpu_s"]) == (7.5, 2.5)
+
+
 def test_tracker_marks_are_ordered_and_repeat_safe():
     tracker = rss.StageRssTracker()
     tracker.mark("only")

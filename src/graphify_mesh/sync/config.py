@@ -912,6 +912,29 @@ CLASSIFICATION_TABLES: dict[int, ClassificationTable] = {
 }
 
 
+def _exact_max_rows_from_env() -> int:
+    """GRAPHIFY_MESH_EXACT_MAX_ROWS, or the embed_similarity default when unset or bad.
+
+    A bad value warns instead of failing: the limit only picks exact vs LSH."""
+    from graphify_mesh.sync.embed_similarity import EXACT_MAX_ROWS
+
+    raw = os.environ.get("GRAPHIFY_MESH_EXACT_MAX_ROWS")
+    if raw is None:
+        return EXACT_MAX_ROWS
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        value = 0
+    if value < 2:
+        logging.getLogger("graphify_mesh.sync").warning(
+            "GRAPHIFY_MESH_EXACT_MAX_ROWS=%r is not an integer >= 2; using %d",
+            raw,
+            EXACT_MAX_ROWS,
+        )
+        return EXACT_MAX_ROWS
+    return value
+
+
 def _classification_version_from_env(var_name: str) -> int:
     """The classification table the digest uses, CLASSIFICATION_VERSION when unset.
 
@@ -1086,6 +1109,13 @@ class Settings:
     relabel_all: bool = field(
         default_factory=lambda: os.environ.get("GRAPHIFY_MESH_RELABEL_ALL", "0") == "1"
     )
+    # Env GRAPHIFY_MESH_STAGE_CACHE=0 turns the stage caches off (never read, never written).
+    stage_cache: bool = field(
+        default_factory=lambda: os.environ.get("GRAPHIFY_MESH_STAGE_CACHE", "1").strip() != "0"
+    )
+    # Row count up to which similar_approach compares every pair exactly. Env
+    # GRAPHIFY_MESH_EXACT_MAX_ROWS; a value below 2 or unparsable falls back to the default.
+    exact_max_rows: int = field(default_factory=lambda: _exact_max_rows_from_env())
     # "repo" (default) or "global". Env GRAPHIFY_MESH_CLUSTER_SCOPE.
     cluster_scope: str = field(default_factory=lambda: _read_cluster_scope())
     skip_embedding: bool = False
@@ -1242,6 +1272,9 @@ class Settings:
         default_factory=lambda: _scan_depth_from_env("GRAPHIFY_MESH_SCAN_DEPTH", SCAN_DEFAULT_DEPTH)
     )
 
+    # CLI --repo selection; empty means every repo.
+    only_repos: frozenset[str] = frozenset()
+
     def __post_init__(self) -> None:
         # _scan_depth_from_env already clamps the env/CLI path; direct
         # construction (tests, or any other caller building Settings(...) by
@@ -1297,6 +1330,11 @@ class Settings:
         Sibling of `naming_dir`/`generations_dir` under the global dir, never
         git-tracked (see .gitignore `graphify/global/embeddings/`)."""
         return self.global_dir / "embeddings"
+
+    @property
+    def cache_dir(self) -> Path:
+        """Stage caches (`cache/<stage>/`), written only after a successful publish."""
+        return self.global_dir / "cache"
 
     @property
     def embeddings_generations_dir(self) -> Path:

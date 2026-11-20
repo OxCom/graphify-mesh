@@ -74,7 +74,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -284,6 +284,12 @@ class RepoShard:
     # Full recipe dict for the same vectors, carried only so the stamp in
     # meta.json is debuggable by a human. Never used for the reuse decision.
     recipe: dict | None = None
+    # `inputs_digest()` of the inputs every entry's content hash was checked
+    # against. A shard carried forward unverified keeps its old value, so the
+    # next run cannot mistake it for one checked against current sources.
+    inputs_digest: str | None = None
+    # `shard_matrix_sha256()` as written to meta.json; set by stage_embeddings.
+    matrix_sha256: str | None = None
 
     @classmethod
     def empty(cls) -> RepoShard:
@@ -309,6 +315,10 @@ class EmbeddingStageResult:
     # forward because they came from a different recipe. Their shard is staged
     # empty instead, so this generation holds one vector space rather than two.
     vectors_dropped_repos: list[str] = field(default_factory=list)
+    # Repos whose previous shard files are reused byte for byte: staging skips
+    # them and persist_generation hard-links them from the previous generation.
+    # Empty unless the stage cache is on.
+    reused_repo_ids: set[str] = field(default_factory=set)
 
 
 def key_to_ref(key: str) -> LogicalRef:
@@ -1034,7 +1044,68 @@ def _read_v2_shard(current_dir: Path, repo_id: str, meta_path: Path) -> RepoShar
         vectors=vectors,
         recipe_stamp=_meta_recipe_stamp(meta),
         recipe=meta.get("recipe") if isinstance(meta.get("recipe"), dict) else None,
+        inputs_digest=_meta_str(meta, "inputs_digest"),
+        matrix_sha256=_meta_str(meta, "matrix_sha256"),
     )
+
+
+def _meta_str(meta: dict, name: str) -> str | None:
+    value = meta.get(name)
+    return value if isinstance(value, str) and value else None
+
+
+def inputs_digest(
+    graph_sha256: bytes | None,
+    source_digest: str | None,
+    recipe_stamp: str,
+    graph_data: dict,
+    source_root: Path | None,
+) -> str | None:
+    """Digest of everything an unchanged repo's content hashes derive from:
+    the sha256 of the graph.json bytes `graph_data` was parsed from, the live
+    source digest, the recipe stamp, the shard format and a stat of every file
+    the graph's nodes name. `None` when an input is unknown, which never matches."""
+    if graph_sha256 is None or source_digest is None:
+        return None
+    h = hashlib.sha256(graph_sha256)
+    tail = f"\n{source_digest}\n{recipe_stamp}\n{SHARD_FORMAT_VERSION}\n{source_root}\n"
+    h.update(tail.encode("utf-8"))
+    for line in _source_file_stat_lines(graph_data, source_root):
+        h.update(line)
+    return h.hexdigest()
+
+
+def _source_file_stat_lines(graph_data: dict, source_root: Path | None) -> Iterator[bytes]:
+    """(path, size, mtime_ns) of every distinct graphed source_file, sorted.
+    Snippets read these files, and some (an "ignore"-classed extension) are
+    outside the source digest; a stat, never a read, makes their edits a miss."""
+    source_files = sorted(
+        {
+            node["source_file"]
+            for node in graph_data.get("nodes", [])
+            if isinstance(node, dict) and isinstance(node.get("source_file"), str)
+        }
+    )
+    for source_file in source_files:
+        marker = "missing"
+        if source_root is not None and source_file and not Path(source_file).is_absolute():
+            try:
+                stat = os.stat(source_root / source_file)
+                marker = f"{stat.st_size}:{stat.st_mtime_ns}"
+            except OSError:
+                pass
+        yield f"{source_file}\x00{marker}\n".encode()
+
+
+def shard_matrix_sha256(vectors: RepoVectors) -> str:
+    """sha256 of the row keys (newline-joined, UTF-8) followed by the float32
+    matrix bytes as np.save writes them. Hashed through a buffer view, so a
+    large mmap'd matrix is not copied."""
+    h = hashlib.sha256("\n".join(vectors.keys).encode("utf-8"))
+    matrix = np.ascontiguousarray(vectors.matrix, dtype=np.float32)
+    if matrix.size:
+        h.update(matrix.data.cast("B"))
+    return h.hexdigest()
 
 
 def _meta_recipe_stamp(meta: dict) -> str | None:
@@ -1239,6 +1310,8 @@ def run_embedding_stage(
     settings: Settings,
     provisional_generation_id: str,
     health_check: HealthCheckFn | None = None,
+    source_digests_by_repo: dict[str, str] | None = None,
+    graph_sha256_by_repo: dict[str, bytes] | None = None,
 ) -> EmbeddingStageResult:
     """Top-level WS3 embed-changed stage. `graphs_by_repo` is the same
     per-repo raw graph data overlay.py already loads (post per-project
@@ -1248,7 +1321,13 @@ def run_embedding_stage(
     `provisional_generation_id` is a run-scoped identifier used only for the
     id-map's "tombstoned_at"/"generation_id" bookkeeping while staging;
     nothing durable is written until `persist_generation` is called after a
-    successful publish (see module docstring)."""
+    successful publish (see module docstring).
+
+    `source_digests_by_repo` holds each repo's live source digest (this run's
+    walk, not the accepted state). With the stage cache on, an unchanged repo
+    whose shard records the same `inputs_digest` skips the per-node re-hash.
+    `graph_sha256_by_repo` is the sha256 of the bytes each graph was parsed
+    from (`overlay.load_graphs_and_sha256`); a repo without one never skips."""
     # URL scheme gate BEFORE any health check runs: a base URL that is not
     # plain http(s)-with-host (file://, gopher://, ...) fails this stage's
     # health-check path outright — degraded mode, zero requests attempted.
@@ -1293,6 +1372,9 @@ def run_embedding_stage(
     staged_shards: dict[str, RepoShard] = {}
     mid_run_failure: str | None = None
     dropped_repo_ids: list[str] = []
+    reused_repo_ids: set[str] = set()
+    source_digests = source_digests_by_repo or {}
+    graph_shas = graph_sha256_by_repo or {}
 
     def _stage_shard(staged_repo_id: str, staged_shard: RepoShard) -> None:
         staged_shards[staged_repo_id] = staged_shard
@@ -1304,13 +1386,32 @@ def run_embedding_stage(
     for i, (repo_id, graph_data) in enumerate(repo_items, start=1):
         source_root = repo_roots_by_id.get(repo_id)
         previous_shard = read_previous_shard(previous_current_dir, repo_id)
+        current_inputs_digest = inputs_digest(
+            graph_shas.get(repo_id),
+            source_digests.get(repo_id),
+            current_recipe_stamp,
+            graph_data,
+            source_root,
+        )
+        # Same inputs as when the published shard was checked, so its content
+        # hashes still hold and the per-node re-hash (reads every snippet) is
+        # skipped. Off: decide as before, the result is the same shard.
+        inputs_unchanged = (
+            settings.stage_cache
+            and current_inputs_digest is not None
+            and previous_shard.inputs_digest == current_inputs_digest
+            and previous_shard.matrix_sha256 is not None
+        )
 
         if (
             repo_id in unchanged_repo_ids
             and previous_shard.entries
             and previous_shard.recipe_stamp == current_recipe_stamp
             and set(previous_shard.entries) == set(graph_node_keys(repo_id, graph_data).values())
-            and _shard_content_current(repo_id, graph_data, source_root, previous_shard)
+            and (
+                inputs_unchanged
+                or _shard_content_current(repo_id, graph_data, source_root, previous_shard)
+            )
         ):
             # WS1's own changed-detection (decide_action -> ACTION_SKIP)
             # already told us this repo is untouched this run — reuse its
@@ -1326,6 +1427,9 @@ def run_embedding_stage(
             # every vector whose key and input are unchanged.
             log.info("[%d/%d] %s: reusing previous shard (unchanged) ...", i, total_repos, repo_id)
             stats.reused_repos_unchanged += 1
+            if inputs_unchanged:
+                reused_repo_ids.add(repo_id)
+            previous_shard.inputs_digest = current_inputs_digest
             _stage_shard(repo_id, previous_shard)
             continue
 
@@ -1395,6 +1499,7 @@ def run_embedding_stage(
         # (peak-RSS: compute_repo_shard has already taken everything it
         # reuses out of it by now).
         del previous_shard
+        shard.inputs_digest = current_inputs_digest
         _stage_shard(repo_id, shard)
 
     id_map = build_id_map(previous_id_map, all_keys, provisional_generation_id)
@@ -1411,6 +1516,7 @@ def run_embedding_stage(
         id_map=id_map,
         reason=mid_run_failure or "",
         vectors_dropped_repos=sorted(dropped_repo_ids),
+        reused_repo_ids=reused_repo_ids,
     )
 
 
@@ -1423,38 +1529,55 @@ def _infer_dim(vectors_by_repo: dict[str, RepoVectors]) -> int:
     )
 
 
+def _write_shard(out_dir: Path, repo_id: str, shard: RepoShard) -> None:
+    """The one shard writer (`<repo>.meta.json` + `<repo>.npy`), shared by
+    staging and persist_generation's fallback so both write the same bytes."""
+    meta_path = out_dir / _shard_meta_filename(repo_id)
+    matrix_path = out_dir / _shard_matrix_filename(repo_id)
+    shard.matrix_sha256 = shard_matrix_sha256(shard.vectors)
+    # json.dump streams straight to the file handle — json.dumps built
+    # the whole serialized shard meta as one in-RAM string first, which
+    # at large node counts briefly doubled this stage's footprint.
+    with meta_path.open("w", encoding="utf-8") as meta_fh:
+        json.dump(
+            {
+                "repo_id": repo_id,
+                "shard_format": SHARD_FORMAT_VERSION,
+                "dim": shard.vectors.dim,
+                # Carried from the shard rather than recomputed here: a
+                # shard reused verbatim from a previous generation (degraded
+                # mode, mid-run fallback, unchanged repo) must keep the
+                # stamp of the recipe that actually produced its vectors.
+                "recipe_stamp": shard.recipe_stamp,
+                "recipe": shard.recipe,
+                "entries": shard.entries,
+                "inputs_digest": shard.inputs_digest,
+                "matrix_sha256": shard.matrix_sha256,
+            },
+            meta_fh,
+        )
+    np.save(matrix_path, shard.vectors.matrix)
+
+
 def stage_embeddings(
-    staging_root: Path, staged_shards_source: dict[str, RepoShard], id_map: dict[str, dict]
+    staging_root: Path,
+    staged_shards_source: dict[str, RepoShard],
+    id_map: dict[str, dict],
+    skip_repo_ids: Collection[str] = (),
 ) -> Path:
     """Write this run's shards + id-map into the ephemeral per-run staging
     tempdir as shard format v2 (`<repo>.meta.json` + `<repo>.npy`). Nothing
     here touches the real, persistent embeddings_dir — see
-    `persist_generation`."""
+    `persist_generation`.
+
+    Repos in `skip_repo_ids` are not written: their previous files are reused
+    as they are, and persist_generation links them in."""
     out_dir = staging_root / "embeddings"
     out_dir.mkdir(parents=True, exist_ok=True)
     for repo_id, shard in staged_shards_source.items():
-        meta_path = out_dir / _shard_meta_filename(repo_id)
-        matrix_path = out_dir / _shard_matrix_filename(repo_id)
-        # json.dump streams straight to the file handle — json.dumps built
-        # the whole serialized shard meta as one in-RAM string first, which
-        # at large node counts briefly doubled this stage's footprint.
-        with meta_path.open("w", encoding="utf-8") as meta_fh:
-            json.dump(
-                {
-                    "repo_id": repo_id,
-                    "shard_format": SHARD_FORMAT_VERSION,
-                    "dim": shard.vectors.dim,
-                    # Carried from the shard rather than recomputed here: a
-                    # shard reused verbatim from a previous generation (degraded
-                    # mode, mid-run fallback, unchanged repo) must keep the
-                    # stamp of the recipe that actually produced its vectors.
-                    "recipe_stamp": shard.recipe_stamp,
-                    "recipe": shard.recipe,
-                    "entries": shard.entries,
-                },
-                meta_fh,
-            )
-        np.save(matrix_path, shard.vectors.matrix)
+        if repo_id in skip_repo_ids:
+            continue
+        _write_shard(out_dir, repo_id, shard)
     with (out_dir / "id-map.json").open("w", encoding="utf-8") as id_map_fh:
         json.dump(id_map, id_map_fh, indent=2, sort_keys=True)
     return out_dir
@@ -1487,20 +1610,63 @@ def _fsync_tree(root: Path) -> None:
         _fsync_dir(directory)
 
 
-def persist_generation(embeddings_dir: Path, generation_id: str, staged_dir: Path) -> None:
+def _link_or_copy(source: Path, target: Path) -> None:
+    """Hard-link `source` to `target`; copy when the link fails (another
+    filesystem, no link support). Safe because generation files are never
+    modified in place, and GC unlinking the old name leaves the inode."""
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+
+
+def persist_generation(
+    embeddings_dir: Path,
+    generation_id: str,
+    staged_dir: Path,
+    reused_shards: Mapping[str, RepoShard] | None = None,
+) -> None:
     """Called only after a successful publish (mirrors publish.flip_current):
     copies the staged shard files into
     `embeddings_dir/generations/<generation_id>/` and flips
     `embeddings_dir/current` to point at it.
+
+    `reused_shards` were not staged; their files are hard-linked from the
+    generation `current` still points at. Staging sits on another filesystem
+    (PrivateTmp), so a link from there would fail with EXDEV. When neither a
+    link nor a copy works, the in-memory shard is written instead.
 
     Deleting old generations is NOT part of this function. It runs after
     `publish.flip_current` has succeeded — see `gc_embedding_generations`."""
     generations_dir = embeddings_dir / "generations"
     generations_dir.mkdir(parents=True, exist_ok=True)
     gen_dir = generations_dir / generation_id
+    reused = reused_shards or {}
+    previous_dir = (embeddings_dir / "current").resolve() if reused else None
+    if previous_dir is not None and previous_dir == gen_dir.resolve():
+        raise RuntimeError(
+            f"embedding generation {generation_id} is the one reused shards are linked from"
+        )
     if gen_dir.exists():
         shutil.rmtree(gen_dir)
     shutil.copytree(staged_dir, gen_dir)
+    if previous_dir is not None:
+        for repo_id in sorted(reused):
+            names = (_shard_meta_filename(repo_id), _shard_matrix_filename(repo_id))
+            try:
+                for name in names:
+                    _link_or_copy(previous_dir / name, gen_dir / name)
+            except OSError as exc:
+                log.warning(
+                    "%s: could not link or copy the reused shard from %s (%s) — "
+                    "writing it from memory instead",
+                    repo_id,
+                    previous_dir,
+                    exc,
+                )
+                for name in names:
+                    (gen_dir / name).unlink(missing_ok=True)
+                _write_shard(gen_dir, repo_id, reused[repo_id])
     # copytree leaves the copied bytes in the page cache. Without this, a crash
     # after the flip below can leave `current` pointing at a generation whose
     # shard files are empty or truncated, while gc_old_generations has already

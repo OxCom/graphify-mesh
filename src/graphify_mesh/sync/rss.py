@@ -10,6 +10,8 @@ third-party profiler.
 
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,20 +51,34 @@ def snapshot() -> RssSnapshot:
     return RssSnapshot(vm_rss_kb=rss_kb, vm_hwm_kb=hwm_kb)
 
 
+def _cpu_seconds() -> float:
+    # Children included so reaped `graphify` subprocesses count toward the stage.
+    t = os.times()
+    return t.user + t.system + t.children_user + t.children_system
+
+
 class StageRssTracker:
     def __init__(self) -> None:
         self._stages: dict[str, dict] = {}
         self._last_hwm_kb = snapshot().vm_hwm_kb
+        self._last_wall = time.monotonic()
+        self._last_cpu = _cpu_seconds()
 
     def mark(self, stage_name: str) -> None:
         snap = snapshot()
         growth = max(snap.vm_hwm_kb - self._last_hwm_kb, 0)
         self._last_hwm_kb = snap.vm_hwm_kb
+        wall = time.monotonic()
+        cpu = _cpu_seconds()
         self._stages[stage_name] = {
             "rss_kb_at_end": snap.vm_rss_kb,
             "hwm_kb_at_end": snap.vm_hwm_kb,
             "hwm_growth_kb": growth,
+            "wall_s": round(wall - self._last_wall, 2),
+            "cpu_s": round(cpu - self._last_cpu, 2),
         }
+        self._last_wall = wall
+        self._last_cpu = cpu
 
     def to_dict(self) -> dict[str, dict]:
         return dict(self._stages)

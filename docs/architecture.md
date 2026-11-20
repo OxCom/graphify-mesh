@@ -299,6 +299,46 @@ discovery
   overwrote the entry and re-queued the key, so the stored hash and the vector
   could belong to different nodes and every duplicate re-embedded on every run.
 
+### Stage caches
+
+Three stages skip work for inputs that did not change. A cache never changes
+output: with the same inputs, a run with `GRAPHIFY_MESH_STAGE_CACHE=0` publishes
+byte-identical files (`tests/sync/test_stage_cache_equivalence.py`). Only
+per-run stamps differ: the overlay's generation id and `created_at`, and the
+`provisional-<UTC second>` ids in the embeddings `id-map.json`.
+
+- **Embedding** keeps no separate cache. Each shard's meta records
+  `inputs_digest` and `matrix_sha256`. `inputs_digest` covers the graph.json
+  sha256, the source digest, the recipe stamp, the shard format, the repo root
+  and a stat of every graphed source file. When it matches, the shard is reused
+  without re-hashing and hard-linked into the new generation.
+- **Overlay** caches exact-path candidates per repo pair under `cache/overlay/`.
+  The key is the sha256 of both repos' row keys and vectors, plus `top_k`, the
+  threshold and the code recipe. The LSH path is not cached.
+- **Lexical** caches one partial per repo under `cache/lexical/`. The key covers
+  the graph.json sha256, `manifest.json`, the source digest, the repo root, a
+  stat of every graphed source file and the tokenizer inputs.
+
+The graph.json sha256 comes from the same bytes the stages parsed. The embed,
+overlay and lexical stages share one read of each graph.json. The lexical stage
+also reads each `manifest.json` once and both hashes and parses those bytes. A
+`graphify update` that rewrites either file mid-run cannot file an old result
+under a new key.
+
+Entries are spooled to disk during the run and moved into place only after
+`flip_current` succeeds. A blocked publish, a crash or a dry run writes no
+entry. After the flush, a cache that this run consulted drops the entries the
+run did not use. A cache that was never consulted keeps every entry: the
+overlay on the LSH path or without vectors, the lexical cache when no repo had
+a key. An
+unreadable or corrupt entry is a miss and is recomputed, never a run failure.
+
+The cache directory is host-local. The overlay key does not cover the BLAS
+build numpy links against, so do not share `cache/` between hosts. Each cache
+has a recipe guard test that pins the source of the code its entries derive
+from (`tests/sync/test_*_recipe_guard.py`). A comment-only change re-pins the
+hash. A semantic change also bumps the recipe constant the test names.
+
 ## The naming stage
 
 The naming stage runs entirely in the sync process. It stages no graph file and

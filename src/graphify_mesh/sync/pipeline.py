@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from graphify_mesh.sync import (
+    embed_similarity,
     embedding,
     graphify_cli,
     lexical_index,
@@ -72,7 +73,9 @@ from graphify_mesh.sync.config import (
     is_valid_http_base_url,
 )
 from graphify_mesh.sync.discovery import assert_registry_containment, discover_filesystem, reconcile
+from graphify_mesh.sync.lexical_partial_cache import LexicalPartialCache
 from graphify_mesh.sync.locking import transaction_lock
+from graphify_mesh.sync.overlay_pair_cache import OverlayPairCache
 from graphify_mesh.sync.registry import (
     BUILDER_GRAPHIFY,
     BUILDER_GRAPHIFY_PHP,
@@ -81,6 +84,7 @@ from graphify_mesh.sync.registry import (
     load_registry,
     registry_hash,
 )
+from graphify_mesh.sync.stage_cache import PendingCacheWrites, sweep_staging_dirs
 from graphify_mesh.sync.state import (
     CLOCK_STATE_KEY,
     SourceDigest,
@@ -893,6 +897,9 @@ class RunReport:
     infra_repos_in_grace: list[str] = field(default_factory=list)
     infra_repos_past_grace: list[str] = field(default_factory=list)
     dirty_repos: list[str] = field(default_factory=list)
+    # Repos with a change this run did not sync because --repo left them out.
+    # Their state is untouched, so the next run that includes them syncs them.
+    pending_repos: list[str] = field(default_factory=list)
     merge_ok: bool = False
     merge_error: str = ""
     # Cross-repo edges `graphify merge-graphs` emitted and the pipeline
@@ -913,6 +920,9 @@ class RunReport:
     labeling_reason: str = ""
     clustering_backend: str = ""
     overlay_edge_counts: dict = field(default_factory=dict)
+    # Vectors the overlay compared and the exact-path limit they were held to.
+    overlay_rows: int = 0
+    overlay_exact_max_rows: int = 0
     overlay_manual_relation_count: int = 0
     embedding_status: str = ""
     embedding_stats: dict = field(default_factory=dict)
@@ -921,7 +931,23 @@ class RunReport:
     # would have mixed two vector spaces under one manifest.
     embedding_vectors_dropped_repos: list[str] = field(default_factory=list)
     lexical_index_stats: dict = field(default_factory=dict)
+    # Per-stage cache use: overlay/lexical hits and misses, embedding shards
+    # reused without a re-hash. All zero with the cache off or on a dry run.
+    stage_cache: dict = field(default_factory=dict)
     stage_rss: dict = field(default_factory=dict)
+
+
+# Row status of a repo with a change that --repo left out (see pending_repos).
+STATUS_DEFERRED = "deferred"
+
+
+def _embed_reuse_candidates(project_actions: list[dict]) -> set[str]:
+    """Repos whose graph did not change this run, so the embed stage may reuse
+    their whole shard. A deferred repo merges its last graph, as if unchanged;
+    the shard's content hashes are still checked against live source."""
+    return {
+        a["repo_id"] for a in project_actions if a.get("status") in ("unchanged", STATUS_DEFERRED)
+    }
 
 
 def _embedding_skip_reason(settings: Settings) -> str:
@@ -968,6 +994,10 @@ def run(settings: Settings) -> RunReport:
         settings.global_dir.mkdir(parents=True, exist_ok=True)
         lock_path = settings.lock_path
 
+    # No cache dir on a dry run or with the cache off: nothing is ever spooled.
+    pending_cache = PendingCacheWrites(
+        settings.cache_dir if settings.stage_cache and not settings.dry_run else None
+    )
     try:
         with transaction_lock(lock_path):
             if not settings.dry_run:
@@ -978,8 +1008,24 @@ def run(settings: Settings) -> RunReport:
                         len(swept),
                         ", ".join(swept),
                     )
-            return _run_locked(settings, staging_root)
+            if not settings.dry_run and settings.stage_cache:
+                # A cache that cannot be cleaned is a cache problem, never a run failure.
+                try:
+                    swept_cache = sweep_staging_dirs(settings.cache_dir)
+                except OSError as exc:
+                    log.warning("startup: could not sweep stage-cache spool dirs: %s", exc)
+                    swept_cache = []
+                if swept_cache:
+                    log.info(
+                        "startup: swept %d stale stage-cache spool dir(s): %s",
+                        len(swept_cache),
+                        ", ".join(swept_cache),
+                    )
+            return _run_locked(settings, staging_root, pending_cache)
     finally:
+        # Every exit that did not flush (blocked publish, crash) drops the spool;
+        # after a flush this is a no-op.
+        pending_cache.discard()
         # Staging is per-run scratch (mkdtemp above). Without this, every run
         # — success, blocked publish, or crash — leaks a tempdir; anything
         # durable was already copied out by publish/persist_generation.
@@ -995,6 +1041,10 @@ def _record_stage_rss(tracker: rss.StageRssTracker, report: RunReport) -> None:
     log.info(
         "stage RSS (MB, hwm growth): %s",
         {name: round(entry["hwm_growth_kb"] / 1024) for name, entry in report.stage_rss.items()},
+    )
+    log.info(
+        "stage time (s, wall/cpu): %s",
+        {name: (entry["wall_s"], entry["cpu_s"]) for name, entry in report.stage_rss.items()},
     )
 
 
@@ -1012,7 +1062,9 @@ def _duplicate_collection_path_errors(entries: list[RepoEntry]) -> list[str]:
     ]
 
 
-def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
+def _run_locked(
+    settings: Settings, staging_root: Path, pending_cache: PendingCacheWrites
+) -> RunReport:
     # Staleness baseline for the eventual manifest: captured BEFORE any
     # pipeline stage runs, so files edited DURING a long sync (mtime after
     # this instant but before publish) still compare newer-than-baseline and
@@ -1039,6 +1091,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # approved_roots is known.
     assert_registry_containment(registry, settings.approved_roots)
     reconciliation = reconcile(discovered, registry, settings.mesh_root, scan_errors=scan_errors)
+    tracker.mark("discovery")
     report = RunReport(dry_run=settings.dry_run, reconciliation=reconciliation.to_dict())
     log.info(
         "discovery: %d registered, %d discovered, %d broken, %d removed, %d renamed",
@@ -1090,9 +1143,18 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             shifted,
         )
     broken_ids = set(reconciliation.broken)
-    active_repos = [
-        e for e in _repos_for_run(registry, reconciliation.to_dict()) if e.repo_id not in broken_ids
-    ]
+    run_repos = _repos_for_run(registry, reconciliation.to_dict())
+    active_repos = [e for e in run_repos if e.repo_id not in broken_ids]
+    # The CLI checked --repo before the lock; the registry can change since.
+    # Broken repos still count: they are reported, and their last graph merged.
+    if settings.only_repos and not settings.only_repos & {e.repo_id for e in run_repos}:
+        report.publish_blocked_reason = "--repo: selected repo(s) not active: " + ", ".join(
+            sorted(settings.only_repos)
+        )
+        log.error("%s", report.publish_blocked_reason)
+        _record_stage_rss(tracker, report)
+        _finalize(settings, staging_root, report, state, published_data=None, generation_id="")
+        return report
     # Read before the per-repo loop rewrites any entry: the loss accepted by
     # earlier runs that have not published yet, which this run's outcomes no
     # longer report because those repos are unchanged now.
@@ -1135,6 +1197,10 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     infra_in_grace: list[str] = []
     infra_past_grace: list[str] = []
     dirty_repos: list[str] = []
+    pending_repos: list[str] = []
+    # Unselected repos whose graph.json is not the accepted one. Any entry
+    # refuses publish outright: only a full sync can rebuild them.
+    repo_flag_held: list[str] = []
     graph_paths_by_repo: dict[str, Path] = {}
     # WS4: source roots per repo_id, for depends_on/API extraction. Broken
     # repos keep their last-known root even though it's unreachable this
@@ -1142,6 +1208,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # than an error, so this is harmless and avoids yet another repo-id ->
     # root lookup living in overlay.py.
     repo_roots_by_id: dict[str, Path] = {}
+    source_digests_by_repo: dict[str, str] = {}
     bootstrap_failed_repo_ids: set[str] = set()
 
     for repo_id in reconciliation.broken:
@@ -1227,6 +1294,9 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             has_graph = graph_path.exists()
             manifests = manifest_futures[entry.repo_id].result()
             current_manifest = manifests[0]
+            # Live walk, not the accepted state: a deferred repo's state lags
+            # the source its embedding snippets are read from.
+            source_digests_by_repo[entry.repo_id] = current_manifest.attempt_id
             prior_state = state.get(entry.repo_id)
             capabilities = (
                 {SQL_CAPABILITY_KEY: sql_capability}
@@ -1304,6 +1374,60 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
                 active_version=active_version,
                 graph_drifted=drifted,
             )
+            if (
+                settings.only_repos
+                and entry.repo_id not in settings.only_repos
+                and action != ACTION_SKIP
+            ):
+                # --repo left this repo out: keep its last graph and leave its
+                # state entry as it is, so the next run including it still sees
+                # the change. Nothing is rebuilt, forced or seeded here.
+                if drifted:
+                    # The on-disk graph is not the accepted one (rewritten, or
+                    # deleted after acceptance). Publishing around it would ship
+                    # unaccepted data, so the run refuses publish (see repo_flag_held).
+                    stale_repos.append(entry.repo_id)
+                    publish_blocking_repos.append(entry.repo_id)
+                    repo_flag_held.append(entry.repo_id)
+                    if has_graph:
+                        held_status = "graph_drift_held"
+                        held_reason = "graph.json changed outside the sync; rebuild held"
+                        graph_paths_by_repo[entry.repo_id] = graph_path
+                    else:
+                        held_status = "graph_missing_held"
+                        held_reason = "graph.json missing; bootstrap deferred"
+                    report.project_actions.append(
+                        {
+                            "repo_id": entry.repo_id,
+                            "action": action,
+                            "status": held_status,
+                            "reason": held_reason,
+                        }
+                    )
+                    log.warning(
+                        "[%d/%d] %s: %s; not selected by --repo, publish refused",
+                        i,
+                        total_active,
+                        entry.repo_id,
+                        held_reason,
+                    )
+                    bar.tick(i, f"{entry.repo_id}: {held_status}")
+                    continue
+                report.project_actions.append(
+                    {"repo_id": entry.repo_id, "action": action, "status": STATUS_DEFERRED}
+                )
+                pending_repos.append(entry.repo_id)
+                if has_graph:
+                    graph_paths_by_repo[entry.repo_id] = graph_path
+                log.info(
+                    "[%d/%d] %s: %s deferred (not selected by --repo)",
+                    i,
+                    total_active,
+                    entry.repo_id,
+                    action,
+                )
+                bar.tick(i, f"{entry.repo_id}: deferred")
+                continue
             if drifted:
                 log.warning(
                     "[%d/%d] %s: graph.json changed outside the sync (sha256 %s, accepted %s)",
@@ -1619,6 +1743,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     report.infra_repos_in_grace = sorted(set(infra_in_grace))
     report.infra_repos_past_grace = sorted(set(infra_past_grace))
     report.dirty_repos = sorted(set(dirty_repos))
+    report.pending_repos = sorted(set(pending_repos))
     report.auto_add_failed = sorted(bootstrap_failed_repo_ids)
     tracker.mark("extract")
 
@@ -1799,11 +1924,18 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # (plan WS1 item 6 order). Per-repo raw graphs are loaded once here and
     # reused by the overlay stage below, rather than re-reading every
     # per-repo graph.json twice.
-    graphs_by_repo = overlay.load_graphs_by_repo(graph_paths_by_repo)
+    graphs_by_repo, graph_sha256_by_repo = overlay.load_graphs_and_sha256(graph_paths_by_repo)
+    # Same gate as the spool in run(): no cache is read or written with the
+    # cache off or on a dry run.
+    caches_on = settings.stage_cache and not settings.dry_run
+    pair_cache = OverlayPairCache(settings.cache_dir, pending_cache) if caches_on else None
+    lexical_cache = LexicalPartialCache(settings.cache_dir, pending_cache) if caches_on else None
+    embed_fast_reused = 0
     embedding_vectors_by_repo: dict[str, RepoVectors] = {}
     embedding_model_for_overlay = "unknown"
     embedding_recipe: dict = {}
     embeddings_staged_dir: Path | None = None
+    embeddings_reused_shards: dict[str, embedding.RepoShard] = {}
     embed_skip_reason = _embedding_skip_reason(settings)
     if embed_skip_reason:
         report.embedding_status = embed_skip_reason
@@ -1825,9 +1957,7 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             carried_stage.id_map,
         )
     if not embed_skip_reason:
-        unchanged_repo_ids = {
-            a["repo_id"] for a in report.project_actions if a.get("status") == "unchanged"
-        }
+        unchanged_repo_ids = _embed_reuse_candidates(report.project_actions)
         # An unchanged repo reuses its whole published shard. That shard was
         # produced by whatever embedding recipe was configured back then, so
         # after the model changes it would carry the old model's vectors into
@@ -1875,7 +2005,10 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
             settings,
             provisional_generation_id,
             health_check=settings.ollama_embed_health_check,
+            source_digests_by_repo=source_digests_by_repo,
+            graph_sha256_by_repo=graph_sha256_by_repo,
         )
+        embed_fast_reused = len(embed_result.reused_repo_ids)
         report.embedding_status = embed_result.status
         report.embedding_stats = embed_result.stats.to_dict()
         report.embedding_vectors_dropped_repos = embed_result.vectors_dropped_repos
@@ -1890,16 +2023,25 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         embedding_model_for_overlay = settings.ollama_embed_model
         if embed_result.recipe is not None:
             embedding_recipe = embed_result.recipe.to_dict()
+        # Already held by embed_result (mmap'd); kept for persist's fallback write.
+        embeddings_reused_shards = {
+            repo_id: embed_result.shards_by_repo[repo_id]
+            for repo_id in embed_result.reused_repo_ids
+        }
         embeddings_staged_dir = embedding.stage_embeddings(
-            staging_root, embed_result.shards_by_repo, embed_result.id_map
+            staging_root,
+            embed_result.shards_by_repo,
+            embed_result.id_map,
+            skip_repo_ids=embed_result.reused_repo_ids,
         )
     tracker.mark("embedding")
 
     # WS4: overlay-resolve stage. Runs after the WS3 embed stage, before the
     # WS5 lexical-index stage — per plan WS1 item 6 pipeline order. Every
     # logical ref is resolved fresh
-    # against graph_paths_by_repo/repo_roots_by_id for THIS generation (C27)
-    # — nothing overlay-related is cached across runs. Dangling
+    # against graph_paths_by_repo/repo_roots_by_id for THIS generation (C27).
+    # Only exact-path pair candidates come from the stage cache, keyed on both
+    # repos' vectors, so edges are the same with the cache on or off. Dangling
     # manual-relation refs raise uncaught (same hard-fail convention as
     # naming's BackendMismatchError) and intentionally crash the run.
     overlay_result = overlay.build_overlay(
@@ -1910,21 +2052,42 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
         embedding_vectors_by_repo=embedding_vectors_by_repo,
         embedding_model=embedding_model_for_overlay,
         graphs_by_repo=graphs_by_repo,
+        pair_cache=pair_cache,
+        exact_max_rows=settings.exact_max_rows,
     )
+    report.overlay_rows = embed_similarity.comparable_row_count(embedding_vectors_by_repo or {})
+    report.overlay_exact_max_rows = settings.exact_max_rows
     report.overlay_edge_counts = overlay_result.edge_counts_by_type
     report.overlay_manual_relation_count = overlay_result.manual_relation_count
     tracker.mark("overlay")
 
     # WS5: lexical-index stage. Runs after overlay-resolve, before validate
     # (plan WS1 item 6 order, now fully wired — see module docstring).
-    # Rebuilt fresh every generation from the same per-repo raw graphs/roots
-    # overlay.py already loaded above; nothing here is incremental/cached
-    # across runs, matching the "bundle artifact built once per generation"
-    # contract (WS5 deliverable 2) rather than a per-MCP-session rebuild.
+    # Assembled every generation from the same per-repo raw graphs/roots
+    # overlay.py already loaded above. An unchanged repo's partial may come
+    # from the stage cache; the merged bundle is byte-identical either way.
     lexical_result = lexical_index.build_lexical_index(
-        graphs_by_repo, repo_roots_by_id, graph_paths_by_repo=graph_paths_by_repo
+        graphs_by_repo,
+        repo_roots_by_id,
+        graph_paths_by_repo=graph_paths_by_repo,
+        source_digests_by_repo=source_digests_by_repo,
+        partial_cache=lexical_cache,
+        graph_sha256_by_repo=graph_sha256_by_repo,
     )
     report.lexical_index_stats = lexical_result.stats.to_dict()
+    # Set here, not at publish, so a blocked run's status.json carries it too.
+    report.stage_cache = {
+        "enabled": caches_on,
+        "overlay": {
+            "hits": pair_cache.hits if pair_cache else 0,
+            "misses": pair_cache.misses if pair_cache else 0,
+        },
+        "lexical": {
+            "hits": lexical_cache.hits if lexical_cache else 0,
+            "misses": lexical_cache.misses if lexical_cache else 0,
+        },
+        "embedding": {"reused": embed_fast_reused},
+    }
     # Last consumer of the per-repo raw graphs (embed -> overlay -> lexical
     # all share this one load). Drop the full per-repo graph contents now
     # rather than keeping them resident alongside the merged graph through
@@ -1980,6 +2143,17 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
 
     if settings.dry_run:
         report.publish_blocked_reason = "dry-run: no publish performed"
+        tracker.mark("validate_publish")
+        _record_stage_rss(tracker, report)
+        _finalize(settings, staging_root, report, state, published_data=None, generation_id="")
+        return report
+
+    # Not a ratio: one unaccepted graph is enough, and --allow-shrink does not
+    # release it, because --repo never rebuilds the repo that would fix it.
+    if repo_flag_held:
+        report.publish_blocked_reason = "--repo: unselected repo(s) need a full sync: " + (
+            ", ".join(sorted(set(repo_flag_held)))
+        )
         tracker.mark("validate_publish")
         _record_stage_rss(tracker, report)
         _finalize(settings, staging_root, report, state, published_data=None, generation_id="")
@@ -2097,9 +2271,27 @@ def _run_locked(settings: Settings, staging_root: Path) -> RunReport:
     # earlier. A skipped or degraded embed stage persists the carried-forward
     # shards (embedding.carry_forward_stage), so the ids still match.
     if embeddings_staged_dir is not None:
-        embedding.persist_generation(settings.embeddings_dir, generation_id, embeddings_staged_dir)
+        embedding.persist_generation(
+            settings.embeddings_dir,
+            generation_id,
+            embeddings_staged_dir,
+            reused_shards=embeddings_reused_shards,
+        )
 
     publish.flip_current(settings.global_dir, gen_dir)
+
+    # Cache entries become durable only once the generation they fed is live.
+    if settings.stage_cache:
+        pending_cache.flush()
+    # GC only after the flush: entries this run staged must exist before
+    # anything not in the used-key sets is removed.
+    for stage_cache_source in (pair_cache, lexical_cache):
+        if stage_cache_source is None:
+            continue
+        try:
+            stage_cache_source.collect_garbage()
+        except OSError as exc:
+            log.warning("publish: could not collect stage-cache entries: %s", exc)
 
     # Embedding GC runs only now, never inside persist_generation: between
     # persisting the vectors and this flip, the graph `current` points at is
@@ -2193,6 +2385,10 @@ def _finalize(
             "infra_repos_in_grace": report.infra_repos_in_grace,
             "infra_repos_past_grace": report.infra_repos_past_grace,
             "dirty_repos": report.dirty_repos,
+            "pending_repos": report.pending_repos,
+            "overlay_rows": report.overlay_rows,
+            "overlay_exact_max_rows": report.overlay_exact_max_rows,
+            "stage_cache": report.stage_cache,
             "merge_ok": report.merge_ok,
             "merge_error": report.merge_error,
             "stripped_cross_repo_edges": report.stripped_cross_repo_edges,

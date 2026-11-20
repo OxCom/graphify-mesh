@@ -4,6 +4,35 @@
 
 ### Features and behavior changes
 
+- Added: stage caches for the embedding, overlay and lexical stages under
+  `<global_dir>/cache/`. An unchanged repo reuses its published shard without
+  a re-hash. An unchanged repo pair reuses its exact-path overlay candidates,
+  and an unchanged repo reuses its lexical partial. Published output is
+  byte-identical with the cache on or off. Entries are written only after a
+  successful publish, and entries the run did not use are collected.
+  `GRAPHIFY_MESH_STAGE_CACHE=0` turns the caches off; no other value does.
+- Added: `GRAPHIFY_MESH_EXACT_MAX_ROWS` (default `80000`) sets the row count
+  up to which `similar_approach` compares every pair exactly. Above 90% of it
+  the run logs a warning; above it the overlay uses LSH.
+- Added: run report and `status.json` fields `overlay_rows`,
+  `overlay_exact_max_rows` and `stage_cache` (per-stage hits and misses, and
+  embedding shards reused).
+- Changed: the embed, overlay and lexical stages share one read of each repo's
+  `graph.json`. Its sha256 feeds both the embedding `inputs_digest` and the
+  lexical cache key. The lexical stage reads each `manifest.json` once for both
+  its key and its stale-semantic flags. Published shards from earlier runs miss
+  the reuse check once and are re-hashed.
+- Added: `graphify-mesh-sync --repo <id>`, repeatable, rebuilds only the
+  selected repos and still publishes over all repos. Every other repo with a
+  change keeps its last graph and state entry, shows status `deferred`, and is
+  listed in the new `pending_repos` report field. An unselected repo whose
+  accepted `graph.json` was rewritten or deleted shows `graph_drift_held` or
+  `graph_missing_held` instead. It is not in `pending_repos`, and the run does
+  not publish, whatever the stale ratio or `--allow-shrink`. An unknown or
+  disabled id, or an unreadable or malformed registry, exits 2 before the
+  lock; a held lock exits 3.
+- Added: each `stage_rss` entry in the run report now carries `wall_s` and
+  `cpu_s` for that stage. CPU time includes reaped `graphify` subprocesses.
 - Changed: `graphifyy` is pinned to `==0.9.112` (was `>=0.9.95,<1.0`). The
   sync treats a new graphify version as a producer upgrade and force-rebuilds
   every repo with `--producer-changed`; with a range, a routine

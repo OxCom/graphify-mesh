@@ -53,6 +53,8 @@ keep their upstream names: `GRAPHIFY_BIN` and `GRAPHIFY_NO_BACKUP`.
 | `GRAPHIFY_MESH_EXTRACT_CONCURRENCY` | sync (extract) | `2` | Max concurrent per-repo `graphify extract`/`update` children (bounded thread pool). Every child's RSS lands in the same cgroup `MemoryMax` as the parent sync process (steady-state parent peak observed ~1.9G inside a 4G cgroup), so this is a tuned, hard-capped setting — never derive it from the repo count. `subprocess.run` releases the GIL, so a thread pool (not a process pool) is sufficient. Unparsable/zero/negative values fall back to the hard floor of `1` (fully sequential) rather than raising. |
 | `GRAPHIFY_MESH_TLS_MODE` | sync (all outbound HTTPS) | `strict` | How outbound HTTPS certificates are verified on the naming/embed health probes and the embed calls. `strict`: stock `ssl.create_default_context()` — full chain + hostname verification plus the strict X.509 extension profile. `relaxed`: clears `VERIFY_X509_STRICT` **only**; chain verification against the system CA store and hostname checking stay on. Use it on a host behind a TLS-intercepting corporate proxy, where the re-signed certificate omits the Authority Key Identifier and Python 3.13+ therefore rejects a chain that `curl` and Node accept (`certificate verify failed: Missing Authority Key Identifier`) — without it the probes report a reachable backend as unhealthy and the pipeline runs permanently degraded. `insecure`: the `curl -k` equivalent — `check_hostname=False`, `verify_mode=CERT_NONE`, every certificate accepted including an attacker's, logged at WARNING on each context build; for a diagnostic run on a trusted network only. An unrecognized value raises at call time naming the variable. Note this covers only calls this package makes itself: the `graphify` **child** process resolves TLS on its own, so a proxied host needs the child pointed at an endpoint it can reach (e.g. a local HTTP shim). |
 | `GRAPHIFY_MESH_TLS_INSECURE` | sync (all outbound HTTPS) | unset | Boolean shorthand for `GRAPHIFY_MESH_TLS_MODE=insecure` (`1`/`true`/`yes`/`on`). An explicit `GRAPHIFY_MESH_TLS_MODE` wins over it. |
+| `GRAPHIFY_MESH_STAGE_CACHE` | sync (embed, overlay, lexical) | `1` (on) | Only the value `0` turns the stage caches off; any other value, `false` included, leaves them on. Off means the overlay and lexical caches are never read or written and an unchanged repo's shard is re-hashed instead of reused by `inputs_digest`. Published output is the same either way. See [Stage caches](architecture.md#stage-caches). |
+| `GRAPHIFY_MESH_EXACT_MAX_ROWS` | sync (overlay) | `80000` | Comparable vector rows up to which `similar_approach` compares every cross-repo pair exactly. Above it the overlay uses LSH buckets and the pair cache is not used. Above 90% of the limit the run logs a warning. A value below `2` or unparsable logs a warning and uses the default. |
 | `GRAPHIFY_BIN` | sync | `graphify` | Name/path of the upstream `graphify` binary. |
 | `GRAPHIFY_NO_BACKUP` | sync | (set to `1` on child calls) | Suppresses `graphify`'s dated backup dirs; the sync engine always sets this on the graphify subprocesses it spawns. |
 | `GRAPHIFY_MESH_TRANSPORT` | server | `stdio` | `stdio` or `http`. A CLI `--transport` flag beats this; this beats the default. |
@@ -186,6 +188,7 @@ file means no extra excludes and `.gitignore` honoured, as upstream reads it.
 | `--allow-shrink` | Authorize publishing a smaller graph than the previous generation; also authorizes per-repo (per-project) shrink acceptance for **every** repo in the run — a shrunken per-repo graph is accepted and state advances instead of being refused. To approve one repo's shrink only, use `repos[].allow_shrink_once` in the registry instead. |
 | `--shrink-policy {attributed,connected,count}` | Override `GRAPHIFY_MESH_SHRINK_POLICY` for this run. Only an explicit flag overrides; without it the env value stays in charge. |
 | `--extract-concurrency N` | Override `GRAPHIFY_MESH_EXTRACT_CONCURRENCY` (default 2, floor 1). |
+| `--repo ID` | Sync only this registered repo id; repeat the flag for several repos. Default: all repos. Every other repo with a change keeps its last `graph.json` and state entry, appears with status `deferred`, and is listed in `pending_repos`. An unselected repo whose accepted `graph.json` was rewritten or deleted shows `graph_drift_held` or `graph_missing_held` instead, is not in `pending_repos`, and the run does not publish. The stale ratio and `--allow-shrink` do not change that; a full sync does. Merge, naming, embedding, overlay, validate and publish still run over all repos. An unknown or disabled id, or an unreadable or malformed registry, exits `2` before the lock is taken. If no selected id is active when the run takes the lock, the run does not publish. A run that finds the lock held exits `3` without waiting. |
 | `-v`, `--verbose` | Debug logging. |
 
 ## CLI flags (`graphify-mesh-server`)
@@ -255,6 +258,8 @@ pipeline run. Notable fields and derived paths:
   constructed directly instead of through the environment parser.
 - `graphify_bin`, `stale_threshold`, `dry_run`, `skip_labeling`,
   `skip_embedding`, `allow_shrink` — run behavior.
+- `only_repos: frozenset[str]` — CLI `--repo`; the repo ids this run rebuilds.
+  Empty, the default, means every repo. See the `--repo` row in the CLI table.
 - `shrink_policy`, `shrink_check_bin`, `php_build_bin` — env
   `GRAPHIFY_MESH_SHRINK_POLICY` (CLI `--shrink-policy`),
   `GRAPHIFY_MESH_SHRINK_CHECK_BIN` and `GRAPHIFY_MESH_PHP_BUILD_BIN`; see the
@@ -264,6 +269,9 @@ pipeline run. Notable fields and derived paths:
   community goes to the LLM this run; stored assignments still keep ids stable;
   communities the LLM still fails to name get provisional hub names as usual).
   `cluster_scope` — env `GRAPHIFY_MESH_CLUSTER_SCOPE` (`repo` or `global`); see
+  the environment table.
+- `stage_cache` — env `GRAPHIFY_MESH_STAGE_CACHE` (only `0` sets it false);
+  `exact_max_rows` — env `GRAPHIFY_MESH_EXACT_MAX_ROWS` (default `80000`). See
   the environment table.
 - `embed_request_timeout` — env `GRAPHIFY_MESH_EMBED_TIMEOUT`;
   `classification_version` — env `GRAPHIFY_MESH_CLASSIFICATION_VERSION`. See the
@@ -317,8 +325,23 @@ Derived path properties (all under `mesh_root`):
 | `lock_path` | `<global_dir>/.graphify-mesh-sync.lock` |
 | `naming_dir` | `<global_dir>/naming` |
 | `embeddings_dir` | `<global_dir>/embeddings` |
+| `cache_dir` | `<global_dir>/cache` (one subdirectory per stage) |
 | `manual_relations_path` | `<mesh_root>/bin/manual-relations.json` |
 | `manual_relations_schema_path` | `<mesh_root>/bin/manual-relations.schema.json` |
+
+### Run report: overlay size and stage-cache fields
+
+The CLI JSON output and `status.json` carry these fields. A run whose publish
+was blocked still reports them. On a dry run every cache counter is `0`.
+
+| Field | Meaning |
+|-------|---------|
+| `overlay_rows` | Vector rows the `similar_approach` stage compared. It is `0` when the embed stage was skipped. |
+| `overlay_exact_max_rows` | The exact-path limit this run used (`GRAPHIFY_MESH_EXACT_MAX_ROWS`). |
+| `stage_cache.enabled` | `false` when `GRAPHIFY_MESH_STAGE_CACHE=0` or on a dry run. `stage_cache` is `{}` when the run stopped before the lexical stage. |
+| `stage_cache.overlay.hits` / `.misses` | Repo pairs whose exact-path candidates came from the cache, and pairs computed this run. Both stay `0` on the LSH path. |
+| `stage_cache.lexical.hits` / `.misses` | Repos whose lexical partial came from the cache, and repos built this run. A repo with no cache key is built without a lookup and counts as neither. A repo has no key when its graph was not loaded, it has no source digest, or its `manifest.json` exists but is unreadable. |
+| `stage_cache.embedding.reused` | Repos whose published shard was reused without a re-hash because its `inputs_digest` matched. |
 
 ## `ServerConfig` fields (server)
 
