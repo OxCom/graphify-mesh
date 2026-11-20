@@ -4,6 +4,11 @@
 
 ### Features and behavior changes
 
+- Changed: `search` returns one hit per source file. Each file keeps the
+  position of its best node, and lower files fill the list to `k`. The shown
+  node is the file's best node other than the file node. `collapse_files:
+  false` restores per-node hits. `cross_project` and `context_pack` are
+  unchanged.
 - Changed: symbol-anchor pins skip nodes whose source file is a test path
   (`tests/`, `*.stories.tsx`, ...) unless the query mentions tests, matching
   the test demotion already applied to fused results.

@@ -54,7 +54,10 @@ def test_same_file_second_hit_is_not_sunk_below_weaker_candidates():
     ]
     gen = build_generation([first, second] + weaker)
 
-    result = rank("lock weeks", gen, None, k=10, embed_query_fn=fake_embed_query_fn())
+    # MMR's same-file penalty acts on per-node results only.
+    result = rank(
+        "lock weeks", gen, None, k=10, embed_query_fn=fake_embed_query_fn(), collapse_files=False
+    )
 
     keys = _keys(result)
     assert keys[0] in {key_for("repo.a", first), key_for("repo.a", second)}, keys

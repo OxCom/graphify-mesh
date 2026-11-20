@@ -169,6 +169,7 @@ to the current project and only widens when asked. Fails closed if
 | `q` | string | — (required) | Query text. |
 | `scope` | string | `current` | `current`, `all`, or `repo:<id>`. `all` means every **enabled** repo in `registry.json`, not "no filter": a repo disabled since the generation was published is not served. With no enabled repo at all, `all` raises rather than searching everything. |
 | `k` | integer | ranking default | Max results. |
+| `collapse_files` | boolean | `true` | One hit per source file (see "Per-file collapse" below). `false` returns every matching node, several per file. A non-boolean is an error. |
 | `cwd` | string | — | "Absolute path of the project directory this call is about, used to resolve scope='current'. Pass it on every call — one session can move between projects. Omit it only with an explicit scope ('all' or 'repo:<id>'); a directory outside registry.json is refused." |
 
 Each `search` hit carries a `match_type`: `exact` when the whole query is an
@@ -233,6 +234,17 @@ Fused ranking (`server/retrieval.py:rank`):
   `MMR_SCALE_DEPTH`-th (10) best candidate, so penalty and relevance share one
   scale; all-tied scores keep the unscaled penalty
   (`server/ranking.py:mmr_penalty_scale`).
+- **Per-file collapse.** `search` returns one hit per (repo, source file) unless
+  `collapse_files` is `false`. An exact hit, then an anchor hit, keeps its
+  file. Otherwise MMR orders the whole fused pool, and each file takes the
+  position of its best-ranked node. The node shown is the file's best node
+  other than the file node, the one cited at line 1 and labelled with the file
+  name or a longer path suffix of it. The file node shows only when it is the
+  file's only candidate
+  (`server/retrieval.py:_representative_tier`). Lower files fill the list to
+  `k`. The reserved test slots are placed after the collapse, so a slot never
+  repeats a shown file. `cross_project` and `context_pack` keep per-node
+  results.
 
 Hits from `search`, `cross_project` and `find_similar`, and `context_pack`
 cards, carry no `community_name`: the labels proved unreliable and cost payload

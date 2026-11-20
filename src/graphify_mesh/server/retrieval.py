@@ -441,6 +441,69 @@ def _reserve_test_slots(
     return result
 
 
+FileGroup = tuple[str, str]
+
+
+def _file_group(key: str) -> FileGroup:
+    """The (repo, source_file) a logical key (`repo\\x1fsource_file\\x1flabel`)
+    collapses into. Every key has both: `node_key` gives a node without a
+    source file no key."""
+    repo, source_file, _label = key.split("\x1f", 2)
+    return (repo, source_file)
+
+
+def _representative_tier(label: str, source_file: str) -> int:
+    """Which node of a collapsed file stands for it: lower tier wins, ties go
+    to the better-ranked node. The file node (cited at line 1, labelled with
+    the file's name or, when that name is not unique, a longer path suffix:
+    `LockWeeks.php`, `Cron/LockWeeks.php`) is tier 1, so the file's best
+    class, method or key node stands for it whenever one is in the pool;
+    every other node is tier 0. Preferring the class named after the file
+    over a method was measured too: it lost method-level goldens and swapped
+    line-precise method citations for class lines. Backslashes count as `/`
+    on both sides, for Windows-style paths."""
+    label = label.replace("\\", "/")
+    source_file = source_file.replace("\\", "/")
+    return 1 if label == source_file or source_file.endswith("/" + label) else 0
+
+
+def _collapse_fused(ordered: list[str], taken: set[FileGroup]) -> list[str]:
+    """One key per file of `ordered` (the MMR order of the whole fused pool),
+    at the position of the file's best-ranked key, skipping files in `taken`.
+    The key shown is the file's lowest `_representative_tier` key among all
+    its pool keys, so the choice does not depend on how far `k` reaches."""
+    position = {key: index for index, key in enumerate(ordered)}
+    members: dict[FileGroup, list[str]] = {}
+    for key in ordered:
+        members.setdefault(_file_group(key), []).append(key)
+
+    def preference(key: str) -> tuple[int, int]:
+        _repo, source_file, label = key.split("\x1f", 2)
+        return (_representative_tier(label, source_file), position[key])
+
+    collapsed: list[str] = []
+    seen: set[FileGroup] = set(taken)
+    for key in ordered:
+        group = _file_group(key)
+        if group in seen:
+            continue
+        seen.add(group)
+        collapsed.append(min(members[group], key=preference))
+    return collapsed
+
+
+def _first_hit_per_file(hits: list[Hit], taken: set[FileGroup]) -> list[Hit]:
+    """`hits` without any hit whose file is in `taken` or already had a hit."""
+    seen = set(taken)
+    kept: list[Hit] = []
+    for hit in hits:
+        group = _file_group(hit.key)
+        if group not in seen:
+            seen.add(group)
+            kept.append(hit)
+    return kept
+
+
 def rank(
     query: str,
     generation: Generation,
@@ -448,11 +511,20 @@ def rank(
     k: int,
     embed_query_fn: EmbedQueryFn,
     include_inferred: bool = False,
+    collapse_files: bool = True,
 ) -> RankedResult:
     """Top-level WS5 search orchestration: exact-alias bypass, symbol
     anchors (`anchors.py`), then lexical+vector+structural candidate
     generation, RRF fusion, hub/DEPRECATED/stale-semantic penalties, MMR diversification,
-    deterministic tie-break."""
+    deterministic tie-break.
+
+    With `collapse_files` (the default) the result holds one hit per
+    (repo, source_file): an exact hit, then an anchor hit, keeps its file;
+    otherwise the file takes the position of its best-ranked fused node and
+    shows its best node that is not the file node (`_representative_tier`).
+    The list is filled to `k` from further down the pool, then the reserved
+    test slots are placed on it.
+    `collapse_files=False` returns every node on its own, as before."""
     k = max(1, min(k, ranking.MAX_K))
     # Store-level degraded markers (reload rejections, embeddings stamp
     # problems, ...) are merged into every tool response by the server layer
@@ -466,9 +538,13 @@ def rank(
         if h
     ]
     exact_hits.sort(key=lambda h: h.key)
+    if collapse_files:
+        # Before the cut, so one file's many exact hits cannot fill `k`.
+        exact_hits = _first_hit_per_file(exact_hits, set())
     # An alias shared by many nodes must not blow past the caller's `k`;
     # truncating after the sort keeps which hits survive deterministic.
     del exact_hits[k:]
+    taken_files = {_file_group(h.key) for h in exact_hits}
     selected_keys = {h.key for h in exact_hits}
     remaining_slots = max(0, k - len(exact_hits))
 
@@ -485,7 +561,10 @@ def rank(
             hit = _hit_from_key(key, generation, anchors.ANCHOR_MATCH_SCORE, "anchor")
             if hit:
                 anchor_hits.append(hit)
+        if collapse_files:
+            anchor_hits = _first_hit_per_file(anchor_hits, taken_files)
         del anchor_hits[remaining_slots:]
+        taken_files |= {_file_group(h.key) for h in anchor_hits}
         # Anchors stay in the fused pool so MMR diversifies against them exactly
         # as when they rank there on their own; they are dropped after selection.
         anchor_key_set = {h.key for h in anchor_hits}
@@ -563,13 +642,26 @@ def rank(
             )
             for key, score in fused_scores.items()
         ]
-        diversified_keys = ranking.mmr_select(
-            penalized, path_by_key, remaining_slots + len(anchor_key_set)
-        )
-        diversified_keys = [key for key in diversified_keys if key not in anchor_key_set][
-            :remaining_slots
-        ]
         final_scores = dict(penalized)
+        slot_pool = penalized
+        if collapse_files:
+            # Greedy MMR is prefix-stable, so ordering the whole pool keeps
+            # the top-n of a larger k equal to the result for k=n, and leaves
+            # enough distinct files to fill `k` wherever the pool has them.
+            ordered = ranking.mmr_select(penalized, path_by_key, len(penalized))
+            ordered = [key for key in ordered if key not in anchor_key_set]
+            collapsed = _collapse_fused(ordered, taken_files)
+            diversified_keys = collapsed[:remaining_slots]
+            # Spare tests for the reserved slots come from the collapsed list
+            # too, so a slot never brings back a second node of a shown file.
+            slot_pool = [(key, final_scores[key]) for key in collapsed]
+        else:
+            diversified_keys = ranking.mmr_select(
+                penalized, path_by_key, remaining_slots + len(anchor_key_set)
+            )
+            diversified_keys = [key for key in diversified_keys if key not in anchor_key_set][
+                :remaining_slots
+            ]
         if is_test is not None:
             # Slot positions count from the top of the whole result, so the
             # exact and anchor hits ahead of the fused ones do not move them.
@@ -580,7 +672,7 @@ def rank(
                 if position >= ahead
             ]
             diversified_keys = _reserve_test_slots(
-                diversified_keys, penalized, is_test, slots, exclude=anchor_key_set
+                diversified_keys, slot_pool, is_test, slots, exclude=anchor_key_set
             )
         for key in diversified_keys:
             hit = _hit_from_key(key, generation, final_scores.get(key, 0.0), "fused")

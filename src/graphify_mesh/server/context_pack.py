@@ -185,7 +185,15 @@ def build_context_pack(
     token_budget: int,
     embed_query_fn: EmbedQueryFn,
 ) -> ContextPackResult:
-    ranked = rank(goal, generation, repo_filter, CONTEXT_PACK_CANDIDATE_K, embed_query_fn)
+    # One card per node: several snippets of one file are separate evidence.
+    ranked = rank(
+        goal,
+        generation,
+        repo_filter,
+        CONTEXT_PACK_CANDIDATE_K,
+        embed_query_fn,
+        collapse_files=False,
+    )
     generation_created_at = _generation_created_at_epoch(generation)
 
     # Cards are built LAZILY inside the budget loop: each build costs a

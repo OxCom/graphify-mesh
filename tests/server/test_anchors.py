@@ -139,8 +139,11 @@ def test_pinned_anchor_leaves_fused_hits_as_in_disabled_path(monkeypatch):
 
     assert anchors.anchor_keys(QUERY, gen, None, exclude=set()) == [anchor_key]
     embed = fake_embed_query_fn()
-    enabled = rank(QUERY, gen, None, k=k, embed_query_fn=embed)
-    disabled = _rank_disabled(monkeypatch, QUERY, gen, None, k=k, embed_query_fn=embed)
+    # Per-node results: the sibling shares the anchor's file.
+    enabled = rank(QUERY, gen, None, k=k, embed_query_fn=embed, collapse_files=False)
+    disabled = _rank_disabled(
+        monkeypatch, QUERY, gen, None, k=k, embed_query_fn=embed, collapse_files=False
+    )
 
     disabled_keys = [h.key for h in disabled.hits]
     assert anchor_key in disabled_keys

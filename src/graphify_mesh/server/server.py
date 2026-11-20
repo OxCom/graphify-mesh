@@ -279,6 +279,9 @@ class GraphifyMeshServer:
     def tool_search(self, arguments: dict) -> dict:
         query = _validate_str(arguments, "q")
         k = _validate_k(arguments)
+        collapse_files = arguments.get("collapse_files", True)
+        if not isinstance(collapse_files, bool):
+            raise ToolError("'collapse_files' must be a boolean")
         scope = _validate_scope(arguments)
         scope_cwd = self._scope_cwd(arguments, scope)
         entries = self._registry_entries()
@@ -287,7 +290,14 @@ class GraphifyMeshServer:
         except ScopeResolutionError as exc:
             raise ToolError(str(exc)) from exc
         generation = self._generation()
-        ranked = rank(query, generation, decision.repo_ids, k, self.embed_query_fn)
+        ranked = rank(
+            query,
+            generation,
+            decision.repo_ids,
+            k,
+            self.embed_query_fn,
+            collapse_files=collapse_files,
+        )
         return {
             "hits": [_hit_to_dict(h, generation) for h in ranked.hits],
             "degraded": ranked.degraded,
@@ -309,7 +319,9 @@ class GraphifyMeshServer:
         if not repo_filter:
             raise ToolError("exclude_repos leaves no repo to search")
         generation = self._generation()
-        ranked = rank(query, generation, repo_filter, k, self.embed_query_fn)
+        # Per-node hits, as before: the per-file collapse was evaluated and
+        # approved for repo-scoped `search` only.
+        ranked = rank(query, generation, repo_filter, k, self.embed_query_fn, collapse_files=False)
         return {
             "hits": [_hit_to_dict(h, generation) for h in ranked.hits],
             "degraded": ranked.degraded,
@@ -638,6 +650,14 @@ class GraphifyMeshServer:
                             "description": "'current' (default), 'all', or 'repo:<id>'",
                         },
                         "k": {"type": "integer", "default": ranking.DEFAULT_K},
+                        "collapse_files": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": (
+                                "One hit per source file (default). false returns "
+                                "every matching node, several per file."
+                            ),
+                        },
                         "cwd": {
                             "type": "string",
                             "description": (
