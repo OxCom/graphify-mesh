@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import time
+from collections.abc import Iterator
 from datetime import date
 from pathlib import Path
 
@@ -57,6 +58,70 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+# Items per C-encoded chunk. Bounds the largest string held at once while
+# keeping the per-call overhead of `JSONEncoder.encode` negligible.
+_ENCODE_BATCH = 2000
+# Levels of containers split into chunks before whole values go to the C encoder.
+_ENCODE_DEPTH = 3
+_SCALARS = (str, int, float, bool, type(None))
+
+
+def iter_json_chunks(encoder: json.JSONEncoder, data: object) -> Iterator[str]:
+    """Yield exactly the text `encoder.iterencode(data)` yields, in bounded chunks.
+
+    `iterencode` uses the C encoder only for one-shot calls, so streaming a
+    large artifact through it runs pure-Python encoding (seconds per pass).
+    This splits the outer `_ENCODE_DEPTH` levels itself and hands the pieces
+    to `encoder.encode`, which takes the C path; the output stays
+    byte-identical. Dicts are split per key at every split level. A list of
+    scalars, or of more than `_ENCODE_BATCH` items, is encoded in slices of
+    `_ENCODE_BATCH` items. A chunk therefore holds one
+    value below the split depth or one slice of list items. That bounds item
+    counts, not bytes: a list of very large items yields large chunks.
+    Encoders with an `indent` keep `iterencode`, since a batch's surrounding
+    whitespace would differ.
+    """
+    if encoder.indent is not None:
+        yield from encoder.iterencode(data)
+        return
+    yield from _chunks(encoder, data, _ENCODE_DEPTH)
+
+
+def _chunks(encoder: json.JSONEncoder, o: object, depth: int) -> Iterator[str]:
+    sep = encoder.item_separator
+    # Exact types only: subclasses and non-str keys go whole to the C encoder,
+    # which mirrors iterencode's handling of them.
+    if depth > 0 and type(o) is dict and all(type(k) is str for k in o):
+        keys = sorted(o) if encoder.sort_keys else list(o)
+        yield "{"
+        # Per key, never batched: a batch of keys would put that many values,
+        # each possibly huge, into one chunk.
+        for i, key in enumerate(keys):
+            if i:
+                yield sep
+            yield encoder.encode(key)
+            yield encoder.key_separator
+            yield from _chunks(encoder, o[key], depth - 1)
+        yield "}"
+    elif depth > 0 and type(o) in (list, tuple):
+        seq: list | tuple = o  # type: ignore[assignment]
+        yield "["
+        # Recursing into scalars only multiplies calls: slice those directly.
+        if len(seq) <= _ENCODE_BATCH and not all(type(v) in _SCALARS for v in seq):
+            for i, item in enumerate(seq):
+                if i:
+                    yield sep
+                yield from _chunks(encoder, item, depth - 1)
+        else:
+            for i in range(0, len(seq), _ENCODE_BATCH):
+                if i:
+                    yield sep
+                yield encoder.encode(list(seq[i : i + _ENCODE_BATCH]))[1:-1]
+        yield "]"
+    else:
+        yield encoder.encode(o)
+
+
 def _write_json_atomic(path: Path, data: dict, **encoder_kwargs) -> str:
     """Write via tmp-file + rename so an interrupted write can never leave a
     truncated .json in a generation dir. `current` is only flipped after all
@@ -77,7 +142,7 @@ def _write_json_atomic(path: Path, data: dict, **encoder_kwargs) -> str:
     # the contents are not (power loss), leaving an empty/garbage .json
     # behind an already-flipped `current`.
     with tmp_path.open("wb") as fh:
-        for chunk in encoder.iterencode(data):
+        for chunk in iter_json_chunks(encoder, data):
             raw = chunk.encode("utf-8")
             hasher.update(raw)
             fh.write(raw)
@@ -333,7 +398,7 @@ def output_hash(graph_data: dict) -> str:
     (equality verified against json.dumps across unicode/float/inf inputs)."""
     h = hashlib.sha256()
     encoder = json.JSONEncoder(sort_keys=True, separators=(", ", ": "))
-    for chunk in encoder.iterencode(graph_data):
+    for chunk in iter_json_chunks(encoder, graph_data):
         h.update(chunk.encode("utf-8"))
     return h.hexdigest()
 

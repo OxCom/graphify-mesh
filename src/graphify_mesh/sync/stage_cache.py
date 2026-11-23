@@ -14,7 +14,9 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import BinaryIO
 
 log = logging.getLogger(__name__)
 
@@ -87,6 +89,116 @@ def write_entry(dir: Path, key: str, payload: bytes) -> None:
         raise
 
 
+_COPY_CHUNK = 1 << 20
+
+
+def _write_framed(
+    dir: Path, key: str, src: BinaryIO, length: int, expected_digest: bytes | None = None
+) -> None:
+    """Write `length` bytes from `src` as entry `key`, atomically, without
+    holding the payload in RAM: the digest slot is filled after the stream.
+    Same framing as `write_entry`. With `expected_digest`, a payload that does
+    not match it raises before anything is renamed into place."""
+    path = _entry_path(dir, key)
+    if path is None:
+        raise ValueError(f"invalid cache key: {key!r}")
+    dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(dir), prefix=".cache-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(_PREFIX)
+            fh.write(length.to_bytes(_LEN_BYTES, "big"))
+            fh.write(b"\x00" * _DIGEST_BYTES)
+            hasher = hashlib.sha256()
+            remaining = length
+            while remaining:
+                chunk = src.read(min(_COPY_CHUNK, remaining))
+                if not chunk:
+                    raise ValueError(f"source ended {remaining} byte(s) early")
+                hasher.update(chunk)
+                fh.write(chunk)
+                remaining -= len(chunk)
+            if src.read(1):
+                raise ValueError("source grew while it was copied")
+            digest = hasher.digest()[:_DIGEST_BYTES]
+            if expected_digest is not None and digest != expected_digest:
+                raise ValueError("payload does not match its recorded digest")
+            fh.seek(len(_PREFIX) + _LEN_BYTES)
+            fh.write(digest)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def write_entry_from_file(dir: Path, key: str, source: Path) -> None:
+    """`write_entry` for a payload that lives in a file, streamed."""
+    with source.open("rb") as src:
+        _write_framed(dir, key, src, os.fstat(src.fileno()).st_size)
+
+
+def _open_entry(path: Path) -> tuple[BinaryIO, int, bytes] | None:
+    """Open a framed entry positioned at its payload: (file, length, digest).
+    None (file closed) for a foreign, truncated or oversized entry."""
+    fh = path.open("rb")
+    try:
+        header = fh.read(_HEADER_SIZE)
+        if len(header) < _HEADER_SIZE or not header.startswith(_PREFIX):
+            fh.close()
+            return None
+        offset = len(_PREFIX)
+        length = int.from_bytes(header[offset : offset + _LEN_BYTES], "big")
+        if os.fstat(fh.fileno()).st_size != _HEADER_SIZE + length:
+            fh.close()
+            return None
+        return fh, length, header[offset + _LEN_BYTES : _HEADER_SIZE]
+    except BaseException:
+        fh.close()
+        raise
+
+
+def copy_entry_payload(dir: Path, key: str, dest: Path) -> bool:
+    """Stream entry `key`'s payload into `dest`, verifying its digest on the
+    way; the payload is never held in RAM. False, with `dest` untouched, for a
+    missing, corrupt or unreadable entry: the caller recomputes."""
+    path = _entry_path(dir, key)
+    if path is None:
+        log.debug("stage-cache: invalid key %r ignored", key)
+        return False
+    part = dest.with_name(dest.name + ".part")
+    try:
+        opened = _open_entry(path)
+        if opened is None:
+            log.debug("stage-cache: foreign or corrupt entry %s ignored", path)
+            return False
+        src, length, digest = opened
+        with src, part.open("wb") as out:
+            hasher = hashlib.sha256()
+            remaining = length
+            while remaining:
+                chunk = src.read(min(_COPY_CHUNK, remaining))
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                out.write(chunk)
+                remaining -= len(chunk)
+        if remaining or hasher.digest()[:_DIGEST_BYTES] != digest:
+            log.debug("stage-cache: truncated or corrupt entry %s ignored", path)
+            part.unlink(missing_ok=True)
+            return False
+        os.replace(part, dest)
+        return True
+    except FileNotFoundError:
+        part.unlink(missing_ok=True)
+        return False
+    except OSError as exc:
+        log.debug("stage-cache: unreadable entry %s: %s", path, exc)
+        part.unlink(missing_ok=True)
+        return False
+
+
 def gc_entries(dir: Path, keep_keys: set[str]) -> int:
     """Remove entries whose key is not in keep_keys; return how many were removed.
 
@@ -128,6 +240,16 @@ class PendingCacheWrites:
         self._items: list[tuple[Path, str, Path]] = []
 
     def add(self, dir: Path, key: str, payload: bytes) -> None:
+        self._spool(dir, key, lambda staging, spool_key: write_entry(staging, spool_key, payload))
+
+    def add_file(self, dir: Path, key: str, source: Path) -> None:
+        """`add` for a payload held in a file: streamed, never read into RAM.
+        The file may be removed once this returns."""
+        self._spool(
+            dir, key, lambda staging, spool_key: write_entry_from_file(staging, spool_key, source)
+        )
+
+    def _spool(self, dir: Path, key: str, write: Callable[[Path, str], None]) -> None:
         if self._cache_dir is None:
             return
         if _entry_path(dir, key) is None:
@@ -142,7 +264,7 @@ class PendingCacheWrites:
                     tempfile.mkdtemp(prefix=f"{_STAGING_PREFIX}{os.getpid()}-", dir=self._cache_dir)
                 )
             spool_key = f"p{len(self._items)}"
-            write_entry(self._staging, spool_key, payload)
+            write(self._staging, spool_key)
         except Exception as exc:
             log.warning("stage-cache: could not stage %s/%s: %s", dir, key, exc)
             return
@@ -182,11 +304,14 @@ def _promote(spooled: Path, dir: Path, key: str) -> None:
     try:
         os.replace(spooled, path)
     except OSError:
-        # Another filesystem than the spool dir: fall back to a framed copy.
-        payload = read_entry(spooled.parent, spooled.name[: -len(_SUFFIX)])
-        if payload is None:
+        # Another filesystem than the spool dir: fall back to a framed copy,
+        # streamed so a large entry is never held in RAM.
+        opened = _open_entry(spooled)
+        if opened is None:
             raise
-        write_entry(dir, key, payload)
+        src, length, digest = opened
+        with src:
+            _write_framed(dir, key, src, length, expected_digest=digest)
 
 
 def sweep_staging_dirs(cache_dir: Path) -> list[str]:

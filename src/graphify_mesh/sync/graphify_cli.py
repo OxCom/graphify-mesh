@@ -648,13 +648,35 @@ def _cli_timeout() -> int:
     return value
 
 
+def _allowed_parent_env(extra: frozenset[str]) -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if _child_env_allows(k, extra)}
+
+
+def _finish_child_env(base: dict[str, str], env: dict | None) -> dict[str, str]:
+    base["GRAPHIFY_NO_BACKUP"] = "1"
+    if env:
+        base.update(env)
+    return base
+
+
+def child_env(env: dict | None = None) -> dict[str, str]:
+    """The exact environment `_run` hands a child launched with `env`. For
+    callers that must describe the child's inputs (merge_cache.py's key);
+    holds secret values, so never log it."""
+    return _finish_child_env(_allowed_parent_env(_child_env_extra()), env)
+
+
+def merge_graphs_env(staging_home: Path) -> dict[str, str]:
+    """The environment `run_merge_graphs` gives its child."""
+    return child_env(_isolated_home_env(staging_home))
+
+
 def _run(
     argv: list[str], cwd: Path | None, env: dict | None, timeout: int | None = None
 ) -> CliResult:
     if timeout is None:
         timeout = _cli_timeout()
-    extra = _child_env_extra()
-    full_env = {k: v for k, v in os.environ.items() if _child_env_allows(k, extra)}
+    full_env = _allowed_parent_env(_child_env_extra())
     # Names only, never values: an operator whose backend variable never reaches
     # the child sees it here instead of guessing from degraded extraction output.
     dropped = sorted(k for k in os.environ if k not in full_env)
@@ -682,9 +704,7 @@ def _run(
             "child env: dropped parent variables by name: %s",
             ", ".join(dropped),
         )
-    full_env["GRAPHIFY_NO_BACKUP"] = "1"
-    if env:
-        full_env.update(env)
+    full_env = _finish_child_env(full_env, env)
     try:
         proc = subprocess.run(  # noqa: S603 - structured argv, no shell; binary from operator config
             argv,
@@ -928,4 +948,5 @@ def run_merge_graphs(
     )
     staging_home.mkdir(parents=True, exist_ok=True)
     argv = _sandbox_argv(argv, [out_path.parent, staging_home])
+    # merge_graphs_env() describes this exact env for the merge cache key.
     return _run(argv, cwd=None, env=_isolated_home_env(staging_home))

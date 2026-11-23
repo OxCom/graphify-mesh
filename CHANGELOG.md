@@ -7,6 +7,20 @@
 - Changed: the `naming: labeled ...` progress line also reports the chunk's
   LLM token usage (`<in> in / <out> out tokens, ~<n> in per batch`), taken
   from the backend's usage figures. Prompt text is never logged.
+- Added: stage cache for the merge under `<global_dir>/cache/merge/` (one
+  entry, about 93 MB). When no input graph.json, graphify install or child
+  environment changed, a run reuses the last merged bytes instead of running
+  `graphify merge-graphs`. Measured on a warm `--repo` run: merge 19.6 s to
+  0.9 s. No key, and no reuse, unless GRAPHIFY_BIN's interpreter is the sync's
+  own and graphify is a non-editable install. Published output is
+  byte-identical. `GRAPHIFY_MESH_STAGE_CACHE=0` turns it off.
+- Changed: published JSON artifacts and `output_hash` are encoded through the
+  C JSON encoder in bounded chunks instead of the pure-Python streaming
+  encoder, with byte-identical output. Measured offline on the fleet
+  generation: global-graph.json 2.1 s to 0.5 s, `output_hash` 3.1 s to 0.8 s,
+  lexical-index.json 1.6 s to 0.9 s. On a warm `--repo` run, validate_publish
+  went from 20.7 s to 3.5 s, measured before dicts were split per key (about
+  0.5 s more on the lexical index).
 - Changed: `search` returns up to `k` hits, one per source file. Each file
   keeps the position and the score of its best node. The shown node is the
   file's best node other than the file node, for exact hits too.

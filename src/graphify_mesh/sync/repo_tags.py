@@ -110,12 +110,24 @@ def _release(raw: str) -> str | None:
 # `graphify merge-graphs` is paid for, while the tag map is built after it, so
 # without this memo the same binary would be probed twice per sync run.
 _parity_checked: set[str] = set()
+# Full version string each binary reported in the parity check (None: no usable
+# answer). The merge cache keys on it without probing the binary again.
+_binary_versions: dict[str, str | None] = {}
 
 
 def reset_version_parity_cache() -> None:
     """Forget which binaries were already probed. Test hook — a long-lived
     process never changes which binary a given path points at mid-run."""
     _parity_checked.clear()
+    _binary_versions.clear()
+
+
+def probed_binary_version(graphify_bin: str | None) -> str | None:
+    """Version `graphify_bin` reported to `check_graphify_version_parity` in
+    this process, or None when it was not probed or gave no usable answer."""
+    if graphify_bin is None:
+        return None
+    return _binary_versions.get(graphify_bin)
 
 
 def check_graphify_version_parity(graphify_bin: str | None) -> None:
@@ -151,6 +163,7 @@ def check_graphify_version_parity(graphify_bin: str | None) -> None:
         )
         return
     from_binary = _binary_graphify_version(graphify_bin)
+    _binary_versions[graphify_bin] = from_binary
     if from_binary is None:
         log.warning(
             "graphify version parity check skipped: %r did not report a usable version "

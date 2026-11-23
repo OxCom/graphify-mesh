@@ -50,6 +50,7 @@ from graphify_mesh.sync import (
     embedding,
     graphify_cli,
     lexical_index,
+    merge_cache,
     naming,
     naming_state,
     overlay,
@@ -1802,6 +1803,11 @@ def _run_locked(
 
     staging_home = staging_root / "graphify-home"
     merged_out_path = staging_root / "merged-graph.json"
+    merge_cache_source = (
+        merge_cache.MergeCache(settings.cache_dir, pending_cache)
+        if settings.stage_cache and not settings.dry_run
+        else None
+    )
 
     if not sorted_graph_paths:
         report.merge_ok = False
@@ -1816,13 +1822,43 @@ def _run_locked(
         # guards, and the merge can burn its whole 900 s timeout first. The
         # probe memoizes per binary, so the later call costs nothing.
         repo_tags.check_graphify_version_parity(settings.graphify_bin)
-        merge_result = graphify_cli.run_merge_graphs(
-            settings.graphify_bin, sorted_graph_paths, merged_out_path, staging_home
-        )
-        report.merge_ok = merge_result.ok
-        if not merge_result.ok:
-            report.merge_error = merge_result.stderr.strip()[:500]
-        log.info("merge: %s", "ok" if report.merge_ok else "FAILED: " + report.merge_error)
+        # The merge output is a pure function of its inputs (merge_cache.py):
+        # unchanged inputs reuse the bytes the last published run merged.
+        merge_key: str | None = None
+        merge_inputs: merge_cache.InputSnapshot | None = None
+        reused = False
+        if merge_cache_source is not None:
+            merge_inputs = merge_cache.snapshot_inputs(sorted_graph_paths)
+            merge_key = merge_cache.merge_key(
+                sorted_graph_paths,
+                merge_inputs,
+                settings.graphify_bin,
+                graphify_cli.merge_graphs_env(staging_home),
+            )
+            if merge_key is not None:
+                reused = merge_cache_source.restore(merge_key, merged_out_path)
+        if reused:
+            report.merge_ok = True
+            log.info("merge: ok (inputs unchanged, cached merge output reused)")
+        else:
+            merge_result = graphify_cli.run_merge_graphs(
+                settings.graphify_bin, sorted_graph_paths, merged_out_path, staging_home
+            )
+            report.merge_ok = merge_result.ok
+            if not merge_result.ok:
+                report.merge_error = merge_result.stderr.strip()[:500]
+            log.info("merge: %s", "ok" if report.merge_ok else "FAILED: " + report.merge_error)
+            # Cache only when no input changed while the child read it, by
+            # content and by (size, mtime_ns, inode): the key must describe
+            # exactly the bytes this output came from.
+            if (
+                report.merge_ok
+                and merge_key is not None
+                and merge_cache_source is not None
+                and merge_inputs is not None
+                and merge_cache.snapshot_inputs(sorted_graph_paths) == merge_inputs
+            ):
+                merge_cache_source.stage(merge_key, merged_out_path)
     tracker.mark("merge")
 
     if not report.merge_ok:
@@ -2314,7 +2350,7 @@ def _run_locked(
         pending_cache.flush()
     # GC only after the flush: entries this run staged must exist before
     # anything not in the used-key sets is removed.
-    for stage_cache_source in (pair_cache, lexical_cache, api_cache):
+    for stage_cache_source in (pair_cache, lexical_cache, api_cache, merge_cache_source):
         if stage_cache_source is None:
             continue
         try:

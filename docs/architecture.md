@@ -301,7 +301,7 @@ discovery
 
 ### Stage caches
 
-Four caches skip work for inputs that did not change. A cache never changes
+Five caches skip work for inputs that did not change. A cache never changes
 output: with the same inputs, a run with `GRAPHIFY_MESH_STAGE_CACHE=0` publishes
 byte-identical files (`tests/sync/test_stage_cache_equivalence.py`). Only
 per-run stamps differ: the overlay's generation id and `created_at`, and the
@@ -330,6 +330,26 @@ per-run stamps differ: the overlay's generation id and `created_at`, and the
   mtime marker, the scan read exactly the digest's code files with a scanned
   suffix, and every marker matches. Each skip is logged at INFO and counted in
   `stage_cache.api.skipped`.
+- **Merge** stores the raw `merged-graph.json` that `graphify merge-graphs`
+  wrote, under `cache/merge/` (one entry, about 93 MB for the fleet). A hit
+  streams it into staging and skips the child (about 20 s). The key covers the
+  ordered input paths and each graph.json's sha256, and the graphify version and
+  wheel RECORD hash. It also covers the networkx and Python versions, the
+  interpreter and its prefix, and the name and value of every variable in the
+  child's environment. HOME is the exception: it is a fresh, empty staging
+  directory every run, so the key records a constant for it.
+  No key is produced, so the merge always runs, when:
+  - GRAPHIFY_BIN is not one script whose `#!` interpreter is this process's
+    interpreter in this environment (same realpath and same prefix; an `env`
+    shebang never qualifies);
+  - graphify is an editable install, has no wheel RECORD, or this process
+    imports it from elsewhere;
+  - the binary reports a version other than that install's;
+  - an input cannot be read.
+  An output is stored only when every input's sha256 and (size, mtime_ns,
+  inode) are unchanged after the child exits. The run status reports no merge
+  hit count; a hit logs `merge: ok (inputs unchanged, cached merge output
+  reused)`.
 
 The graph.json sha256 comes from the same bytes the stages parsed. The embed,
 overlay and lexical stages share one read of each graph.json. The lexical stage
@@ -342,7 +362,7 @@ Entries are spooled to disk during the run and moved into place only after
 entry. After the flush, a cache that this run consulted drops the entries the
 run did not use. A cache that was never consulted keeps every entry: the
 overlay on the LSH path or without vectors, the lexical cache when no repo had
-a key. An
+a key, the merge cache when the run produced no merge key. An
 unreadable or corrupt entry is a miss and is recomputed, never a run failure.
 
 The cache directory is host-local. The overlay key does not cover the BLAS
