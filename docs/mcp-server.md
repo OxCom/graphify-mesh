@@ -229,22 +229,27 @@ Fused ranking (`server/retrieval.py:rank`):
   its neighbours.
 - **Fusion.** Unweighted reciprocal rank fusion (`RRF_K` 60) over the three
   lists.
-- **Diversification.** MMR (`MMR_LAMBDA` 0.7). Its similarity penalty is
+- **Diversification.** MMR (`MMR_LAMBDA` 0.7). Its similarity penalty applies
+  between nodes of one file, the same path in the same repo. It is
   multiplied by the score spread between the best and the
   `MMR_SCALE_DEPTH`-th (10) best candidate, so penalty and relevance share one
   scale; all-tied scores keep the unscaled penalty
   (`server/ranking.py:mmr_penalty_scale`).
-- **Per-file collapse.** `search` returns one hit per (repo, source file) unless
-  `collapse_files` is `false`. An exact hit, then an anchor hit, keeps its
-  file. Otherwise MMR orders the whole fused pool, and each file takes the
-  position of its best-ranked node. The node shown is the file's best node
-  other than the file node, the one cited at line 1 and labelled with the file
-  name or a longer path suffix of it. The file node shows only when it is the
-  file's only candidate
-  (`server/retrieval.py:_representative_tier`). Lower files fill the list to
-  `k`. The reserved test slots are placed after the collapse, so a slot never
-  repeats a shown file. `cross_project` and `context_pack` keep per-node
-  results.
+- **Per-file collapse.** `search` returns up to `k` hits, one per (repo,
+  source file), unless `collapse_files` is `false`. An exact hit, then an
+  anchor hit, keeps its file; several exact hits in one file use the same
+  node preference as fused hits, then key order. Otherwise MMR orders the
+  whole fused pool, and each file takes the position of its best-ranked node.
+  The node shown is the file's best node other than the file node, the one
+  cited at line 1 and labelled with the file name or a longer path suffix of
+  it. The file node shows only when it is the file's only candidate
+  (`server/retrieval.py:_representative_tier`). A fused hit's `score` is its
+  file's best score, not the shown node's own, so scores fall down the list.
+  A node the generation cannot resolve is skipped: the file's next node, or
+  the next file, takes its place. The list holds fewer than `k` hits when the
+  pool has fewer files. The reserved test slots are placed after the
+  collapse, so a slot never repeats a shown file. `cross_project` and
+  `context_pack` keep per-node results.
 
 Hits from `search`, `cross_project` and `find_similar`, and `context_pack`
 cards, carry no `community_name`: the labels proved unreliable and cost payload
@@ -259,6 +264,8 @@ Explicit cross-repo hybrid search, optionally restricted to a list of repos.
 | `repos` | string[] | all enabled repos | Restrict to these `repo_id`s. Omitted means every enabled repo, never an unfiltered search; an unknown or disabled id is a hard error, and a registry with no enabled repo at all is an error too rather than an empty result. |
 | `exclude_repos` | string[] | none | Drop these `repo_id`s from the search, after `repos` is applied (`repos` minus `exclude_repos`). Same shape rules as `repos`; an unknown or disabled id is a hard error, and an empty remainder is an error ("exclude_repos leaves no repo to search"). |
 | `k` | integer | ranking default | Max results. |
+
+`cross_project` always returns per-node hits and ignores a `collapse_files` argument.
 
 `degraded` in the result lists reduced-quality modes. `embeddings_unavailable:*`
 means lexical-only ranking: scores are low and order is weak, so treat the hits

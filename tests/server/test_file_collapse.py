@@ -1,5 +1,5 @@
 """Per-file collapse of `retrieval.rank` (V3): one hit per (repo, source_file),
-the file's best-ranked position kept, the list filled to k from further down,
+the file's best-ranked position kept, up to k hits, one per file,
 exact/anchor precedence within a file, the file-named node as the file's
 representative, test slots on the collapsed list, and the callers that opt out."""
 
@@ -17,6 +17,7 @@ from conftest import (
     write_registry,
 )
 from test_anchors import _fillers
+from test_search_quality import _overtime_generation
 from test_server import _server
 
 from graphify_mesh.server import anchors, retrieval
@@ -47,7 +48,7 @@ def _crowded_generation() -> list[dict]:
     return nodes + _fillers()
 
 
-def test_one_hit_per_file_and_list_filled_to_k():
+def test_one_hit_per_file_up_to_k():
     gen = build_generation(_crowded_generation())
 
     result = rank("invoice total", gen, None, k=5, embed_query_fn=fake_embed_query_fn())
@@ -110,6 +111,10 @@ def test_file_node_gives_way_to_the_class_at_the_files_best_position():
 
     assert result.hits[0].key == key_for("repo.a", cls)
     assert [h.source_file for h in result.hits].count(HOLIDAYS) == 1
+    # The hit carries its file's best score, so scores fall down the list.
+    assert result.hits[0].score == expanded.hits[0].score
+    scores = [h.score for h in result.hits]
+    assert scores == sorted(scores, reverse=True)
 
 
 def test_a_path_qualified_file_node_gives_way_too():
@@ -249,16 +254,137 @@ def test_anchor_hit_takes_its_file_over_a_fused_sibling(monkeypatch):
     assert export_hits[0].match_type == "anchor"
 
 
-def test_same_path_in_two_repos_is_two_files():
+def test_same_path_in_two_repos_is_two_files_at_their_own_rank():
     nodes = [
         make_node("repo.a", ".invoiceTotal()", "src/billing.py", node_id="a"),
         make_node("repo.b", ".invoiceTotal()", "src/billing.py", node_id="b"),
     ]
+    # Weaker matches in other files: the same-file MMR penalty, applied across
+    # repos, would sink the repo.b hit below them.
+    nodes += [
+        make_node("repo.a", f".invoice{word}()", f"src/weak{i}.py", node_id=f"w{i}")
+        for i, word in enumerate(WORDS)
+    ]
     gen = build_generation(nodes + _fillers("repo.a"))
+    both = {("repo.a", "src/billing.py"), ("repo.b", "src/billing.py")}
+
+    for collapse in (True, False):
+        result = rank(
+            "invoice total",
+            gen,
+            None,
+            k=5,
+            embed_query_fn=fake_embed_query_fn(),
+            collapse_files=collapse,
+        )
+        assert set(_files(result)[:2]) == both, (collapse, _files(result))
+
+
+def test_exact_hits_in_one_file_prefer_a_node_over_the_file_node():
+    # The file node's key sorts first ("OrderService" < "orderService"); the
+    # tier rule still shows the other node, as on the fused path.
+    path = "src/OrderService"
+    file_node = make_node("repo.a", "OrderService", path, node_id="f")
+    method = make_node("repo.a", "orderService", path, node_id="m", line=9)
+    gen = build_generation([file_node, method] + _fillers())
+    expanded = rank(
+        "OrderService", gen, None, k=5, embed_query_fn=fake_embed_query_fn(), collapse_files=False
+    )
+    assert [h.key for h in expanded.hits if h.match_type == "exact"] == [
+        key_for("repo.a", file_node),
+        key_for("repo.a", method),
+    ]
+
+    result = rank("OrderService", gen, None, k=5, embed_query_fn=fake_embed_query_fn())
+
+    assert result.hits[0].key == key_for("repo.a", method)
+    assert result.hits[0].match_type == "exact"
+    assert [h.source_file for h in result.hits].count(path) == 1
+
+
+def test_two_anchors_in_one_file_keep_only_the_first(monkeypatch):
+    first = make_node("repo.a", ".exportRows()", "src/Export.php", node_id="a1")
+    second = make_node("repo.a", ".exportRowsCsv()", "src/Export.php", node_id="a2")
+    other = make_node("repo.a", ".exportOther()", "src/Other.php", node_id="o")
+    gen = build_generation([first, second, other] + _fillers())
+    keys = [key_for("repo.a", first), key_for("repo.a", second)]
+    monkeypatch.setattr(anchors, "anchor_keys", lambda *a, **kw: list(keys))
+
+    result = rank("export rows csv", gen, None, k=5, embed_query_fn=fake_embed_query_fn())
+
+    export_hits = [h for h in result.hits if h.source_file == "src/Export.php"]
+    assert [(h.key, h.match_type) for h in export_hits] == [(keys[0], "anchor")]
+    assert "src/Other.php" in [h.source_file for h in result.hits]
+
+
+def test_an_anchor_in_an_exact_hit_file_is_dropped(monkeypatch):
+    exact = make_node("repo.a", "OrderService", "src/order.py", node_id="e")
+    helper = make_node("repo.a", ".orderHelper()", "src/order.py", node_id="h")
+    other = make_node("repo.a", ".orderServiceOther()", "src/other.py", node_id="o")
+    gen = build_generation([exact, helper, other] + _fillers())
+    monkeypatch.setattr(anchors, "anchor_keys", lambda *a, **kw: [key_for("repo.a", helper)])
+
+    result = rank("OrderService", gen, None, k=5, embed_query_fn=fake_embed_query_fn())
+
+    assert [h.match_type for h in result.hits].count("anchor") == 0
+    assert [h.source_file for h in result.hits].count("src/order.py") == 1
+    assert result.hits[0].key == key_for("repo.a", exact)
+
+
+def test_a_pool_with_fewer_files_than_k_returns_one_hit_per_file():
+    nodes = [
+        make_node("repo.a", f".invoiceTotal{word}()", f"src/{f}.py", node_id=f"{f}{word}")
+        for f in ("alpha", "beta")
+        for word in WORDS[:3]
+    ]
+    gen = build_generation(nodes + _fillers())
 
     result = rank("invoice total", gen, None, k=5, embed_query_fn=fake_embed_query_fn())
 
-    assert {("repo.a", "src/billing.py"), ("repo.b", "src/billing.py")} <= set(_files(result))
+    assert sorted(f for _repo, f in _files(result)) == ["src/alpha.py", "src/beta.py"]
+
+
+def test_a_representative_missing_from_the_generation_falls_back_to_the_next_node():
+    file_node = make_node("repo.a", "PopulatePublicHolidays.php", HOLIDAYS, node_id="f")
+    cls = make_node("repo.a", "PopulatePublicHolidays", HOLIDAYS, node_id="c", line=12)
+    gen = build_generation([file_node, cls] + _fillers())
+    del gen.node_id_by_key[key_for("repo.a", cls)]
+
+    result = rank(
+        "populate public holidays php", gen, None, k=5, embed_query_fn=fake_embed_query_fn()
+    )
+
+    assert result.hits[0].key == key_for("repo.a", file_node)
+
+
+def test_a_file_missing_from_the_generation_is_replaced_by_the_next_file():
+    nodes = [
+        make_node("repo.a", ".invoiceTotal()", "src/gone.py", node_id="g"),
+        make_node("repo.a", ".invoiceRefund()", "src/one.py", node_id="one"),
+        make_node("repo.a", ".invoiceDraft()", "src/two.py", node_id="two"),
+    ]
+    gen = build_generation(nodes + _fillers())
+    del gen.node_id_by_key[key_for("repo.a", nodes[0])]
+
+    result = rank("invoice total", gen, None, k=2, embed_query_fn=fake_embed_query_fn())
+
+    assert sorted(f for _repo, f in _files(result)) == ["src/one.py", "src/two.py"]
+
+
+def test_a_malformed_key_is_its_own_file(monkeypatch):
+    node = make_node("repo.a", ".invoiceTotal()", "src/billing.py", node_id="n")
+    gen = build_generation([node] + _fillers())
+    gen.node_id_by_key["malformed-key"] = "n"
+    original = retrieval.lexical_candidates
+    monkeypatch.setattr(
+        retrieval, "lexical_candidates", lambda *a, **kw: ["malformed-key"] + original(*a, **kw)
+    )
+
+    result = rank("invoice total", gen, None, k=5, embed_query_fn=fake_embed_query_fn())
+
+    keys = [h.key for h in result.hits]
+    assert "malformed-key" in keys
+    assert key_for("repo.a", node) in keys
 
 
 def test_reserved_test_slot_runs_on_the_collapsed_list():
@@ -286,6 +412,51 @@ def test_reserved_test_slot_runs_on_the_collapsed_list():
     assert len(files) == 20
     assert len(set(files)) == 20
     assert files[retrieval.TEST_RESULT_SLOT_EVERY - 1] == ("repo.a", "tests/php/OvertimeTest.php")
+
+
+def _overtime_sources(count: int) -> list[dict]:
+    return [
+        make_node("repo.a", f".overtimeCalculation{i}()", f"src/Overtime{i}.php", node_id=f"s{i}")
+        for i in range(count)
+    ]
+
+
+def test_collapsed_prefix_holds_with_an_exact_hit_and_a_test_slot():
+    alias = make_node("repo.a", "OvertimeCalculation", "src/OvertimeCalculation.php", node_id="x")
+    test_keys, gen = _overtime_generation([alias])
+    embed = fake_embed_query_fn()
+
+    top10 = rank("OvertimeCalculation", gen, None, k=10, embed_query_fn=embed)
+    top20 = rank("OvertimeCalculation", gen, None, k=20, embed_query_fn=embed)
+
+    assert [h.key for h in top20.hits[:10]] == [h.key for h in top10.hits]
+    assert top10.hits[0].match_type == "exact"
+    assert top10.hits[retrieval.TEST_RESULT_SLOT_EVERY - 1].key in test_keys
+    assert len(set(_files(top20))) == len(top20.hits)
+
+
+def test_no_test_in_the_pool_leaves_the_slot_to_source():
+    gen = build_generation(_overtime_sources(30))
+
+    result = rank("overtime calculation", gen, None, k=20, embed_query_fn=fake_embed_query_fn())
+
+    files = _files(result)
+    assert len(files) == 20 and len(set(files)) == 20
+    assert not any(f.startswith("tests/") for _repo, f in files)
+
+
+def test_a_test_below_the_slot_floor_is_not_placed(monkeypatch):
+    test = make_node(
+        "repo.a", ".testOvertimeCalculation()", "tests/php/OvertimeTest.php", node_id="t"
+    )
+    gen = build_generation(_overtime_sources(30) + [test])
+    monkeypatch.setattr(retrieval, "TEST_SLOT_MIN_SCORE_RATIO", 1e9)
+
+    result = rank("overtime calculation", gen, None, k=20, embed_query_fn=fake_embed_query_fn())
+
+    files = _files(result)
+    assert len(files) == 20 and len(set(files)) == 20
+    assert ("repo.a", "tests/php/OvertimeTest.php") not in files
 
 
 # --- callers --------------------------------------------------------------
@@ -341,6 +512,7 @@ def test_search_tool_rejects_a_non_boolean_collapse_files(tmp_path, monkeypatch)
     result = server.call_tool("search", {"q": "order", "cwd": str(root), "collapse_files": "no"})
 
     assert result["isError"] is True
+    assert "'collapse_files' must be a boolean" in result["content"][0]["text"]
 
 
 def test_search_tool_schema_declares_collapse_files(tmp_path, monkeypatch):
@@ -350,7 +522,10 @@ def test_search_tool_schema_declares_collapse_files(tmp_path, monkeypatch):
     assert schema["inputSchema"]["properties"]["collapse_files"] == {
         "type": "boolean",
         "default": True,
-        "description": schema["inputSchema"]["properties"]["collapse_files"]["description"],
+        "description": (
+            "One hit per source file (default). false returns every matching node, several "
+            "per file."
+        ),
     }
 
 

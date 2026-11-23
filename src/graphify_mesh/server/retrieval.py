@@ -444,12 +444,28 @@ def _reserve_test_slots(
 FileGroup = tuple[str, str]
 
 
+def _key_parts(key: str) -> tuple[str, str, str] | None:
+    """(repo, source_file, label) of a logical key
+    (`repo\\x1fsource_file\\x1flabel`); None for a key of any other shape."""
+    parts = key.split("\x1f", 2)
+    if len(parts) != 3:
+        return None
+    return (parts[0], parts[1], parts[2])
+
+
 def _file_group(key: str) -> FileGroup:
-    """The (repo, source_file) a logical key (`repo\\x1fsource_file\\x1flabel`)
-    collapses into. Every key has both: `node_key` gives a node without a
-    source file no key."""
-    repo, source_file, _label = key.split("\x1f", 2)
-    return (repo, source_file)
+    """The (repo, source_file) a key collapses into. A malformed key is a
+    group of its own and is never merged with another key."""
+    parts = _key_parts(key)
+    if parts is None:
+        return ("", key)
+    return (parts[0], parts[1])
+
+
+def _key_tier(key: str) -> int:
+    """`_representative_tier` of a key; 0 for a malformed one."""
+    parts = _key_parts(key)
+    return 0 if parts is None else _representative_tier(parts[2], parts[1])
 
 
 def _representative_tier(label: str, source_file: str) -> int:
@@ -467,29 +483,39 @@ def _representative_tier(label: str, source_file: str) -> int:
     return 1 if label == source_file or source_file.endswith("/" + label) else 0
 
 
-def _collapse_fused(ordered: list[str], taken: set[FileGroup]) -> list[str]:
-    """One key per file of `ordered` (the MMR order of the whole fused pool),
-    at the position of the file's best-ranked key, skipping files in `taken`.
-    The key shown is the file's lowest `_representative_tier` key among all
-    its pool keys, so the choice does not depend on how far `k` reaches."""
+def _collapse_fused(ordered: list[str], taken: set[FileGroup]) -> list[tuple[str, str]]:
+    """One (shown key, best key) pair per file of `ordered` (the MMR order of
+    the whole fused pool), at the position of the file's best-ranked key,
+    skipping files in `taken`. The key shown is the file's lowest
+    `_representative_tier` key among all its pool keys, so the choice does not
+    depend on how far `k` reaches."""
     position = {key: index for index, key in enumerate(ordered)}
     members: dict[FileGroup, list[str]] = {}
     for key in ordered:
         members.setdefault(_file_group(key), []).append(key)
 
-    def preference(key: str) -> tuple[int, int]:
-        _repo, source_file, label = key.split("\x1f", 2)
-        return (_representative_tier(label, source_file), position[key])
-
-    collapsed: list[str] = []
+    collapsed: list[tuple[str, str]] = []
     seen: set[FileGroup] = set(taken)
     for key in ordered:
         group = _file_group(key)
         if group in seen:
             continue
         seen.add(group)
-        collapsed.append(min(members[group], key=preference))
+        shown = min(members[group], key=lambda member: (_key_tier(member), position[member]))
+        collapsed.append((shown, key))
     return collapsed
+
+
+def _best_hit_per_file(hits: list[Hit]) -> list[Hit]:
+    """One hit per file of key-sorted `hits`: the lowest `_key_tier` one, then
+    the first in key order; the result stays in key order."""
+    best: dict[FileGroup, Hit] = {}
+    for hit in hits:
+        group = _file_group(hit.key)
+        current = best.get(group)
+        if current is None or _key_tier(hit.key) < _key_tier(current.key):
+            best[group] = hit
+    return sorted(best.values(), key=lambda h: h.key)
 
 
 def _first_hit_per_file(hits: list[Hit], taken: set[FileGroup]) -> list[Hit]:
@@ -518,12 +544,12 @@ def rank(
     generation, RRF fusion, hub/DEPRECATED/stale-semantic penalties, MMR diversification,
     deterministic tie-break.
 
-    With `collapse_files` (the default) the result holds one hit per
-    (repo, source_file): an exact hit, then an anchor hit, keeps its file;
-    otherwise the file takes the position of its best-ranked fused node and
-    shows its best node that is not the file node (`_representative_tier`).
-    The list is filled to `k` from further down the pool, then the reserved
-    test slots are placed on it.
+    With `collapse_files` (the default) the result holds up to `k` hits, one
+    per (repo, source_file): an exact hit, then an anchor hit, keeps its file;
+    otherwise the file takes the position and the score of its best-ranked
+    fused node and shows its best node that is not the file node
+    (`_representative_tier`). Lower files take the places of dropped nodes,
+    then the reserved test slots are placed on the list.
     `collapse_files=False` returns every node on its own, as before."""
     k = max(1, min(k, ranking.MAX_K))
     # Store-level degraded markers (reload rejections, embeddings stamp
@@ -540,7 +566,7 @@ def rank(
     exact_hits.sort(key=lambda h: h.key)
     if collapse_files:
         # Before the cut, so one file's many exact hits cannot fill `k`.
-        exact_hits = _first_hit_per_file(exact_hits, set())
+        exact_hits = _best_hit_per_file(exact_hits)
     # An alias shared by many nodes must not blow past the caller's `k`;
     # truncating after the sort keeps which hits survive deterministic.
     del exact_hits[k:]
@@ -642,22 +668,38 @@ def rank(
             )
             for key, score in fused_scores.items()
         ]
+        # MMR's same-file penalty compares these: the repo is part of the file,
+        # so one path in two repos is two files. An empty path stays empty,
+        # which the penalty never matches.
+        file_by_key = {
+            key: f"{_file_group(key)[0]}\x1f{path}" if path else ""
+            for key, path in path_by_key.items()
+        }
         final_scores = dict(penalized)
         slot_pool = penalized
+        shown_scores: dict[str, float] = {}
         if collapse_files:
             # Greedy MMR is prefix-stable, so ordering the whole pool keeps
             # the top-n of a larger k equal to the result for k=n, and leaves
-            # enough distinct files to fill `k` wherever the pool has them.
-            ordered = ranking.mmr_select(penalized, path_by_key, len(penalized))
-            ordered = [key for key in ordered if key not in anchor_key_set]
+            # enough distinct files to reach `k` wherever the pool has them.
+            ordered = ranking.mmr_select(penalized, file_by_key, len(penalized))
+            # A key the generation cannot resolve gives no hit: drop it before
+            # choosing, so the file's next node, or the next file, stands in.
+            ordered = [
+                key
+                for key in ordered
+                if key not in anchor_key_set and key in generation.node_id_by_key
+            ]
             collapsed = _collapse_fused(ordered, taken_files)
-            diversified_keys = collapsed[:remaining_slots]
+            # A hit carries its file's best score, the order the list is in.
+            shown_scores = {shown: final_scores[best] for shown, best in collapsed}
+            diversified_keys = [shown for shown, _best in collapsed][:remaining_slots]
             # Spare tests for the reserved slots come from the collapsed list
             # too, so a slot never brings back a second node of a shown file.
-            slot_pool = [(key, final_scores[key]) for key in collapsed]
+            slot_pool = list(shown_scores.items())
         else:
             diversified_keys = ranking.mmr_select(
-                penalized, path_by_key, remaining_slots + len(anchor_key_set)
+                penalized, file_by_key, remaining_slots + len(anchor_key_set)
             )
             diversified_keys = [key for key in diversified_keys if key not in anchor_key_set][
                 :remaining_slots
@@ -675,7 +717,8 @@ def rank(
                 diversified_keys, slot_pool, is_test, slots, exclude=anchor_key_set
             )
         for key in diversified_keys:
-            hit = _hit_from_key(key, generation, final_scores.get(key, 0.0), "fused")
+            score = shown_scores.get(key, final_scores.get(key, 0.0))
+            hit = _hit_from_key(key, generation, score, "fused")
             if hit:
                 fused_hits.append(hit)
 

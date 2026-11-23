@@ -4,11 +4,14 @@
 
 ### Features and behavior changes
 
-- Changed: `search` returns one hit per source file. Each file keeps the
-  position of its best node, and lower files fill the list to `k`. The shown
-  node is the file's best node other than the file node. `collapse_files:
-  false` restores per-node hits. `cross_project` and `context_pack` are
-  unchanged.
+- Changed: `search` returns up to `k` hits, one per source file. Each file
+  keeps the position and the score of its best node. The shown node is the
+  file's best node other than the file node, for exact hits too.
+  `collapse_files: false` restores per-node hits. `cross_project` and
+  `context_pack` are unchanged.
+- Fixed: the MMR same-file penalty compared paths without the repo, so a hit
+  at the same path in a second repo was ranked down as a duplicate. This
+  affects every ranked tool.
 - Changed: symbol-anchor pins skip nodes whose source file is a test path
   (`tests/`, `*.stories.tsx`, ...) unless the query mentions tests, matching
   the test demotion already applied to fused results.
