@@ -225,6 +225,7 @@ def llm_names(
     started = time.monotonic()
     for index in range(chunk_count):
         chunk = dict(items[index * chunk_size : (index + 1) * chunk_size])
+        usage: dict[str, int] = {}
         if parallel_gate:
             os.environ[parallel_gate] = "1"
         try:
@@ -236,6 +237,7 @@ def llm_names(
                 quiet=True,
                 max_concurrency=max_concurrency,
                 batch_size=batch_size,
+                usage_out=usage,
             )
         finally:
             if parallel_gate:
@@ -248,13 +250,19 @@ def llm_names(
         named = sum(
             1 for label in labels.values() if label and not PLACEHOLDER_RE.match(label.strip())
         )
+        tokens_in = usage.get("input", 0)
+        batches = max(1, -(-len(chunk) // batch_size))
         log.info(
-            "naming: labeled %d/%d communities (%d named, chunk %d/%d, %.1fs)",
+            "naming: labeled %d/%d communities (%d named, chunk %d/%d, %.1fs), "
+            "%d in / %d out tokens, ~%d in per batch",
             min((index + 1) * chunk_size, total),
             total,
             named,
             index + 1,
             chunk_count,
             time.monotonic() - started,
+            tokens_in,
+            usage.get("output", 0),
+            tokens_in // batches,
         )
     return labels, ("llm" if any_llm else source)

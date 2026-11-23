@@ -37,3 +37,6 @@ LICENSE
 # answering code questions (2026-11-16).
 # 2026-11-19: tests are indexed and demoted at query time instead (graphify-mesh non-source demotion).
 # /tests/
+
+# Release notes: semantic pass on ai1 times out (504 at 540 s), 2026-11-23.
+CHANGELOG.md

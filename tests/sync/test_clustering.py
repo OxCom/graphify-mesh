@@ -152,6 +152,28 @@ def test_llm_names_chunks_calls_and_logs_progress(monkeypatch, caplog):
     assert progress[-1].startswith("naming: labeled 20/20 communities (10 named, chunk 3/3, ")
 
 
+def test_llm_names_progress_reports_token_usage_per_chunk(monkeypatch, caplog):
+    monkeypatch.setenv("GRAPHIFY_LABEL_BATCH_SIZE", "2")  # chunk = 8 communities
+
+    def fake_generate_community_labels(G, communities, usage_out=None, **kwargs):
+        usage_out["input"] = usage_out.get("input", 0) + 100 * len(communities)
+        usage_out["output"] = usage_out.get("output", 0) + 10 * len(communities)
+        return {cid: f"Name {cid}" for cid in communities}, "llm"
+
+    stub = types.ModuleType("graphify.llm")
+    stub.generate_community_labels = fake_generate_community_labels
+    monkeypatch.setitem(sys.modules, "graphify.llm", stub)
+
+    communities = {cid: [f"n{cid}"] for cid in range(20)}
+    with caplog.at_level("INFO", logger="graphify_mesh.sync.clustering"):
+        _REAL_LLM_NAMES(None, communities, backend="ollama", model="m")
+
+    progress = [r.getMessage() for r in caplog.records if "naming: labeled" in r.getMessage()]
+    assert len(progress) == 3
+    assert progress[0].endswith(", 800 in / 80 out tokens, ~200 in per batch")
+    assert progress[-1].endswith(", 400 in / 40 out tokens, ~200 in per batch")
+
+
 def test_llm_names_source_is_llm_if_any_chunk_was(monkeypatch):
     monkeypatch.setenv("GRAPHIFY_LABEL_BATCH_SIZE", "1")  # chunk = 4 communities
     sources = iter(["llm", "placeholder"])

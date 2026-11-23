@@ -278,7 +278,11 @@ pipeline run. Notable fields and derived paths:
   environment table.
   While labeling runs, one INFO line per chunk of `4 × GRAPHIFY_LABEL_BATCH_SIZE`
   communities reports progress, `named` counting non-placeholder labels so far:
-  `naming: labeled <done>/<total> communities (<named> named, chunk <i>/<n>, <secs>s)`.
+  `naming: labeled <done>/<total> communities (<named> named, chunk <i>/<n>, <secs>s), <in> in / <out> out tokens, ~<n> in per batch`.
+  The token counts are the backend's own usage figures for that chunk, retries
+  included. `in per batch` divides by the planned batch count, so upstream
+  re-asks make it overstate one prompt's size. Compare it with the context
+  window (`num_ctx`) to spot truncated prompts.
 - `ollama_*` / `ollama_embed_*` — naming and embedding endpoints, models, and
   health timeouts (plus test-only injectable health checks). `ollama_api_timeout`
   is the per-labeling-call ceiling, separate from `ollama_health_timeout`.

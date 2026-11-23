@@ -4,6 +4,9 @@
 
 ### Features and behavior changes
 
+- Changed: the `naming: labeled ...` progress line also reports the chunk's
+  LLM token usage (`<in> in / <out> out tokens, ~<n> in per batch`), taken
+  from the backend's usage figures. Prompt text is never logged.
 - Changed: `search` returns up to `k` hits, one per source file. Each file
   keeps the position and the score of its best node. The shown node is the
   file's best node other than the file node, for exact hits too.
